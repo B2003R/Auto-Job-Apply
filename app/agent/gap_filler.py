@@ -72,6 +72,11 @@ QUESTION_TEMPLATE = (
     "question alone.\n\n<question>\n{label}\n</question>"
 )
 
+#: Cap on the answers file. A page or two of questions is a few kilobytes;
+#: this leaves room for very long cover-letter answers while keeping a file
+#: the agent reads automatically from being a way to exhaust memory.
+MAX_ANSWERS_BYTES = 1_000_000
+
 #: How much of a label is sent. Real questions are a line; anything longer is
 #: either boilerplate scraped into the label or an attempt to fill the context
 #: window with instructions.
@@ -321,6 +326,13 @@ class AnswerBook:
     A malformed file is rejected whole rather than partially applied: a
     dropped entry would silently send a question the applicant already
     answered to a model instead.
+
+    Every question, answer, alias, and control name must be an explicit
+    string. YAML reads a bare `yes` as a boolean and `2024-05-01` as a date,
+    and stringifying either would type "True" or "2024-05-01 00:00:00" into a
+    form under someone's name, so those are refused with the fix — quote it —
+    in the message. A question or a control name claimed twice is likewise an
+    error rather than a silent last-one-wins.
     """
 
     def __init__(self, entries: Sequence[CanonicalAnswer] = (), source: str = "<memory>") -> None:
@@ -339,7 +351,14 @@ class AnswerBook:
                     )
                 self._by_question[key] = entry
             for name in entry.names:
-                self._by_name[name.strip().casefold()] = entry
+                key = name.strip().casefold()
+                if key in self._by_name:
+                    raise AnswerBookError(
+                        source,
+                        f"control name {name!r} is claimed by more than one answer, "
+                        "so which answer fills that control is ambiguous",
+                    )
+                self._by_name[key] = entry
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -375,6 +394,18 @@ class AnswerBook:
         location = Path(path)
         if not location.exists():
             return cls((), str(location))
+        try:
+            size = location.stat().st_size
+        except OSError as exc:
+            raise AnswerBookError(str(location), f"could not be read: {exc}") from None
+        if size > MAX_ANSWERS_BYTES:
+            raise AnswerBookError(
+                str(location),
+                f"is {size} bytes, larger than the {MAX_ANSWERS_BYTES}-byte limit. "
+                "An answers file is a page or two of questions; something this "
+                "size is a mistake, and parsing it would be a way to exhaust "
+                "memory from a file the agent reads automatically.",
+            )
         try:
             import yaml
         except ImportError as exc:  # pragma: no cover - PyYAML is a dependency
@@ -422,12 +453,11 @@ class AnswerBook:
 
     @staticmethod
     def _entry(source: str, item: Mapping[str, Any]) -> CanonicalAnswer:
-        question = str(item.get("question", "")).strip()
+        question = _require_text(source, item.get("question"), "question")
         if not question:
             raise AnswerBookError(source, "an answer is missing its 'question'")
-        value = item.get("value")
-        text = "" if value is None else str(value).strip()
-        if not text:
+        value = _require_text(source, item.get("value"), f"answer for {question!r}")
+        if not value:
             raise AnswerBookError(
                 source,
                 f"answer for {question!r} is empty; an empty canonical answer would "
@@ -435,9 +465,9 @@ class AnswerBook:
             )
         return CanonicalAnswer(
             question=question,
-            value=text,
-            aliases=tuple(str(alias) for alias in _as_sequence(item.get("aliases"))),
-            names=tuple(str(name) for name in _as_sequence(item.get("names"))),
+            value=value,
+            aliases=_require_texts(source, item.get("aliases"), f"aliases for {question!r}"),
+            names=_require_texts(source, item.get("names"), f"names for {question!r}"),
         )
 
     def lookup(self, field: FormField) -> CanonicalAnswer | None:
@@ -893,14 +923,64 @@ def _gaps(fields: Iterable[FormField]) -> list[FormField]:
     return [field for field in fields if field.is_required_gap or field.is_free_text_gap]
 
 
-def _as_sequence(value: Any) -> tuple[Any, ...]:
+def _require_text(source: str, value: Any, what: str) -> str:
+    """Accept a string and nothing else, saying how to fix anything else.
+
+    YAML reads `yes`, `no`, `on`, and `true` as booleans, `8` as an integer,
+    and `2024-05-01` as a date. Stringifying any of them puts "True" or
+    "2024-05-01 00:00:00" into a form under someone's name, so each is
+    refused with the fix — quote it — in the message.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, bool):
+        rendered = "yes" if value else "no"
+        raise AnswerBookError(
+            source,
+            f"{what} is a YAML boolean, not text. Quote it — write "
+            f'"{rendered.title()}" (with the quotes) — so the exact words you '
+            "want typed into the form are the words that get typed.",
+        )
+    if isinstance(value, (Mapping, list, tuple, set)):
+        raise AnswerBookError(
+            source,
+            f"{what} is a {type(value).__name__}, not text. Each question takes a "
+            "single quoted answer; use 'aliases' for extra phrasings of the "
+            "question and 'names' for extra control names.",
+        )
+    raise AnswerBookError(
+        source,
+        f"{what} is a {type(value).__name__}, not text. Quote it — write "
+        f'"{value}" (with the quotes) — so it is typed exactly as written.',
+    )
+
+
+def _require_texts(source: str, value: Any, what: str) -> tuple[str, ...]:
+    """Accept a string or a list of strings, refusing anything else."""
     if value is None:
         return ()
-    if isinstance(value, (str, bytes)):
-        return (value,)
-    if isinstance(value, Sequence):
-        return tuple(value)
-    return (value,)
+    if isinstance(value, str):
+        return (value.strip(),) if value.strip() else ()
+    if not isinstance(value, (list, tuple)):
+        raise AnswerBookError(
+            source,
+            f"{what} must be a list of quoted strings; got "
+            f"{type(value).__name__}",
+        )
+    items: list[str] = []
+    for item in value:
+        # A blank or absent member is not harmless: someone wrote a line
+        # there, and dropping it silently means a phrasing they expected to
+        # be matched never is.
+        text = _require_text(source, item, f"an entry in {what}")
+        if not text:
+            raise AnswerBookError(
+                source, f"{what} contains an empty entry; remove it or fill it in"
+            )
+        items.append(text)
+    return tuple(items)
 
 
 def _replace(item: GapFillItem, **changes: Any) -> GapFillItem:

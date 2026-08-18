@@ -437,6 +437,128 @@ class TestCanonicalPrecedence:
         assert len(AnswerBook.from_yaml(path)) == 0
 
 
+class TestAnswerBookStrictness:
+    """Only explicit strings, because YAML's guesses become someone's answer.
+
+    `Are you authorized to work: yes` parses as the boolean True, and
+    stringifying it types "True" into a legal question. Numbers, dates, and
+    nested structures have the same problem in milder form. Each one is
+    refused with a message that says how to fix it.
+    """
+
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            ('answers:\n  "Are you authorized to work?": yes\n', "quote"),
+            ('answers:\n  "Are you authorized to work?": no\n', "quote"),
+            ('answers:\n  "Do you consent?": true\n', "quote"),
+            ('answers:\n  "Years of experience": 8\n', "quote"),
+            ('answers:\n  "Graduation": 2024-05-01\n', "quote"),
+            ('answers:\n  "Preferred name": ["Alex", "Kim"]\n', "single"),
+            ('answers:\n  "Preferred name":\n    first: Alex\n', "single"),
+        ],
+    )
+    def test_a_non_string_answer_is_refused_with_advice(
+        self, tmp_path: Path, content: str, expected: str
+    ) -> None:
+        path = tmp_path / "answers.yaml"
+        path.write_text(content, encoding="utf-8")
+
+        with pytest.raises(AnswerBookError) as excinfo:
+            AnswerBook.from_yaml(path)
+
+        assert expected in str(excinfo.value).lower()
+
+    def test_a_boolean_answer_never_becomes_the_word_true(self, tmp_path: Path) -> None:
+        path = tmp_path / "answers.yaml"
+        path.write_text('answers:\n  "Do you consent?": yes\n', encoding="utf-8")
+
+        with pytest.raises(AnswerBookError) as excinfo:
+            AnswerBook.from_yaml(path)
+
+        assert "True" not in str(excinfo.value).replace("true", "")
+
+    @pytest.mark.parametrize(
+        "item",
+        [
+            {"question": True, "value": "Yes"},
+            {"question": 42, "value": "Yes"},
+            {"question": ["Preferred name"], "value": "Alex"},
+            {"question": "Preferred name", "value": ["Alex"]},
+            {"question": "Preferred name", "value": {"text": "Alex"}},
+            {"question": "Preferred name", "value": "Alex", "aliases": [True]},
+            {"question": "Preferred name", "value": "Alex", "aliases": [1, 2]},
+            {"question": "Preferred name", "value": "Alex", "names": [None]},
+            {"question": "Preferred name", "value": "Alex", "names": [{"a": "b"}]},
+            {"question": "Preferred name", "value": "Alex", "aliases": {"a": "b"}},
+        ],
+    )
+    def test_every_field_of_a_long_entry_must_be_a_string(self, item: Any) -> None:
+        with pytest.raises(AnswerBookError):
+            AnswerBook.from_mapping({"answers": [item]})
+
+    def test_a_duplicate_control_name_is_an_error(self) -> None:
+        with pytest.raises(AnswerBookError) as excinfo:
+            AnswerBook.from_mapping(
+                {
+                    "answers": [
+                        {"question": "Profile", "value": "a", "names": ["linkedin_url"]},
+                        {"question": "Link", "value": "b", "names": ["LinkedIn_URL"]},
+                    ]
+                }
+            )
+
+        assert "linkedin_url" in str(excinfo.value).lower()
+
+    def test_a_name_colliding_within_one_entry_is_an_error(self) -> None:
+        with pytest.raises(AnswerBookError):
+            AnswerBook.from_mapping(
+                {
+                    "answers": [
+                        {
+                            "question": "Profile",
+                            "value": "a",
+                            "names": ["linkedin_url", "linkedin_url"],
+                        }
+                    ]
+                }
+            )
+
+    def test_a_valid_long_entry_still_loads(self) -> None:
+        answers = AnswerBook.from_mapping(
+            {
+                "answers": [
+                    {
+                        "question": "Why do you want to work here?",
+                        "value": "Because of the mission.",
+                        "aliases": ["Why are you applying?"],
+                        "names": ["why_us"],
+                    }
+                ]
+            }
+        )
+
+        assert len(answers) == 1
+        assert answers.lookup(field(label="Why are you applying?")) is not None
+        assert answers.lookup(field(label="", name="why_us")) is not None
+
+    def test_an_oversized_answers_file_is_refused(self, tmp_path: Path) -> None:
+        """A multi-megabyte answers file is a mistake or a paste of a resume."""
+        from app.agent.gap_filler import MAX_ANSWERS_BYTES
+
+        path = tmp_path / "answers.yaml"
+        padding = "x" * 1_000
+        lines = ["answers:"]
+        for index in range(MAX_ANSWERS_BYTES // 1_000 + 2):
+            lines.append(f'  "Question {index}": "{padding}"')
+        path.write_text("\n".join(lines), encoding="utf-8")
+
+        with pytest.raises(AnswerBookError) as excinfo:
+            AnswerBook.from_yaml(path)
+
+        assert "large" in str(excinfo.value).lower()
+
+
 class TestShippedExample:
     """The example file must never answer a real form.
 
