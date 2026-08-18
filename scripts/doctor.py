@@ -290,7 +290,10 @@ def _calibration_check(settings: Settings) -> DoctorCheck:
         return DoctorCheck(
             DoctorCategory.CALIBRATION_INVALID,
             CheckStatus.WARNING,
-            f"toolbar coordinates are not calibrated: ({settings.toolbar_x}, {settings.toolbar_y})",
+            "toolbar coordinates are the uncalibrated sentinel "
+            f"({settings.toolbar_x}, {settings.toolbar_y}); the native toolbar-click "
+            "trigger tier will refuse to run — set TOOLBAR_X/TOOLBAR_Y with "
+            "scripts/calibrate_toolbar.py to enable it",
         )
     return DoctorCheck(
         DoctorCategory.CALIBRATION_INVALID,

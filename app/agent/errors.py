@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
-    from app.agent.form_scanner import FormDiff, FormSnapshot
+    from app.agent.form_scanner import FormDiff, FormSnapshot, SettleResult
     from app.agent.jobright_trigger import TierAttempt
 
 
@@ -173,27 +173,30 @@ class ServiceWorkerUnresponsiveError(BrowserError):
 class FormSettleTimeout(BrowserError):
     """Raised when a page never reaches mutation/value quiescence in time.
 
-    Carries the last snapshot and the last diff against the caller's
-    baseline so a caller (or an operator reading logs) can still see how far
-    the page got, instead of only learning that it never stopped changing.
+    Carries the last unsettled `SettleResult` (snapshot, diff against the
+    caller's baseline, and whether any change was observed at all) so a
+    caller can still act on what did happen — a page that autofilled and
+    then kept animating has genuinely changed fields even though it never
+    went quiet.
     """
 
-    def __init__(
-        self,
-        quiet_ms: int,
-        timeout_ms: int,
-        snapshot: "FormSnapshot",
-        diff: "FormDiff",
-    ) -> None:
+    def __init__(self, quiet_ms: int, timeout_ms: int, result: "SettleResult") -> None:
         self.quiet_ms = quiet_ms
         self.timeout_ms = timeout_ms
-        self.snapshot = snapshot
-        self.diff = diff
+        self.result = result
         super().__init__(
             f"Form never stayed unchanged for {quiet_ms}ms within {timeout_ms}ms; "
-            f"last snapshot had {len(snapshot.fields)} field(s) with "
-            f"{len(diff.changed)} change(s) versus the baseline"
+            f"last snapshot had {len(result.snapshot.fields)} field(s) with "
+            f"{len(result.diff.changed)} change(s) versus the baseline"
         )
+
+    @property
+    def snapshot(self) -> "FormSnapshot":
+        return self.result.snapshot
+
+    @property
+    def diff(self) -> "FormDiff":
+        return self.result.diff
 
 
 class NativeClickError(BrowserError):

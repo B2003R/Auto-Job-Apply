@@ -17,7 +17,7 @@ from scripts.doctor import CheckStatus, DoctorCategory, run_doctor
 EXTENSION_ID = "abcextensionid1234567890abcdefg"
 
 
-def _settings(profile: Path, *, toolbar_x: int = 1200, toolbar_y: int = 80) -> Settings:
+def _settings(profile: Path, *, toolbar_x: int = 0, toolbar_y: int = 0) -> Settings:
     return Settings(
         _env_file=None,
         chrome_executable=Path("/usr/bin/google-chrome"),
@@ -636,6 +636,22 @@ class TestDoctorXdotoolAndCalibration:
 
         check = _category_check(report, DoctorCategory.CALIBRATION_INVALID)
         assert check.status is CheckStatus.WARNING
+
+    async def test_default_sentinel_calibration_is_explained_as_uncalibrated(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+        worker = FakeWorker(url=f"chrome-extension://{EXTENSION_ID}/background.js")
+        context = FakeContext(service_workers=[worker])
+
+        report = await run_doctor(settings, session_factory=_factory_returning(context))
+
+        check = _category_check(report, DoctorCategory.CALIBRATION_INVALID)
+        assert check.status is CheckStatus.WARNING
+        assert "scripts/calibrate_toolbar.py" in check.message
+        assert "native" in check.message.lower()
 
     async def test_reports_ok_for_valid_calibration(self, tmp_path: Path) -> None:
         profile = tmp_path / "profile"

@@ -26,6 +26,7 @@ from app.agent.native_click import (
     XDOTOOL_BINARY,
     CommandRunner,
     Which,
+    minimal_env,
     resolve_display,
     run_command,
 )
@@ -72,7 +73,11 @@ async def read_pointer_position(
         )
     resolve_display(environ)
 
-    result = await runner([binary, "getmouselocation", "--shell"], timeout_ms / 1000)
+    result = await runner(
+        [binary, "getmouselocation", "--shell"],
+        timeout_ms / 1000,
+        minimal_env(environ),
+    )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise NativeClickUnavailable(f"xdotool getmouselocation failed: {detail}")

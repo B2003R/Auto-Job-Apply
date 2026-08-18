@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 from app.agent.errors import FormSettleTimeout, TriggerFailed
 from app.agent.extension import find_service_worker, probe_service_worker
 from app.agent.form_scanner import (
+    DEFAULT_FIRST_CHANGE_TIMEOUT_MS,
     DEFAULT_QUIET_MS,
     DEFAULT_SETTLE_TIMEOUT_MS,
     FormDiff,
@@ -103,91 +104,132 @@ class TriggerResult:
     def failed_attempts(self) -> tuple[TierAttempt, ...]:
         return tuple(attempt for attempt in self.attempts if not attempt.succeeded)
 
+    @property
+    def settled(self) -> bool:
+        """False when fields changed but the page never went quiet in time."""
+        return self.settle.settled
 
-#: Deep-queries the first visible, enabled control whose accessible text
-#: matches `autofill`, descending through open shadow roots. Returns the
-#: element itself (via `evaluate_handle`) or `null`.
+
+#: Deep-queries the best control whose accessible name matches `autofill`,
+#: descending through open shadow roots. Returns the element itself (via
+#: `evaluate_handle`) or `null`.
+#:
+#: Only genuinely interactive elements are considered — not "anything with an
+#: `aria-label`/`data-testid`/`onclick`", which on a real ATS page matches
+#: wrappers, tracking divs, and whole page sections. An element's accessible
+#: name is taken from its own attributes, or from its text only when that
+#: text is short enough to belong to a control; candidates larger than a
+#: fraction of the viewport are rejected outright, and among what remains the
+#: smallest (and, at equal size, deepest) wins — a real button is small and
+#: sits at the bottom of the tree, a container is neither.
 AUTOFILL_QUERY_SCRIPT = """
 (() => {
   const MATCH = /autofill/i;
+  const MAX_TEXT_LENGTH = 80;
+  const MAX_AREA_FRACTION = 0.35;
+  const MAX_ROOT_DEPTH = 8;
   const CANDIDATE_SELECTOR = [
     'button',
-    '[role="button"]',
-    'a',
     'input[type="button"]',
     'input[type="submit"]',
-    '[data-testid]',
-    '[aria-label]',
-    '[onclick]',
+    'a[href]',
+    'summary',
+    '[role="button"]',
+    '[role="menuitem"]',
+    '[role="link"]',
   ].join(', ');
-  const MAX_ROOT_DEPTH = 8;
+
+  const viewportArea = Math.max(
+    1,
+    (window.innerWidth || 0) * (window.innerHeight || 0),
+  );
 
   const text = (value) => (value == null ? '' : String(value)).replace(/\\s+/g, ' ').trim();
 
-  const accessibleText = (el) => text(
-    el.getAttribute('aria-label')
-      || el.getAttribute('title')
-      || el.getAttribute('value')
-      || el.textContent,
-  );
+  const accessibleName = (el) => {
+    const explicit = text(
+      el.getAttribute('aria-label')
+        || el.getAttribute('title')
+        || el.getAttribute('value'),
+    );
+    if (explicit) {
+      return explicit.slice(0, MAX_TEXT_LENGTH);
+    }
+    const own = text(el.textContent);
+    return own.length <= MAX_TEXT_LENGTH ? own : '';
+  };
 
-  const isUsable = (el) => {
+  const usableRect = (el) => {
     if (el.disabled === true) {
-      return false;
+      return null;
     }
     if (text(el.getAttribute('aria-disabled')).toLowerCase() === 'true') {
-      return false;
+      return null;
     }
     const view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
     const style = view.getComputedStyle(el);
     if (style) {
       if (style.display === 'none' || style.visibility === 'hidden'
           || style.visibility === 'collapse') {
-        return false;
+        return null;
       }
       if (Number(style.opacity) === 0) {
-        return false;
+        return null;
       }
     }
     const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-  };
-
-  const search = (root, depth) => {
-    let candidates = [];
-    try {
-      candidates = root.querySelectorAll(CANDIDATE_SELECTOR);
-    } catch (error) {
+    if (rect.width <= 0 || rect.height <= 0) {
       return null;
     }
-    for (const el of candidates) {
-      if (MATCH.test(accessibleText(el)) && isUsable(el)) {
-        return el;
+    const area = rect.width * rect.height;
+    if (area / viewportArea > MAX_AREA_FRACTION) {
+      return null;
+    }
+    return { area };
+  };
+
+  const candidates = [];
+  const collect = (root, depth) => {
+    let found = [];
+    try {
+      found = root.querySelectorAll(CANDIDATE_SELECTOR);
+    } catch (error) {
+      return;
+    }
+    for (const el of found) {
+      if (!MATCH.test(accessibleName(el))) {
+        continue;
+      }
+      const usable = usableRect(el);
+      if (usable) {
+        candidates.push({ el, depth, area: usable.area });
       }
     }
     if (depth >= MAX_ROOT_DEPTH) {
-      return null;
+      return;
     }
     let hosts = [];
     try {
       hosts = root.querySelectorAll('*');
     } catch (error) {
-      return null;
+      return;
     }
     for (const host of hosts) {
       if (host.shadowRoot) {
-        const found = search(host.shadowRoot, depth + 1);
-        if (found) {
-          return found;
-        }
+        collect(host.shadowRoot, depth + 1);
       }
     }
-    return null;
   };
+  collect(document, 0);
 
-  return search(document, 0);
+  candidates.sort((left, right) => (left.area - right.area) || (right.depth - left.depth));
+  return candidates.length ? candidates[0].el : null;
 })
 """.strip()
+
+#: Reads the live viewport so an oversized control can be rejected even when
+#: the driver does not expose a configured viewport size.
+VIEWPORT_SCRIPT = "() => ({ width: window.innerWidth, height: window.innerHeight })"
 
 
 #: Asks the MV3 service worker to open the extension's popup, but only when
@@ -274,10 +316,16 @@ async def wait_for_extension_page(
     *,
     timeout_ms: int,
     sleep: Sleeper,
+    known_pages: Sequence[Any] = (),
     poll_interval_ms: int = DEFAULT_POPUP_POLL_MS,
     clock: Callable[[], float] = time.monotonic,
 ) -> Any | None:
-    """Poll a context for a page served by `extension_id`, or give up.
+    """Poll a context for a *newly created* page served by `extension_id`.
+
+    Pages that already existed before the caller acted are never returned:
+    an options tab or a popup left open from an earlier attempt says nothing
+    about whether this dispatch worked, and adopting one would mean clicking
+    — and then closing — a page the caller does not own.
 
     Chrome does not always surface a natively opened popup as a driver-visible
     page, so callers treat `None` as "not reachable" rather than an error.
@@ -286,11 +334,18 @@ async def wait_for_extension_page(
     deadline = clock() + timeout_ms / 1000
     while True:
         for page in list(getattr(context, "pages", []) or []):
-            if str(getattr(page, "url", "")).startswith(prefix):
-                return page
+            if not str(getattr(page, "url", "")).startswith(prefix):
+                continue
+            if any(page is known for known in known_pages):
+                continue
+            return page
         if clock() >= deadline:
             return None
         await sleep(poll_interval_ms / 1000)
+
+
+def _existing_pages(context: Any) -> tuple[Any, ...]:
+    return tuple(getattr(context, "pages", []) or [])
 
 
 class DeepAutofillClicker:
@@ -313,12 +368,16 @@ class DeepAutofillClicker:
         script: str = AUTOFILL_QUERY_SCRIPT,
         min_steps: int = 6,
         max_steps: int = 12,
+        max_area_fraction: float = 0.35,
+        min_container_area: float = 40_000.0,
     ) -> None:
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random(seed)
         self._script = script
         self._min_steps = min_steps
         self._max_steps = max_steps
+        self._max_area_fraction = max_area_fraction
+        self._min_container_area = min_container_area
 
     async def click_in(self, page: Any) -> str:
         frames, _ = same_origin_frames(page)
@@ -371,6 +430,7 @@ class DeepAutofillClicker:
                 "the matched autofill control has no bounding box (off-screen or "
                 "not rendered), so it cannot be clicked like a human would"
             )
+        await self._reject_oversized(page, box)
 
         mouse = getattr(page, "mouse", None)
         if mouse is None:
@@ -398,6 +458,46 @@ class DeepAutofillClicker:
         await mouse.down()
         await self._sleep(self._rng.uniform(0.04, 0.09))
         await mouse.up()
+
+    async def _reject_oversized(self, page: Any, box: Mapping[str, float]) -> None:
+        """Refuse to click something the size of the page itself.
+
+        The in-page query already rejects oversized candidates, but this is
+        the last line of defence before a synthetic pointer press lands
+        somewhere arbitrary: clicking the centre of a full-page container
+        could hit any link or button underneath it. Small controls are always
+        allowed, so a legitimately large button in a tiny extension popup
+        still works.
+        """
+        viewport = await self._viewport(page)
+        if viewport is None:
+            return
+        width, height = viewport
+        area = float(box.get("width", 0.0)) * float(box.get("height", 0.0))
+        if area <= self._min_container_area:
+            return
+        fraction = area / max(1.0, width * height)
+        if fraction <= self._max_area_fraction:
+            return
+        raise TierActionError(
+            f"the matched autofill control covers {fraction:.0%} of the viewport, "
+            "which is a page container rather than a button; refusing to click it"
+        )
+
+    async def _viewport(self, page: Any) -> tuple[float, float] | None:
+        size = getattr(page, "viewport_size", None)
+        if isinstance(size, Mapping) and size.get("width") and size.get("height"):
+            return float(size["width"]), float(size["height"])
+        evaluate = getattr(page, "evaluate", None)
+        if evaluate is None:
+            return None
+        try:
+            measured = await evaluate(VIEWPORT_SCRIPT)
+        except Exception:  # noqa: BLE001 - an unmeasurable viewport just skips the guard
+            return None
+        if isinstance(measured, Mapping) and measured.get("width") and measured.get("height"):
+            return float(measured["width"]), float(measured["height"])
+        return None
 
 
 class InPageAutofillTier:
@@ -454,6 +554,11 @@ class ExtensionPopupTier:
         popup = await context.new_page()
         try:
             await popup.goto(self.popup_url)
+            # Opening the popup page made *it* the active tab; the extension
+            # acts on whichever tab is active, so hand focus back to the ATS
+            # page before the click. Driving the popup itself does not need
+            # OS focus, since its input is delivered over CDP.
+            await _bring_to_front(page)
             detail = await self._clicker.click_in(popup)
             # Let the popup's handler dispatch its message before the page is
             # torn down; quiescence itself is observed by the caller.
@@ -507,6 +612,10 @@ class ServiceWorkerTier:
         )
         await self._worker_probe(worker, self._extension_id, self._worker_timeout_ms)
 
+        # The action is dispatched against the active tab, so the ATS page
+        # must be in the foreground *at the moment the worker runs*.
+        await _bring_to_front(page)
+        known_pages = _existing_pages(context)
         outcome = await worker.evaluate(WORKER_ACTION_SCRIPT)
         if not isinstance(outcome, Mapping):
             raise TierActionError(
@@ -524,13 +633,18 @@ class ServiceWorkerTier:
             self._extension_id,
             timeout_ms=self._popup_timeout_ms,
             sleep=self._sleep,
+            known_pages=known_pages,
         )
         if popup is None:
             return (
-                f"service worker dispatched {method}, but its popup page was "
-                "not reachable for a follow-up click"
+                f"service worker dispatched {method}, but a newly opened popup page "
+                "was not reachable for a follow-up click"
             )
-        detail = await self._clicker.click_in(popup)
+        try:
+            await _bring_to_front(page)
+            detail = await self._clicker.click_in(popup)
+        finally:
+            await _close_quietly(popup)
         return f"service worker dispatched {method} and {detail}"
 
 
@@ -568,11 +682,12 @@ class NativeToolbarTier:
                 "scripts/calibrate_toolbar.py and set TOOLBAR_X/TOOLBAR_Y"
             )
 
+        context = getattr(page, "context", None)
         await _bring_to_front(page)
+        known_pages = _existing_pages(context) if context is not None else ()
         await self._native_click.click()
         detail = "clicked the calibrated extension toolbar button with xdotool"
 
-        context = getattr(page, "context", None)
         if context is None or not self._extension_id:
             return detail
 
@@ -581,13 +696,17 @@ class NativeToolbarTier:
             self._extension_id,
             timeout_ms=self._popup_timeout_ms,
             sleep=self._sleep,
+            known_pages=known_pages,
         )
         if popup is None:
             return detail
         try:
+            await _bring_to_front(page)
             clicked = await self._clicker.click_in(popup)
         except TierActionError as exc:
             return f"{detail}; the extension popup opened but {exc}"
+        finally:
+            await _close_quietly(popup)
         return f"{detail} and {clicked} in the extension popup"
 
 
@@ -608,12 +727,14 @@ class JobrightTrigger:
         clicker: AutofillClicker | None = None,
         quiet_ms: int = DEFAULT_QUIET_MS,
         settle_timeout_ms: int = DEFAULT_SETTLE_TIMEOUT_MS,
+        first_change_timeout_ms: int = DEFAULT_FIRST_CHANGE_TIMEOUT_MS,
         require_field_changes: bool = True,
     ) -> None:
         self._extension_id = extension_id
         self._scanner = scanner if scanner is not None else FormScanner()
         self._quiet_ms = quiet_ms
         self._settle_timeout_ms = settle_timeout_ms
+        self._first_change_timeout_ms = first_change_timeout_ms
         self._require_field_changes = require_field_changes
         self._tiers: tuple[AutofillTier, ...] = (
             tuple(tiers)
@@ -645,6 +766,21 @@ class JobrightTrigger:
     def tiers(self) -> tuple[AutofillTier, ...]:
         return self._tiers
 
+    @property
+    def scanner(self) -> Any:
+        """The scanner that defines which snapshots are comparable.
+
+        Value digests are keyed per `FormScanner` instance, so a baseline
+        taken with a *different* scanner would make every field look changed.
+        Callers take their `before` snapshot from here (or via `baseline`).
+        """
+        return self._scanner
+
+    async def baseline(self, page: Any) -> FormSnapshot:
+        """Snapshot `page` with this trigger's scanner, ready for `trigger`."""
+        snapshot: FormSnapshot = await self._scanner.snapshot(page)
+        return snapshot
+
     async def trigger(self, page: Any, before: FormSnapshot) -> TriggerResult:
         """Trigger Autofill and return the tier that actually changed fields.
 
@@ -662,9 +798,36 @@ class JobrightTrigger:
 
             try:
                 settled = await self._scanner.wait_for_settle(
-                    page, before, self._quiet_ms, self._settle_timeout_ms
+                    page,
+                    before,
+                    quiet_ms=self._quiet_ms,
+                    timeout_ms=self._settle_timeout_ms,
+                    first_change_timeout_ms=self._first_change_timeout_ms,
                 )
             except FormSettleTimeout as exc:
+                if self._require_field_changes and exc.result.diff.has_changes:
+                    # The tier worked: fields demonstrably changed. The page
+                    # merely never went quiet (a spinner, a poller, an
+                    # animation). Firing another tier now would re-trigger
+                    # autofill on an already-filled form, so stop here and
+                    # report the timeout honestly instead.
+                    attempts.append(
+                        TierAttempt(
+                            tier.tier,
+                            True,
+                            f"{detail}; field values changed but the form never settled "
+                            f"within {exc.timeout_ms}ms "
+                            f"(no {exc.quiet_ms}ms quiet period), so the observed "
+                            "changes are returned without firing further tiers",
+                        )
+                    )
+                    return TriggerResult(
+                        tier=tier.tier,
+                        diff=exc.result.diff,
+                        after=exc.result.snapshot,
+                        settle=exc.result,
+                        attempts=tuple(attempts),
+                    )
                 attempts.append(
                     TierAttempt(
                         tier.tier, False, f"{detail}, but the form never settled: {exc}"

@@ -2,7 +2,9 @@
 
 All page, frame, mouse, context, worker, and native-click collaborators are
 fakes, so these tests need no browser, no display, no extension, and no
-xdotool.
+xdotool. The page fakes model focus and page lifetime faithfully enough that
+clicking a closed popup, or clicking a page that was never opened by the
+tier, fails loudly.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ from app.config import Settings
 EXTENSION_ID = "abcextensionid1234567890abcdefg"
 ATS_URL = "https://ats.example.com/apply"
 POPUP_URL = f"chrome-extension://{EXTENSION_ID}/popup.html"
+VIEWPORT = {"width": 1280.0, "height": 800.0}
+BUTTON_BOX = {"x": 100.0, "y": 40.0, "width": 120.0, "height": 32.0}
 
 
 def make_field(**overrides: Any) -> FormField:
@@ -61,26 +65,64 @@ def make_field(**overrides: Any) -> FormField:
     return FormField(**values)
 
 
-def filled_diff() -> tuple[FormSnapshot, FormSnapshot]:
+def changed_snapshots() -> tuple[FormSnapshot, FormSnapshot]:
     before = FormSnapshot(fields=(make_field(),))
-    after = FormSnapshot(
-        fields=(make_field(filled=True, value_digest="filled-digest"),)
-    )
+    after = FormSnapshot(fields=(make_field(filled=True, value_digest="filled-digest"),))
     return before, after
 
 
 def settle_with_changes() -> tuple[FormSnapshot, SettleResult]:
-    before, after = filled_diff()
+    before, after = changed_snapshots()
     return before, SettleResult(
-        snapshot=after, diff=before.diff(after), waited_ms=800.0, polls=8, mutations=12
+        snapshot=after,
+        diff=before.diff(after),
+        waited_ms=800.0,
+        polls=8,
+        mutations=12,
+        settled=True,
+        observed_change=True,
     )
 
 
 def settle_without_changes() -> tuple[FormSnapshot, SettleResult]:
     before = FormSnapshot(fields=(make_field(),))
     return before, SettleResult(
-        snapshot=before, diff=before.diff(before), waited_ms=800.0, polls=8, mutations=0
+        snapshot=before,
+        diff=before.diff(before),
+        waited_ms=800.0,
+        polls=8,
+        mutations=0,
+        settled=True,
+        observed_change=False,
     )
+
+
+def timeout_with_changes() -> tuple[FormSnapshot, FormSettleTimeout]:
+    before, after = changed_snapshots()
+    unsettled = SettleResult(
+        snapshot=after,
+        diff=before.diff(after),
+        waited_ms=15000.0,
+        polls=90,
+        mutations=400,
+        settled=False,
+        observed_change=True,
+    )
+    return before, FormSettleTimeout(quiet_ms=600, timeout_ms=15000, result=unsettled)
+
+
+def timeout_without_changes() -> tuple[FormSnapshot, FormSettleTimeout]:
+    before = FormSnapshot(fields=(make_field(),))
+    unsettled = SettleResult(
+        snapshot=before,
+        diff=before.diff(before),
+        waited_ms=15000.0,
+        polls=90,
+        mutations=400,
+        settled=False,
+        observed_change=False,
+    )
+    return before, FormSettleTimeout(quiet_ms=600, timeout_ms=15000, result=unsettled)
 
 
 class RecordingTier:
@@ -121,6 +163,7 @@ class FakeScanner:
         previous: FormSnapshot,
         quiet_ms: int,
         timeout_ms: int,
+        first_change_timeout_ms: int | None = None,
     ) -> SettleResult:
         self.calls.append(
             {
@@ -128,6 +171,7 @@ class FakeScanner:
                 "previous": previous,
                 "quiet_ms": quiet_ms,
                 "timeout_ms": timeout_ms,
+                "first_change_timeout_ms": first_change_timeout_ms,
             }
         )
         result = self._results.pop(0) if len(self._results) > 1 else self._results[0]
@@ -137,17 +181,26 @@ class FakeScanner:
 
 
 class FakeMouse:
-    def __init__(self, log: list[tuple[str, Any]]) -> None:
-        self._log = log
+    """Mouse double bound to a page; refuses to act on a closed page."""
+
+    def __init__(self, page: "FakePage") -> None:
+        self._page = page
+
+    def _check(self) -> None:
+        if self._page.closed:
+            raise AssertionError(f"{self._page.name} was clicked after it was closed")
 
     async def move(self, x: float, y: float, **kwargs: Any) -> None:
-        self._log.append(("move", (x, y)))
+        self._check()
+        self._page.log.append(("move", (x, y)))
 
     async def down(self, **kwargs: Any) -> None:
-        self._log.append(("down", None))
+        self._check()
+        self._page.log.append(("down", self._page.name))
 
     async def up(self, **kwargs: Any) -> None:
-        self._log.append(("up", None))
+        self._check()
+        self._page.log.append(("up", self._page.name))
 
 
 class FakeElement:
@@ -177,6 +230,9 @@ class FakeHandle:
 class FakeFrame:
     def __init__(self, url: str, handle: FakeHandle | None = None) -> None:
         self.url = url
+        self.name = ""
+        self.parent_frame: FakeFrame | None = None
+        self.child_frames: list[FakeFrame] = []
         self.handle = handle if handle is not None else FakeHandle(None)
         self.scripts: list[str] = []
 
@@ -194,27 +250,30 @@ class FakePage:
         frames: Iterable[FakeFrame] | None = None,
         context: "FakeContext | None" = None,
         name: str = "page",
+        viewport: dict[str, float] | None = None,
     ) -> None:
         self.url = url
         self.log: list[Any] = log if log is not None else []
         self.frames = list(frames) if frames is not None else [FakeFrame(url)]
+        self.main_frame = self.frames[0]
         self.context = context
-        self.mouse = FakeMouse(self.log)
+        self.name = name
+        self.viewport_size = viewport if viewport is not None else dict(VIEWPORT)
+        self.mouse = FakeMouse(self)
         self.closed = False
-        self._name = name
 
     async def bring_to_front(self) -> None:
-        self.log.append((f"{self._name}.bring_to_front", None))
+        self.log.append((f"{self.name}.bring_to_front", None))
 
     async def goto(self, url: str, **kwargs: Any) -> None:
-        self.log.append((f"{self._name}.goto", url))
+        self.log.append((f"{self.name}.goto", url))
         self.url = url
         for frame in self.frames:
             frame.url = url
 
     async def close(self) -> None:
         self.closed = True
-        self.log.append((f"{self._name}.close", None))
+        self.log.append((f"{self.name}.close", None))
 
 
 class FakeContext:
@@ -227,18 +286,24 @@ class FakeContext:
     async def new_page(self) -> FakePage:
         self.new_pages += 1
         self.log.append(("context.new_page", None))
-        popup = self._popup if self._popup is not None else FakePage("about:blank", log=self.log)
+        popup = (
+            self._popup
+            if self._popup is not None
+            else FakePage("about:blank", log=self.log, name="popup")
+        )
         self.pages.append(popup)
         return popup
 
 
 class FakeWorker:
-    def __init__(self, result: Any) -> None:
+    def __init__(self, result: Any, log: list[Any] | None = None) -> None:
         self._result = result
+        self.log = log if log is not None else []
         self.scripts: list[str] = []
 
     async def evaluate(self, script: str, *args: Any) -> Any:
         self.scripts.append(script)
+        self.log.append(("worker.evaluate", None))
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
@@ -257,15 +322,26 @@ class FakeNativeClick:
             raise self._error
 
 
-def autofill_frame(url: str = ATS_URL) -> tuple[FakeFrame, FakeElement]:
-    element = FakeElement({"x": 100.0, "y": 40.0, "width": 120.0, "height": 32.0})
+def autofill_frame(
+    url: str = ATS_URL, box: dict[str, float] | None = None
+) -> tuple[FakeFrame, FakeElement]:
+    element = FakeElement(dict(box) if box is not None else dict(BUTTON_BOX))
     return FakeFrame(url, FakeHandle(element)), element
+
+
+def popup_page(log: list[Any], *, with_control: bool = True) -> FakePage:
+    frame = autofill_frame(POPUP_URL)[0] if with_control else FakeFrame(POPUP_URL)
+    return FakePage(POPUP_URL, log=log, frames=[frame], name="popup")
 
 
 def build_trigger(
     tiers: Sequence[Any], scanner: FakeScanner, **kwargs: Any
 ) -> JobrightTrigger:
     return JobrightTrigger(EXTENSION_ID, tiers=tiers, scanner=scanner, **kwargs)
+
+
+def event_names(log: Sequence[Any]) -> list[str]:
+    return [str(event[0]) for event in log]
 
 
 class TestTierOrdering:
@@ -353,6 +429,7 @@ class TestDiagnosticsAndResult:
         assert [field.name for field in result.diff.newly_filled] == ["first_name"]
         assert result.after is settled.snapshot
         assert result.settle is settled
+        assert result.settled is True
 
     async def test_diff_baseline_is_the_caller_supplied_before_snapshot(self) -> None:
         log: list[str] = []
@@ -377,10 +454,81 @@ class TestDiagnosticsAndResult:
             scanner,
             quiet_ms=333,
             settle_timeout_ms=9999,
+            first_change_timeout_ms=1234,
         ).trigger(FakePage(ATS_URL), before)
 
         assert scanner.calls[0]["quiet_ms"] == 333
         assert scanner.calls[0]["timeout_ms"] == 9999
+        assert scanner.calls[0]["first_change_timeout_ms"] == 1234
+
+
+class TestSettleTimeoutHandling:
+    async def test_timeout_with_observed_changes_succeeds_without_more_tiers(self) -> None:
+        log: list[str] = []
+        before, timeout = timeout_with_changes()
+        tiers = [
+            RecordingTier(TriggerTier.IN_PAGE, log, detail="clicked in-page control"),
+            RecordingTier(TriggerTier.EXTENSION_POPUP, log),
+            RecordingTier(TriggerTier.SERVICE_WORKER, log),
+        ]
+
+        result = await build_trigger(tiers, FakeScanner([timeout])).trigger(
+            FakePage(ATS_URL), before
+        )
+
+        assert log == [TriggerTier.IN_PAGE.value]
+        assert result.tier is TriggerTier.IN_PAGE
+        assert result.diff.has_changes is True
+        assert result.settled is False
+
+    async def test_timeout_success_detail_names_the_timeout_explicitly(self) -> None:
+        log: list[str] = []
+        before, timeout = timeout_with_changes()
+        tiers = [RecordingTier(TriggerTier.IN_PAGE, log, detail="clicked in-page control")]
+
+        result = await build_trigger(tiers, FakeScanner([timeout])).trigger(
+            FakePage(ATS_URL), before
+        )
+
+        detail = result.attempts[0].detail
+        assert result.attempts[0].succeeded is True
+        assert "clicked in-page control" in detail
+        assert "never settled" in detail
+        assert "15000" in detail
+
+    async def test_timeout_without_changes_is_still_a_tier_failure(self) -> None:
+        log: list[str] = []
+        before, timeout = timeout_without_changes()
+        _, settled = settle_with_changes()
+        tiers = [
+            RecordingTier(TriggerTier.IN_PAGE, log, detail="clicked in-page control"),
+            RecordingTier(TriggerTier.EXTENSION_POPUP, log, detail="clicked popup"),
+        ]
+
+        result = await build_trigger(tiers, FakeScanner([timeout, settled])).trigger(
+            FakePage(ATS_URL), before
+        )
+
+        assert log == [TriggerTier.IN_PAGE.value, TriggerTier.EXTENSION_POPUP.value]
+        assert result.tier is TriggerTier.EXTENSION_POPUP
+        assert "never settled" in result.attempts[0].detail
+
+    async def test_timeout_with_changes_is_a_failure_when_verification_is_off(self) -> None:
+        """With verification disabled there is no change signal to trust, so a
+        timeout stays a failure rather than becoming an unverified success."""
+        log: list[str] = []
+        before, timeout = timeout_with_changes()
+        _, settled = settle_with_changes()
+        tiers = [
+            RecordingTier(TriggerTier.IN_PAGE, log),
+            RecordingTier(TriggerTier.EXTENSION_POPUP, log),
+        ]
+
+        result = await build_trigger(
+            tiers, FakeScanner([timeout, settled]), require_field_changes=False
+        ).trigger(FakePage(ATS_URL), before)
+
+        assert result.tier is TriggerTier.EXTENSION_POPUP
 
 
 class TestFailureModes:
@@ -439,24 +587,6 @@ class TestFailureModes:
         assert result.tier is TriggerTier.IN_PAGE
         assert result.diff.has_changes is False
 
-    async def test_settle_timeout_is_a_tier_failure_not_a_raised_error(self) -> None:
-        log: list[str] = []
-        before, settled = settle_with_changes()
-        timeout = FormSettleTimeout(
-            quiet_ms=600, timeout_ms=15000, snapshot=before, diff=before.diff(before)
-        )
-        tiers = [
-            RecordingTier(TriggerTier.IN_PAGE, log, detail="clicked in-page control"),
-            RecordingTier(TriggerTier.EXTENSION_POPUP, log, detail="clicked popup"),
-        ]
-
-        result = await build_trigger(tiers, FakeScanner([timeout, settled])).trigger(
-            FakePage(ATS_URL), before
-        )
-
-        assert result.tier is TriggerTier.EXTENSION_POPUP
-        assert "never" in result.attempts[0].detail
-
     async def test_unexpected_tier_errors_become_diagnostics_not_crashes(self) -> None:
         log: list[str] = []
         before, settled = settle_with_changes()
@@ -479,6 +609,39 @@ class TestFailureModes:
             await build_trigger([], FakeScanner([settled])).trigger(
                 FakePage(ATS_URL), before
             )
+
+
+class TestBaselineScanner:
+    """Digest keys are per-scanner, so the baseline must come from the same
+    scanner the trigger later compares against — the trigger therefore has to
+    expose it rather than hide it."""
+
+    async def test_scanner_is_exposed_for_taking_the_baseline(self) -> None:
+        scanner = FakeScanner([settle_with_changes()[1]])
+
+        trigger = build_trigger([], scanner)
+
+        assert trigger.scanner is scanner
+
+    async def test_baseline_snapshots_with_the_triggers_own_scanner(self) -> None:
+        snapshot = FormSnapshot(fields=(make_field(),))
+
+        class SnapshottingScanner(FakeScanner):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.pages: list[Any] = []
+
+            async def snapshot(self, page: Any) -> FormSnapshot:
+                self.pages.append(page)
+                return snapshot
+
+        scanner = SnapshottingScanner()
+        page = FakePage(ATS_URL)
+
+        taken = await build_trigger([], scanner).baseline(page)
+
+        assert taken is snapshot
+        assert scanner.pages == [page]
 
 
 class TestDefaultTierAssembly:
@@ -518,13 +681,32 @@ class TestDeepAutofillQueryScript:
     def test_script_descends_open_shadow_roots(self) -> None:
         assert "shadowRoot" in AUTOFILL_QUERY_SCRIPT
 
-    def test_script_considers_accessible_text_sources(self) -> None:
+    def test_script_only_considers_real_interactive_controls(self) -> None:
+        for interactive in ("button", "[role=\"button\"]", "input[type=\"button\"]"):
+            assert interactive in AUTOFILL_QUERY_SCRIPT
+        for over_broad in ("'[data-testid]'", "'[aria-label]'", "'[onclick]'"):
+            assert over_broad not in AUTOFILL_QUERY_SCRIPT
+
+    def test_script_reads_accessible_name_sources(self) -> None:
         for source in ("aria-label", "textContent", "title", "value"):
             assert source in AUTOFILL_QUERY_SCRIPT
 
     def test_script_skips_invisible_and_disabled_controls(self) -> None:
         assert "getComputedStyle" in AUTOFILL_QUERY_SCRIPT
         assert "disabled" in AUTOFILL_QUERY_SCRIPT
+
+    def test_script_rejects_page_sized_containers(self) -> None:
+        assert "MAX_AREA_FRACTION" in AUTOFILL_QUERY_SCRIPT
+        assert "innerWidth" in AUTOFILL_QUERY_SCRIPT
+        assert "innerHeight" in AUTOFILL_QUERY_SCRIPT
+
+    def test_script_caps_accessible_text_length(self) -> None:
+        assert "MAX_TEXT_LENGTH" in AUTOFILL_QUERY_SCRIPT
+
+    def test_script_prefers_the_smallest_deepest_candidate(self) -> None:
+        assert "sort" in AUTOFILL_QUERY_SCRIPT
+        assert "area" in AUTOFILL_QUERY_SCRIPT
+        assert "depth" in AUTOFILL_QUERY_SCRIPT
 
 
 class TestInPageTier:
@@ -551,6 +733,9 @@ class TestInPageTier:
         main = FakeFrame(ATS_URL)
         embedded, _ = autofill_frame("https://ats.example.com/embed")
         foreign, _ = autofill_frame("https://tracker.example.net/pixel")
+        main.child_frames = [foreign, embedded]
+        foreign.parent_frame = main
+        embedded.parent_frame = main
         page = FakePage(ATS_URL, log=log, frames=[main, foreign, embedded])
         tier = InPageAutofillTier(clicker=DeepAutofillClicker(sleep=_noop_sleep, seed=1))
 
@@ -590,61 +775,109 @@ class TestInPageTier:
         assert "bounding box" in str(excinfo.value)
 
 
-class TestExtensionPopupTier:
-    def _page_with_popup(self) -> tuple[FakePage, FakePage, list[Any]]:
+class TestOversizedControlGuard:
+    async def test_refuses_to_click_a_page_sized_container(self) -> None:
         log: list[Any] = []
-        popup_frame, _ = autofill_frame(POPUP_URL)
-        popup = FakePage(POPUP_URL, log=log, frames=[popup_frame], name="popup")
+        frame, _ = autofill_frame(
+            ATS_URL, {"x": 0.0, "y": 0.0, "width": 1280.0, "height": 800.0}
+        )
+        page = FakePage(ATS_URL, log=log, frames=[frame])
+        tier = InPageAutofillTier(clicker=DeepAutofillClicker(sleep=_noop_sleep))
+
+        with pytest.raises(TierActionError) as excinfo:
+            await tier.attempt(page)
+
+        assert "viewport" in str(excinfo.value)
+        assert not [event for event in log if event[0] == "down"]
+
+    async def test_allows_a_small_control_inside_a_small_popup(self) -> None:
+        log: list[Any] = []
+        frame, _ = autofill_frame(
+            POPUP_URL, {"x": 10.0, "y": 10.0, "width": 260.0, "height": 44.0}
+        )
+        page = FakePage(
+            POPUP_URL,
+            log=log,
+            frames=[frame],
+            name="popup",
+            viewport={"width": 320.0, "height": 240.0},
+        )
+        clicker = DeepAutofillClicker(sleep=_noop_sleep, seed=3)
+
+        await clicker.click_in(page)
+
+        assert [event for event in log if event[0] == "down"]
+
+    async def test_guard_is_skipped_when_the_viewport_is_unknown(self) -> None:
+        log: list[Any] = []
+        frame, _ = autofill_frame(
+            ATS_URL, {"x": 0.0, "y": 0.0, "width": 1280.0, "height": 800.0}
+        )
+        page = FakePage(ATS_URL, log=log, frames=[frame], viewport={})
+        clicker = DeepAutofillClicker(sleep=_noop_sleep, seed=3)
+
+        await clicker.click_in(page)
+
+        assert [event for event in log if event[0] == "down"]
+
+
+class TestExtensionPopupTier:
+    def _page_with_popup(self, *, with_control: bool = True) -> tuple[FakePage, FakePage, list[Any]]:
+        log: list[Any] = []
+        popup = popup_page(log, with_control=with_control)
         context = FakeContext(log, popup)
         page = FakePage(ATS_URL, log=log, context=context, name="ats")
         return page, popup, log
 
+    def _tier(self) -> ExtensionPopupTier:
+        return ExtensionPopupTier(
+            EXTENSION_ID,
+            clicker=DeepAutofillClicker(sleep=_noop_sleep, seed=5),
+            sleep=_noop_sleep,
+        )
+
     async def test_brings_the_ats_page_to_front_before_opening_the_popup(self) -> None:
         page, _, log = self._page_with_popup()
-        tier = ExtensionPopupTier(
-            EXTENSION_ID, clicker=DeepAutofillClicker(sleep=_noop_sleep), sleep=_noop_sleep
-        )
 
-        await tier.attempt(page)
+        await self._tier().attempt(page)
 
-        names = [event[0] for event in log]
+        names = event_names(log)
         assert names.index("ats.bring_to_front") < names.index("context.new_page")
 
-    async def test_navigates_to_the_extension_popup_url(self) -> None:
-        page, popup, log = self._page_with_popup()
-        tier = ExtensionPopupTier(
-            EXTENSION_ID, clicker=DeepAutofillClicker(sleep=_noop_sleep), sleep=_noop_sleep
-        )
+    async def test_ats_page_is_refocused_before_the_popup_control_is_clicked(self) -> None:
+        page, _, log = self._page_with_popup()
 
-        detail = await tier.attempt(page)
+        await self._tier().attempt(page)
+
+        names = event_names(log)
+        focus_events = [index for index, name in enumerate(names) if name == "ats.bring_to_front"]
+        first_click = names.index("down")
+        assert any(index < first_click for index in focus_events[1:])
+        assert names.index("popup.goto") < focus_events[1]
+
+    async def test_navigates_to_the_extension_popup_url_and_closes_it(self) -> None:
+        page, popup, log = self._page_with_popup()
+
+        detail = await self._tier().attempt(page)
 
         assert ("popup.goto", POPUP_URL) in log
         assert "popup" in detail.lower()
         assert popup.closed is True
 
     async def test_restores_the_ats_page_and_closes_the_popup_after_failure(self) -> None:
-        log: list[Any] = []
-        popup = FakePage(POPUP_URL, log=log, frames=[FakeFrame(POPUP_URL)], name="popup")
-        context = FakeContext(log, popup)
-        page = FakePage(ATS_URL, log=log, context=context, name="ats")
-        tier = ExtensionPopupTier(
-            EXTENSION_ID, clicker=DeepAutofillClicker(sleep=_noop_sleep), sleep=_noop_sleep
-        )
+        page, popup, log = self._page_with_popup(with_control=False)
 
         with pytest.raises(TierActionError):
-            await tier.attempt(page)
+            await self._tier().attempt(page)
 
         assert popup.closed is True
-        assert [event[0] for event in log].count("ats.bring_to_front") == 2
+        assert event_names(log).count("ats.bring_to_front") >= 2
 
     async def test_requires_a_browser_context(self) -> None:
         page = FakePage(ATS_URL, context=None)
-        tier = ExtensionPopupTier(
-            EXTENSION_ID, clicker=DeepAutofillClicker(sleep=_noop_sleep), sleep=_noop_sleep
-        )
 
         with pytest.raises(TierActionError) as excinfo:
-            await tier.attempt(page)
+            await self._tier().attempt(page)
 
         assert "context" in str(excinfo.value)
 
@@ -662,16 +895,18 @@ class TestServiceWorkerTier:
         defaults: dict[str, Any] = {
             "worker_finder": finder,
             "worker_probe": probe,
-            "clicker": DeepAutofillClicker(sleep=_noop_sleep),
+            "clicker": DeepAutofillClicker(sleep=_noop_sleep, seed=11),
             "sleep": _noop_sleep,
             "popup_timeout_ms": 0,
         }
         defaults.update(kwargs)
         return ServiceWorkerTier(EXTENSION_ID, **defaults)
 
-    def _page(self, context: FakeContext | None = None) -> FakePage:
-        log: list[Any] = []
-        return FakePage(ATS_URL, log=log, context=context or FakeContext(log))
+    def _page(self, context: FakeContext | None = None, log: list[Any] | None = None) -> FakePage:
+        shared = log if log is not None else []
+        return FakePage(
+            ATS_URL, log=shared, context=context or FakeContext(shared), name="ats"
+        )
 
     async def test_worker_script_is_feature_guarded(self) -> None:
         assert "openPopup" in WORKER_ACTION_SCRIPT
@@ -705,19 +940,78 @@ class TestServiceWorkerTier:
         with pytest.raises(TierActionError):
             await tier.attempt(self._page())
 
-    async def test_clicks_the_popup_page_when_the_worker_opens_one(self) -> None:
+    async def test_ats_page_is_foreground_when_the_worker_dispatches(self) -> None:
         log: list[Any] = []
-        popup_frame, _ = autofill_frame(POPUP_URL)
-        popup = FakePage(POPUP_URL, log=log, frames=[popup_frame], name="popup")
+        worker = FakeWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log)
+        page = self._page(log=log)
+
+        await self._tier(worker).attempt(page)
+
+        names = event_names(log)
+        assert names.index("ats.bring_to_front") < names.index("worker.evaluate")
+
+    async def test_clicks_only_a_newly_opened_popup_and_closes_it(self) -> None:
+        log: list[Any] = []
         context = FakeContext(log)
-        context.pages.append(popup)
         page = FakePage(ATS_URL, log=log, context=context, name="ats")
-        tier = self._tier(FakeWorker({"ok": True, "method": "action.openPopup", "reason": ""}))
+        popup = popup_page(log)
+        worker = FakeWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log)
+
+        class OpeningWorker(FakeWorker):
+            async def evaluate(self, script: str, *args: Any) -> Any:
+                result = await super().evaluate(script, *args)
+                context.pages.append(popup)
+                return result
+
+        opening = OpeningWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log)
+        tier = self._tier(opening, popup_timeout_ms=500)
 
         detail = await tier.attempt(page)
 
         assert "action.openPopup" in detail
-        assert any(event[0] == "down" for event in log)
+        assert ("down", "popup") in log
+        assert popup.closed is True
+        assert worker.scripts == []
+
+    async def test_ats_page_is_refocused_before_the_popup_click(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+        popup = popup_page(log)
+
+        class OpeningWorker(FakeWorker):
+            async def evaluate(self, script: str, *args: Any) -> Any:
+                result = await super().evaluate(script, *args)
+                context.pages.append(popup)
+                return result
+
+        tier = self._tier(
+            OpeningWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log),
+            popup_timeout_ms=500,
+        )
+
+        await tier.attempt(page)
+
+        names = event_names(log)
+        focus_events = [i for i, name in enumerate(names) if name == "ats.bring_to_front"]
+        assert len(focus_events) >= 2
+        assert focus_events[1] < names.index("down")
+
+    async def test_pre_existing_popup_page_is_never_reused(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        stale_popup = popup_page(log)
+        context.pages.append(stale_popup)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+        tier = self._tier(
+            FakeWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log)
+        )
+
+        detail = await tier.attempt(page)
+
+        assert "not reachable" in detail
+        assert stale_popup.closed is False
+        assert not [event for event in log if event[0] == "down"]
 
     async def test_reports_when_no_popup_page_becomes_reachable(self) -> None:
         tier = self._tier(FakeWorker({"ok": True, "method": "action.openPopup", "reason": ""}))
@@ -729,17 +1023,24 @@ class TestServiceWorkerTier:
 
 
 class TestNativeToolbarTier:
+    def _tier(self, native: Any, **kwargs: Any) -> NativeToolbarTier:
+        defaults: dict[str, Any] = {
+            "extension_id": EXTENSION_ID,
+            "clicker": DeepAutofillClicker(sleep=_noop_sleep, seed=13),
+            "sleep": _noop_sleep,
+            "popup_timeout_ms": 0,
+        }
+        defaults.update(kwargs)
+        return NativeToolbarTier(native, **defaults)
+
     async def test_brings_the_page_to_front_then_clicks_natively(self) -> None:
         log: list[Any] = []
         page = FakePage(ATS_URL, log=log, context=FakeContext(log), name="ats")
         native = FakeNativeClick(log)
-        tier = NativeToolbarTier(
-            native, extension_id=EXTENSION_ID, sleep=_noop_sleep, popup_timeout_ms=0
-        )
 
-        detail = await tier.attempt(page)
+        detail = await self._tier(native).attempt(page)
 
-        names = [event[0] for event in log]
+        names = event_names(log)
         assert names.index("ats.bring_to_front") < names.index("native.click")
         assert native.clicks == 1
         assert "xdotool" in detail
@@ -748,43 +1049,51 @@ class TestNativeToolbarTier:
         log: list[Any] = []
         page = FakePage(ATS_URL, log=log, context=FakeContext(log), name="ats")
         native = FakeNativeClick(log, NativeClickUnavailable("xdotool is not installed"))
-        tier = NativeToolbarTier(
-            native, extension_id=EXTENSION_ID, sleep=_noop_sleep, popup_timeout_ms=0
-        )
 
         with pytest.raises(NativeClickUnavailable) as excinfo:
-            await tier.attempt(page)
+            await self._tier(native).attempt(page)
 
         assert "xdotool is not installed" in str(excinfo.value)
 
     async def test_missing_native_click_configuration_is_reported(self) -> None:
         page = FakePage(ATS_URL)
-        tier = NativeToolbarTier(None, extension_id=EXTENSION_ID, sleep=_noop_sleep)
 
         with pytest.raises(TierActionError) as excinfo:
-            await tier.attempt(page)
+            await self._tier(None).attempt(page)
 
         assert "calibrat" in str(excinfo.value).lower()
 
-    async def test_drives_the_popup_page_when_the_toolbar_click_opens_one(self) -> None:
+    async def test_drives_and_closes_a_newly_opened_popup_page(self) -> None:
         log: list[Any] = []
-        popup_frame, _ = autofill_frame(POPUP_URL)
-        popup = FakePage(POPUP_URL, log=log, frames=[popup_frame], name="popup")
         context = FakeContext(log)
-        context.pages.append(popup)
         page = FakePage(ATS_URL, log=log, context=context, name="ats")
-        tier = NativeToolbarTier(
-            FakeNativeClick(log),
-            extension_id=EXTENSION_ID,
-            clicker=DeepAutofillClicker(sleep=_noop_sleep),
-            sleep=_noop_sleep,
-            popup_timeout_ms=0,
-        )
+        popup = popup_page(log)
 
-        detail = await tier.attempt(page)
+        class OpeningNativeClick(FakeNativeClick):
+            async def click(self) -> None:
+                await super().click()
+                context.pages.append(popup)
 
-        assert any(event[0] == "down" for event in log)
+        detail = await self._tier(
+            OpeningNativeClick(log), popup_timeout_ms=500
+        ).attempt(page)
+
+        assert ("down", "popup") in log
+        assert popup.closed is True
         assert "popup" in detail.lower()
+
+    async def test_pre_existing_popup_page_is_never_reused(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        stale_popup = popup_page(log)
+        context.pages.append(stale_popup)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+
+        detail = await self._tier(FakeNativeClick(log)).attempt(page)
+
+        assert stale_popup.closed is False
+        assert not [event for event in log if event[0] == "down"]
+        assert "xdotool" in detail
 
 
 async def _noop_sleep(seconds: float) -> None:

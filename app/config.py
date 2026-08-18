@@ -30,8 +30,16 @@ class Settings(BaseSettings):
     chrome_executable: Path = Path("/usr/bin/google-chrome")
     chrome_profile_path: Path = Path("/home/user/.config/job-apply-chrome")
     jobright_extension_id: str = "your-extension-id-here"
-    toolbar_x: int = 1200
-    toolbar_y: int = 80
+    # 0 is the "not calibrated yet" sentinel: the native toolbar-click tier
+    # refuses to run rather than press an arbitrary screen pixel on a machine
+    # whose toolbar has never been measured. Set both via
+    # scripts/calibrate_toolbar.py.
+    toolbar_x: int = 0
+    toolbar_y: int = 0
+    #: Window the native tier activates (and verifies) before clicking.
+    chrome_window_name: str = "Google Chrome"
+    #: Explicit X window id, for when several windows match the name.
+    chrome_window_id: str = ""
 
     delay_min_ms: int = 500
     delay_max_ms: int = 1500
