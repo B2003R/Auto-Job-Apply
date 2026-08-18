@@ -10,7 +10,7 @@ logic: `load_selector_map` is the only thing that reads them, and every
 adapter reads selectors through the small `SelectorMap.require`/`get`
 surface rather than a file path of its own.
 
-Two safety properties are enforced here, once, rather than duplicated in
+Three safety properties are enforced here, once, rather than duplicated in
 each adapter:
 
 * **A listing URL is only opened once its host is confirmed to belong to the
@@ -30,6 +30,17 @@ each adapter:
   at load time with a specific complaint, rather than surfacing later as "no
   such element" from deep inside a click, or — worse — silently supplying
   one board's selectors to another's adapter.
+* **A click that was actually attempted is never followed by another one
+  after it fails.** `attempt_click` distinguishes "nothing was dispatched"
+  (no match, an ambiguous match, an invisible match, or the query itself
+  raising) from "`.click()` was invoked and raised" — the latter may already
+  have dispatched pointer/press events before raising, so
+  `ClickAttempt.safe_to_try_another_control` is `False` only for it. An
+  adapter with a fallback control (Jobright's Apply-with-Autofill, then its
+  normal Apply) may only try the fallback when the first case holds; every
+  Playwright exception from a query, a visibility check, or a click is
+  reported through this typed result rather than propagating out of
+  `start_application`.
 
 Playwright is never imported here; `page` is duck-typed (`goto`,
 `query_selector_all`, and whatever an `ElementHandle`-like object exposes),
@@ -45,6 +56,11 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from urllib.parse import urlsplit
 
 from app.storage.models import Board
+
+
+def _describe(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
+
 
 #: Cap on a selector map file. A board's selectors are a handful of short CSS
 #: strings; anything this large is either a mistake or a way to exhaust
@@ -480,78 +496,174 @@ def require_trusted_host(url: str, board: Board) -> None:
         )
 
 
-async def _find_single(page: Any, selector: str) -> Any | None:
-    """Return the one element matching `selector` on `page`, or `None`.
+async def _best_effort_visible(element: Any) -> bool:
+    """Whether `element` is visible, treating an unverifiable element as not.
 
-    Zero matches and *more than one* match are both treated as "not found":
-    clicking an ambiguous selector could land on the wrong one of several
-    similar controls, which is worse than not clicking anything.
+    Used only where no click is at stake (a detection probe's later
+    candidates, or the browsing-only path through `probe_selector`): an
+    exception here means nothing was dispatched to the page, so "assume not
+    visible, look at other matches" is always a safe response.
     """
-    query_all = getattr(page, "query_selector_all", None)
-    if query_all is None:
-        return None
-    try:
-        matches = list(await query_all(selector))
-    except Exception:  # noqa: BLE001 - a selector/query failure means "not present"
-        return None
-    matches = [match for match in matches if match is not None]
-    if len(matches) != 1:
-        return None
-    return matches[0]
-
-
-async def _is_visible(element: Any) -> bool:
     is_visible = getattr(element, "is_visible", None)
     if is_visible is None:
         return True
     try:
         return bool(await is_visible())
-    except Exception:  # noqa: BLE001 - an unverifiable element is not clickable
+    except Exception:  # noqa: BLE001 - see docstring
         return False
 
 
-async def click_selector(page: Any, selector: str) -> bool:
-    """Find exactly one visible element matching `selector` and click it.
+class ProbeOutcome(str, Enum):
+    """The result of checking whether a selector matches anything on a page."""
 
-    Returns whether a click happened, and raises nothing: no match, more
-    than one match, and an invisible match are all ordinary "did not click"
-    outcomes as a page's markup varies, not exceptions. This is the only way
-    adapters click an "explicit configured control" — an ambiguous or absent
-    selector is refused rather than guessed at.
-    """
-    element = await _find_single(page, selector)
-    if element is None:
-        return False
-    if not await _is_visible(element):
-        return False
-    click = getattr(element, "click", None)
-    if click is None:
-        return False
-    await click()
-    return True
+    PRESENT = "present"
+    ABSENT = "absent"
+    #: The query itself raised: presence is genuinely unknown, not "no".
+    INDETERMINATE = "indeterminate"
 
 
-async def selector_present(page: Any, selector: str) -> bool:
-    """Whether at least one *visible* element matches `selector`.
+@dataclass(frozen=True)
+class SelectorProbe:
+    outcome: ProbeOutcome
+    detail: str = ""
 
-    Used for detection-only checks (e.g. "is this an Easy Apply listing?")
-    where an adapter must know a control exists without touching anything —
-    unlike `click_selector`, more than one match is fine here, since nothing
-    is clicked either way.
+    @property
+    def present(self) -> bool:
+        return self.outcome is ProbeOutcome.PRESENT
+
+
+async def probe_selector(page: Any, selector: str) -> SelectorProbe:
+    """Whether at least one *visible* element matches `selector` — without
+    touching anything.
+
+    Used for detection-only checks such as "is this an Easy Apply listing?",
+    where more than one match is fine (nothing is clicked either way) but a
+    query that raises must **not** be read as "absent": a caller detecting an
+    unsupported flow that then proceeds on a false "absent" could walk
+    straight into the very flow the probe exists to keep it out of.
+    `INDETERMINATE` exists so that mistake is a type error, not a possibility
+    silently swallowed here.
     """
     query_all = getattr(page, "query_selector_all", None)
     if query_all is None:
-        return False
+        return SelectorProbe(ProbeOutcome.ABSENT, "page exposes no query_selector_all")
     try:
         matches = await query_all(selector)
-    except Exception:  # noqa: BLE001 - a selector/query failure means "not present"
-        return False
+    except Exception as exc:  # noqa: BLE001 - reported as indeterminate, not swallowed
+        return SelectorProbe(
+            ProbeOutcome.INDETERMINATE, f"query for {selector!r} raised {_describe(exc)}"
+        )
     for match in matches or []:
         if match is None:
             continue
-        if await _is_visible(match):
-            return True
-    return False
+        if await _best_effort_visible(match):
+            return SelectorProbe(ProbeOutcome.PRESENT)
+    return SelectorProbe(ProbeOutcome.ABSENT)
+
+
+class ClickOutcome(str, Enum):
+    """The result of trying to click exactly one visible match for a selector."""
+
+    CLICKED = "clicked"
+    #: Zero or more-than-one match: nothing was dispatched.
+    NOT_FOUND = "not_found"
+    #: Exactly one match, but confirmed (or unverifiably) not visible: nothing
+    #: was dispatched.
+    NOT_VISIBLE = "not_visible"
+    #: The query itself raised, before any element was found: nothing was
+    #: dispatched.
+    QUERY_FAILED = "query_failed"
+    #: `.click()` was actually invoked and raised. Unlike every outcome
+    #: above, a real Playwright click may dispatch pointer/press events
+    #: *before* raising — a mid-click navigation, a detached element, a
+    #: timeout after the down-event — so whether anything happened on the
+    #: page is genuinely unknown.
+    CLICK_FAILED = "click_failed"
+
+
+@dataclass(frozen=True)
+class ClickAttempt:
+    outcome: ClickOutcome
+    detail: str = ""
+
+    @property
+    def clicked(self) -> bool:
+        return self.outcome is ClickOutcome.CLICKED
+
+    @property
+    def safe_to_try_another_control(self) -> bool:
+        """Whether a caller may safely attempt a *different* selector instead.
+
+        True for every outcome except `CLICK_FAILED`: `NOT_FOUND`,
+        `NOT_VISIBLE`, and `QUERY_FAILED` all mean `.click()` was never
+        actually invoked, so nothing was dispatched to the page and trying a
+        different control is exactly as safe as trying the first one would
+        have been. Once `.click()` *has* been called, though, an exception
+        does not mean nothing happened — see `ClickOutcome.CLICK_FAILED` —
+        so a second click on a *different* control could act on a page
+        that is already mid-transition from the first one; the only safe
+        response is to stop and report exactly what happened.
+        """
+        return self.outcome is not ClickOutcome.CLICK_FAILED
+
+
+async def attempt_click(page: Any, selector: str) -> ClickAttempt:
+    """Find exactly one visible element matching `selector` and click it.
+
+    Never raises: every way this can fail to click anything — no match, an
+    ambiguous match, an invisible match, or an outright exception from the
+    query, the visibility check, or the click itself — is reported as a
+    `ClickAttempt`, not an exception. What a caller does next must depend on
+    *which* of those it was: see `ClickAttempt.safe_to_try_another_control`.
+    This is the only way adapters click an "explicit configured control" — an
+    ambiguous or absent selector is refused rather than guessed at.
+    """
+    query_all = getattr(page, "query_selector_all", None)
+    if query_all is None:
+        return ClickAttempt(ClickOutcome.NOT_FOUND, "page exposes no query_selector_all")
+
+    try:
+        matches = [m for m in (await query_all(selector)) if m is not None]
+    except Exception as exc:  # noqa: BLE001 - nothing was clicked; reported, not swallowed
+        return ClickAttempt(
+            ClickOutcome.QUERY_FAILED, f"query for {selector!r} raised {_describe(exc)}"
+        )
+
+    if len(matches) != 1:
+        return ClickAttempt(
+            ClickOutcome.NOT_FOUND,
+            f"{len(matches)} element(s) matched {selector!r}; exactly one is required",
+        )
+    element = matches[0]
+
+    is_visible = getattr(element, "is_visible", None)
+    if is_visible is not None:
+        try:
+            visible = bool(await is_visible())
+        except Exception as exc:  # noqa: BLE001 - nothing was clicked yet
+            return ClickAttempt(
+                ClickOutcome.NOT_VISIBLE,
+                f"visibility of the match for {selector!r} could not be "
+                f"determined: {_describe(exc)}",
+            )
+        if not visible:
+            return ClickAttempt(
+                ClickOutcome.NOT_VISIBLE, f"the match for {selector!r} is not visible"
+            )
+
+    click = getattr(element, "click", None)
+    if click is None:
+        return ClickAttempt(
+            ClickOutcome.NOT_FOUND, f"the match for {selector!r} exposes no click()"
+        )
+
+    try:
+        await click()
+    except Exception as exc:  # noqa: BLE001 - the click may already have been dispatched
+        return ClickAttempt(
+            ClickOutcome.CLICK_FAILED, f"click() on {selector!r} raised {_describe(exc)}"
+        )
+    return ClickAttempt(ClickOutcome.CLICKED)
 
 
 class BaseBoardAdapter:

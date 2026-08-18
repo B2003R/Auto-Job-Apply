@@ -237,3 +237,84 @@ class FakePage:
             for node in _iter_descendants(self.root)
             if compound_matches(node, compound)
         ]
+
+
+class ClickRaisesElement:
+    """Wraps a `FakeElement`, making `click()` raise instead of clicking.
+
+    Models a Playwright `click()` that fails *after* the element was found
+    and confirmed visible — a timeout waiting for the element to be
+    "actionable", a detached node from a concurrent re-render, and so on.
+    Crucially, unlike a query or visibility failure, a real click may have
+    already dispatched pointer/press events to the page before raising, so
+    tests using this double can assert that adapters never quietly treat it
+    the same as "nothing was there".
+    """
+
+    def __init__(self, inner: FakeElement, exc: BaseException) -> None:
+        self._inner = inner
+        self._exc = exc
+
+    async def is_visible(self) -> bool:
+        return await self._inner.is_visible()
+
+    async def click(self) -> None:
+        raise self._exc
+
+
+class VisibilityRaisesElement:
+    """Wraps a `FakeElement`, making `is_visible()` raise instead of answering.
+
+    Models a Playwright `is_visible()` that fails outright (e.g. the frame
+    navigated away while the check was in flight). Nothing is dispatched to
+    the page by a visibility check, so this is always safe to treat the same
+    as "not visible" and fall back to a different control.
+    """
+
+    def __init__(self, inner: FakeElement, exc: BaseException) -> None:
+        self._inner = inner
+        self._exc = exc
+
+    async def is_visible(self) -> bool:
+        raise self._exc
+
+    async def click(self) -> None:
+        await self._inner.click()
+
+
+class FaultInjectingPage:
+    """Wraps a `FakePage`, injecting one fault into one selector's matches.
+
+    `fault="query"` makes `query_selector_all(selector)` itself raise, as if
+    the query never ran at all — nothing was found, let alone clicked.
+    `fault="visible"` and `fault="click"` wrap every element the wrapped page
+    returns for `selector` in `VisibilityRaisesElement` / `ClickRaisesElement`
+    respectively, leaving every other selector's results untouched.
+    """
+
+    def __init__(
+        self, page: FakePage, *, selector: str, fault: str, exc: BaseException
+    ) -> None:
+        self._page = page
+        self._selector = selector
+        self._fault = fault
+        self._exc = exc
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._page, name)
+
+    async def goto(self, url: str) -> None:
+        await self._page.goto(url)
+
+    async def query_selector_all(self, selector: str) -> Sequence[object]:
+        if selector == self._selector and self._fault == "query":
+            self._page.queried_selectors.append(selector)
+            raise self._exc
+        matches = await self._page.query_selector_all(selector)
+        if selector != self._selector:
+            return matches
+        if self._fault == "visible":
+            return [VisibilityRaisesElement(m, self._exc) for m in matches]
+        if self._fault == "click":
+            return [ClickRaisesElement(m, self._exc) for m in matches]
+        return matches

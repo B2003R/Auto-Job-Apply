@@ -12,7 +12,11 @@ already knows how to handle.
 and skips the whole listing the moment it is present, before any other
 selector on the page is even queried — so the modal is never entered, and
 `apply_button` is never clicked underneath it. Only when Easy Apply is
-absent does it look for, and click, the plain external Apply control.
+*confirmed* absent does it look for, and click, the plain external Apply
+control: if that check itself cannot be completed (the probe raised, so
+presence is genuinely unknown), the safe response is to fail rather than
+guess "absent" and click whatever `apply_button` matches on what might
+actually be an Easy Apply page underneath.
 """
 
 from __future__ import annotations
@@ -23,11 +27,12 @@ from app.boards.base import (
     ApplyResult,
     ApplyStatus,
     BaseBoardAdapter,
+    ProbeOutcome,
     SelectorMap,
     SkipReason,
-    click_selector,
+    attempt_click,
     load_selector_map,
-    selector_present,
+    probe_selector,
 )
 from app.storage.models import Board
 
@@ -45,17 +50,27 @@ class LinkedInAdapter(BaseBoardAdapter):
         )
 
     async def start_application(self, page: Any) -> ApplyResult:
-        if await selector_present(page, self.selectors.require("easy_apply_indicator")):
+        easy_apply = await probe_selector(page, self.selectors.require("easy_apply_indicator"))
+        if easy_apply.outcome is ProbeOutcome.INDETERMINATE:
+            return ApplyResult(
+                status=ApplyStatus.FAILED,
+                reason=(
+                    "could not determine whether this listing uses Easy Apply "
+                    f"({easy_apply.detail}); refusing to guess and click the "
+                    "external apply control instead"
+                ),
+            )
+        if easy_apply.present:
             return ApplyResult(
                 status=ApplyStatus.SKIPPED,
                 reason=SkipReason.LINKEDIN_EASY_APPLY.value,
             )
 
-        clicked = await click_selector(page, self.selectors.require("apply_button"))
-        if not clicked:
+        attempt = await attempt_click(page, self.selectors.require("apply_button"))
+        if not attempt.clicked:
             return ApplyResult(
                 status=ApplyStatus.FAILED,
-                reason="no external apply control was found on this listing",
+                reason=f"could not click the external apply control: {attempt.detail}",
             )
         return ApplyResult(
             status=ApplyStatus.STARTED,

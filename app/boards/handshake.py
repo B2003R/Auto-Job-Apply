@@ -14,7 +14,7 @@ from app.boards.base import (
     ApplyStatus,
     BaseBoardAdapter,
     SelectorMap,
-    click_selector,
+    attempt_click,
     load_selector_map,
 )
 from app.storage.models import Board
@@ -33,11 +33,11 @@ class HandshakeAdapter(BaseBoardAdapter):
         )
 
     async def start_application(self, page: Any) -> ApplyResult:
-        clicked = await click_selector(page, self.selectors.require("apply_button"))
-        if not clicked:
+        attempt = await attempt_click(page, self.selectors.require("apply_button"))
+        if not attempt.clicked:
             return ApplyResult(
                 status=ApplyStatus.FAILED,
-                reason="no apply control was found on this listing",
+                reason=f"could not click the apply control: {attempt.detail}",
             )
         return ApplyResult(
             status=ApplyStatus.STARTED,

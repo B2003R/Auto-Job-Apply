@@ -5,9 +5,21 @@ control that starts the extension's autofill flow immediately, without
 first routing through a plain Apply button. That control is looked for and
 clicked *first*, but only when the selector map names one explicitly and it
 resolves to exactly one visible element on the page (see
-`app.boards.base.click_selector`); an absent, unconfigured, or ambiguous
+`app.boards.base.attempt_click`); an absent, unconfigured, or ambiguous
 match falls through to the normal Apply control rather than guessing which
 of several similar-looking buttons is the real one.
+
+That fallback is only safe, though, when nothing was actually dispatched to
+the page by the first attempt. If the autofill control was found, confirmed
+visible, and `.click()` was invoked but raised, Playwright may already have
+sent the click before failing — a mid-click navigation, a detached element,
+a timeout after the pointer-down. Clicking the normal Apply control next
+would then risk a *second* click on a page already reacting to the first, so
+that case is reported as `FAILED` with a diagnostic instead, and the normal
+Apply control is never even queried. `ClickAttempt.safe_to_try_another_control`
+is exactly this distinction: true for "nothing was dispatched" (absent,
+ambiguous, hidden, or the query itself failing), false only once `.click()`
+has actually been invoked and raised.
 
 This adapter is distinct from the four-tier `JobrightTrigger` in
 `app.agent.jobright_trigger`: that trigger fires *after* an ATS page has
@@ -24,7 +36,7 @@ from app.boards.base import (
     ApplyStatus,
     BaseBoardAdapter,
     SelectorMap,
-    click_selector,
+    attempt_click,
     load_selector_map,
 )
 from app.storage.models import Board
@@ -46,18 +58,32 @@ class JobrightAdapter(BaseBoardAdapter):
 
     async def start_application(self, page: Any) -> ApplyResult:
         autofill_selector = self.selectors.get("autofill_apply_button")
-        if autofill_selector and await click_selector(page, autofill_selector):
-            return ApplyResult(
-                status=ApplyStatus.STARTED,
-                reason="clicked the explicit Apply-with-Autofill control",
-                clicked="autofill_apply_button",
-            )
+        if autofill_selector:
+            attempt = await attempt_click(page, autofill_selector)
+            if attempt.clicked:
+                return ApplyResult(
+                    status=ApplyStatus.STARTED,
+                    reason="clicked the explicit Apply-with-Autofill control",
+                    clicked="autofill_apply_button",
+                )
+            if not attempt.safe_to_try_another_control:
+                return ApplyResult(
+                    status=ApplyStatus.FAILED,
+                    reason=(
+                        "the explicit Apply-with-Autofill control was clicked, "
+                        f"but the click failed or its outcome is unknown ({attempt.detail}); "
+                        "refusing to click the normal apply control afterwards, "
+                        "since the first click may already have been dispatched"
+                    ),
+                )
+            # Nothing was dispatched (absent, ambiguous, hidden, or the query
+            # itself failed): falling back to the normal control is safe.
 
-        clicked = await click_selector(page, self.selectors.require("apply_button"))
-        if not clicked:
+        fallback = await attempt_click(page, self.selectors.require("apply_button"))
+        if not fallback.clicked:
             return ApplyResult(
                 status=ApplyStatus.FAILED,
-                reason="no apply control was found on this listing",
+                reason=f"could not click any apply control: {fallback.detail}",
             )
         return ApplyResult(
             status=ApplyStatus.STARTED,
