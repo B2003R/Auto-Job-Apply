@@ -57,12 +57,14 @@ const fileConfigSchema = z.object({
 });
 
 const envSchema = z.object({
-  OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
+  OPENAI_API_KEY: z.string({ error: 'not set. Add your OpenAI key to .env' }).min(1, 'is empty'),
   OPENAI_MODEL: z.string().min(1).default('gpt-4.1'),
   CHROME_PROFILE_DIR: z.string().min(1).default('./.browser-profile'),
   CHROME_DEBUG_PORT: z.coerce.number().int().min(1024).max(65535).default(9222),
   CHROME_PATH: z.string().optional(),
-  APPLICATION_EMAIL: z.string().email('APPLICATION_EMAIL must be a valid address'),
+  APPLICATION_EMAIL: z
+    .string({ error: 'not set. Add the mailbox the agent should use for ATS accounts to .env' })
+    .email('must be a valid email address'),
   WEBMAIL_PROVIDER: z.enum(['gmail', 'outlook']).default('gmail'),
   VAULT_KEY: z.string().optional(),
   NOTIFY_WEBHOOK: z.string().optional(),

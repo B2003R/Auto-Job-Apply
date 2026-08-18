@@ -3,6 +3,7 @@ import { logger } from '../logger.ts';
 import { launchBrowser } from '../browser/chrome.ts';
 import { randomInt, sleep } from '../browser/humanize.ts';
 import { detectJobrightExtension } from '../jobright/extension.ts';
+import { loadAnswerBank } from '../apply/answerBank.ts';
 import { applyToJob, type ApplicationResult } from '../apply/orchestrator.ts';
 import { buildSources } from '../sources/index.ts';
 import {
@@ -25,6 +26,11 @@ import type { CliArgs } from '../index.ts';
  */
 export async function runApplications(args: CliArgs): Promise<void> {
   const config = loadConfig();
+
+  // Fail before opening a browser rather than partway through the first
+  // application: an incomplete answer bank is a setup mistake, not a runtime one.
+  loadAnswerBank();
+
   const sources = buildSources().filter((s) => !args.source || s.key === args.source);
   const sourcesByKey = new Map(sources.map((s) => [s.key, s]));
 
