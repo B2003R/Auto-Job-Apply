@@ -12,12 +12,18 @@ the *least* trusted source of an answer in this project:
   here, at the only place that could actually transmit them, in addition to
   being excluded upstream by the gap filler. Defence in depth, because the
   cost of the failure is an invented answer submitted under someone's name.
-* **A partial answer is not an answer.** A completion that stopped at the
-  token limit is rejected rather than returned, because truncated prose still
-  reads like prose and would be typed into a form mid-sentence. A refusal —
-  reported by `finish_reason`, by `message.refusal`, or simply written out as
-  "I'm sorry, I don't have enough information" — comes back as `declined`, so
-  the field goes to the applicant instead.
+* **A partial answer is not an answer.** Only `finish_reason` values known to
+  mean "finished" are accepted; anything else, including every spelling of
+  truncation and anything a future provider invents, is rejected, because
+  truncated prose still reads like prose and would be typed into a form
+  mid-sentence. A refusal — reported by `finish_reason`, by
+  `message.refusal`, or simply written out as "I'm sorry, I don't have enough
+  information" — comes back as `declined`, so the field goes to the applicant
+  instead.
+* **The model that answered must be the model that was priced.** A response
+  attributed to anything but the configured model (or a dated snapshot of it,
+  which bills the same) is refused rather than recorded, since there is no
+  honest price for a model nobody configured.
 * **Cost is exact.** Token prices are `Decimal` from configuration to
   arithmetic; a fraction of a cent per call compounds over thousands of
   calls, and a float would make the ledger disagree with the invoice. Usage
@@ -63,10 +69,34 @@ _REDACTED = "***redacted***"
 #: provider's scheme marker ("sk-") appearing in ordinary prose.
 _MIN_REDACTED_PREFIX_CHARS = 12
 
-#: `finish_reason` values that mean the text stopped short of the answer.
-#: A truncated draft still reads like prose, so accepting one would type
-#: half a sentence into someone's application.
-_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "content_length"})
+#: A dated or numbered snapshot of the configured model: `-2024-07-18`,
+#: `:20260801`, `-v2`. Must start with a digit (or a `v` and a digit), so
+#: `-mini-clone` is a different model rather than a version of this one.
+_SNAPSHOT_SUFFIX_RE = re.compile(r"[-:@](v?\d[\w.\-]*)", re.IGNORECASE)
+
+#: The only `finish_reason` values that mean "the model finished saying what
+#: it had to say". An allowlist, because providers spell truncation half a
+#: dozen ways — `length`, `model_length`, `truncated`, `token_limit`,
+#: `max_output_tokens` — and a denylist of the spellings we thought of
+#: accepts the next one as a complete answer. Tool-call outcomes are absent
+#: deliberately: this module sends no tools, so `tool_calls` means the
+#: provider did something unrequested rather than that it answered.
+_SUCCESSFUL_FINISH_REASONS = frozenset({"stop", "end_turn", "eos", "stop_sequence"})
+
+#: Spellings of truncation that get a message naming the cause. Anything else
+#: unrecognised is rejected too, just with a vaguer explanation.
+_TRUNCATED_FINISH_REASONS = frozenset(
+    {
+        "length",
+        "max_tokens",
+        "content_length",
+        "model_length",
+        "truncated",
+        "token_limit",
+        "max_output_tokens",
+        "max_completion_tokens",
+    }
+)
 
 #: `finish_reason` values that mean the provider withheld an answer. Unlike
 #: truncation this is not a fault to raise on; it is the model declining,
@@ -320,6 +350,16 @@ class ModelRouter:
                 f"answer was truncated at the output limit (finish_reason "
                 f"{finish!r}); a partial answer must not be typed into a form",
             )
+        if finish and finish not in _SUCCESSFUL_FINISH_REASONS | _DECLINED_FINISH_REASONS:
+            # Fail closed. An unrecognised reason is not evidence that the
+            # model finished, and treating it as one is how the next
+            # provider's word for truncation gets typed into a form.
+            raise ModelResponseError(
+                response.status_code,
+                f"unrecognised finish_reason {finish!r}; only "
+                f"{sorted(_SUCCESSFUL_FINISH_REASONS)} are known to mean the "
+                "answer is complete, so this reply is not usable",
+            )
 
         refusal = message.get("refusal")
         refused = finish in _DECLINED_FINISH_REASONS or (
@@ -333,6 +373,8 @@ class ModelRouter:
                 response.status_code, "response carried an empty answer"
             )
 
+        served = self._verify_model(body.get("model"), profile, response.status_code)
+
         usage = self._parse_usage(body.get("usage"), response.status_code)
         return ModelAnswer(
             # A refusal with no content still needs a text: `UNKNOWN` is the
@@ -340,10 +382,43 @@ class ModelRouter:
             # sees one shape of "no answer" rather than two.
             text=text or "UNKNOWN",
             tier=profile.tier,
-            model=profile.name,
+            model=served,
             usage=usage,
             cost=token_cost(profile, usage),
             refused=refused,
+        )
+
+    @staticmethod
+    def _verify_model(raw: Any, profile: ModelProfile, status: int) -> str:
+        """Refuse an answer from a model other than the one that was priced.
+
+        Cost is computed from the *configured* model's prices, so a gateway
+        that quietly serves something else makes every figure in the ledger
+        wrong — and the ledger is the only record of what this agent spent.
+        Rejecting is preferred to re-pricing because there is no honest price
+        for a model nobody configured.
+
+        A dated snapshot (`gpt-4o-mini-2024-07-18` for `gpt-4o-mini`) is the
+        one substitution that bills identically, so it is accepted and
+        recorded under the name the provider reported.
+        """
+        if not isinstance(raw, str) or not raw.strip():
+            # Not every OpenAI-compatible server echoes the model; absent is
+            # not the same claim as a different one.
+            return profile.name
+        served = raw.strip()
+        configured = profile.name.strip()
+        if served == configured:
+            return served
+        if served.startswith(configured) and _SNAPSHOT_SUFFIX_RE.fullmatch(
+            served[len(configured) :]
+        ):
+            return served
+        raise ModelResponseError(
+            status,
+            f"answer came from model {served!r}, but {configured!r} was requested "
+            "and is what its token prices describe; refusing rather than billing "
+            "one model at another's rates",
         )
 
     @staticmethod
@@ -421,9 +496,13 @@ class ModelRouter:
         if not key:
             return text
         scrubbed = text.replace(key, _REDACTED)
+        # Every length, not just the first that matches: a body often echoes
+        # the key more than once and at more than one truncation ("key=sk-abc…"
+        # in the message, "attempted=sk-ab…" in the error object), and
+        # stopping at the first leaves the rest in the log. Longest first, so
+        # each occurrence is replaced at its full length.
         for length in range(len(key) - 1, _MIN_REDACTED_PREFIX_CHARS - 1, -1):
             prefix = key[:length]
             if prefix in scrubbed:
                 scrubbed = scrubbed.replace(prefix, _REDACTED)
-                break
         return scrubbed

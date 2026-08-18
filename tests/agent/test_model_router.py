@@ -98,7 +98,12 @@ class RecordingTransport(httpx.MockTransport):
             self.requests.append(request)
             if responder is not None:
                 return responder(request)
-            return httpx.Response(200, json=completion_payload())
+            # Echo the requested model, as a real provider does, so a default
+            # response is never accidentally a substituted one.
+            import json
+
+            requested = json.loads(request.content.decode("utf-8")).get("model")
+            return httpx.Response(200, json=completion_payload(model=requested))
 
         super().__init__(handler)
 
@@ -504,7 +509,45 @@ class TestTruncationAndRefusal:
 
         assert (await router.complete(QUESTION)).declined is True
 
-    @pytest.mark.parametrize("finish_reason", ["stop", None])
+    @pytest.mark.parametrize(
+        "finish_reason",
+        [
+            "model_length",
+            "truncated",
+            "token_limit",
+            "max_output_tokens",
+            "tool_calls",
+            "function_call",
+            "error",
+            "cancelled",
+            "something_new_from_a_future_provider",
+        ],
+    )
+    async def test_an_unrecognised_finish_reason_is_rejected(
+        self, finish_reason: str
+    ) -> None:
+        """Unknown means unknown, and an unknown stop is not a known-good one.
+
+        Providers spell truncation half a dozen ways — model_length,
+        truncated, token_limit, max_output_tokens — and a denylist of the
+        spellings we happened to think of accepts the next one as a complete
+        answer. Only reasons known to mean "finished" are accepted.
+        """
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200, json=completion_payload(finish_reason=finish_reason)
+            )
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        assert finish_reason in str(excinfo.value)
+
+    @pytest.mark.parametrize(
+        "finish_reason", ["stop", "end_turn", "eos", "stop_sequence", None, "", "  "]
+    )
     async def test_a_completed_answer_is_returned(
         self, finish_reason: str | None
     ) -> None:
@@ -633,6 +676,28 @@ class TestErrorExcerptRedaction:
 
         assert API_KEY[:20] not in str(excinfo.value)
 
+    async def test_every_occurrence_of_a_key_prefix_is_scrubbed(self) -> None:
+        """One redaction is not enough when a body repeats the key.
+
+        Providers echo a rejected key in a message and again in an error
+        object, and often at two different truncations. Stopping after the
+        first match leaves the rest in the log.
+        """
+        body = (
+            f"Incorrect API key provided: {API_KEY[:20]}****. "
+            f"See docs. key={API_KEY[:20]} attempted={API_KEY[:16]} "
+            f"full={API_KEY}"
+        )
+        transport = RecordingTransport(lambda request: httpx.Response(401, text=body))
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        message = str(excinfo.value)
+        for cut in range(12, len(API_KEY) + 1):
+            assert API_KEY[:cut] not in message
+
     async def test_a_short_coincidental_prefix_is_not_scrubbed(self) -> None:
         """Redaction must not eat the message; "sk-" is not the key."""
         transport = RecordingTransport(
@@ -657,6 +722,97 @@ class TestErrorExcerptRedaction:
             await router.complete(QUESTION)
 
         assert len(str(excinfo.value)) < _MAX_ERROR_DETAIL_CHARS + 200
+
+
+class TestModelSubstitution:
+    """The bill is computed from the configured model, so it has to be the
+    one that answered.
+
+    A gateway that quietly serves a different model than the one requested
+    makes every cost in the ledger wrong — and the ledger is the only record
+    of what this agent spent. A dated snapshot of the same model is the one
+    substitution that is priced identically, so that is the only one taken.
+    """
+
+    async def test_a_substituted_model_is_rejected(self) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200, json=completion_payload(model="some-other-model")
+            )
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        message = str(excinfo.value)
+        assert "some-other-model" in message
+        assert "routine-model" in message
+
+    async def test_a_cheaper_substitution_does_not_pass_as_the_configured_model(
+        self,
+    ) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200, json=completion_payload(model="routine-model-mini-clone")
+            )
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError):
+            await router.complete(QUESTION)
+
+    async def test_a_different_model_of_the_same_length_is_not_a_snapshot(self) -> None:
+        """The version suffix only counts on the configured name itself."""
+        served = "x" * len("routine-model") + "-2026-08-01"
+        transport = RecordingTransport(
+            lambda request: httpx.Response(200, json=completion_payload(model=served))
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError):
+            await router.complete(QUESTION)
+
+    @pytest.mark.parametrize(
+        "served",
+        ["routine-model", "routine-model-2026-08-01", "routine-model:20260801"],
+    )
+    async def test_a_dated_snapshot_of_the_same_model_is_accepted(
+        self, served: str
+    ) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(200, json=completion_payload(model=served))
+        )
+        router, _ = build_router(transport)
+
+        answer = await router.complete(QUESTION)
+
+        assert answer.model == served
+        assert answer.cost == token_cost(
+            router.select(Complexity.ROUTINE),
+            TokenUsage(input_tokens=1_000, output_tokens=20),
+        )
+
+    async def test_a_response_without_a_model_field_is_still_accepted(self) -> None:
+        payload = completion_payload()
+        payload.pop("model")
+        transport = RecordingTransport(lambda request: httpx.Response(200, json=payload))
+        router, _ = build_router(transport)
+
+        answer = await router.complete(QUESTION)
+
+        assert answer.model == "routine-model"
+
+    async def test_the_escalation_model_is_checked_against_its_own_name(self) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200, json=completion_payload(model="routine-model")
+            )
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError):
+            await router.complete(QUESTION, Complexity.ESCALATION)
 
 
 class TestOptionalDependency:
