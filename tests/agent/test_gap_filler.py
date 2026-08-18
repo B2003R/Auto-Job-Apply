@@ -330,6 +330,28 @@ class TestCanonicalPrecedence:
         assert len(AnswerBook.from_yaml(path)) == 0
 
 
+class TestShippedExample:
+    """The example file must never answer a real form.
+
+    It is copied to `answers.yaml` verbatim, and a placeholder that loads is
+    a placeholder that gets typed into someone's application. Everything in
+    it is commented out, so a copy answers nothing until it is edited.
+    """
+
+    EXAMPLE = Path(__file__).resolve().parents[2] / "answers.example.yaml"
+
+    def test_the_example_file_parses(self) -> None:
+        AnswerBook.from_yaml(self.EXAMPLE)
+
+    def test_the_example_file_contains_no_active_answers(self) -> None:
+        assert len(AnswerBook.from_yaml(self.EXAMPLE)) == 0
+
+    def test_the_real_answers_file_is_ignored_by_git(self) -> None:
+        """Real answers are personal data; they must not be committable."""
+        gitignore = self.EXAMPLE.with_name(".gitignore").read_text(encoding="utf-8")
+        assert "answers.yaml" in gitignore.split()
+
+
 class TestProtectedDenial:
     PROTECTED_FIELDS = [
         field(key="visa", label="Will you require visa sponsorship?", name="sponsorship"),

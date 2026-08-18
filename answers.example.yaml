@@ -10,12 +10,16 @@
 # answer one and nothing infers one on your behalf. Even then, a protected
 # question still forces the approval gate to run before submission.
 #
+# Nothing below is active: every line is commented out on purpose, so a
+# straight copy of this file answers nothing until you edit it. A placeholder
+# that loads is a placeholder that gets typed into a real application.
+#
 # Two shapes are accepted. The short one maps a question to an answer:
-
-answers:
-  "Preferred name": "Alex Kim"
-  "How did you hear about us?": "Company careers page"
-
+#
+# answers:
+#   "Preferred name": "Alex Kim"
+#   "How did you hear about us?": "Company careers page"
+#
 # The long one is a list, for when one answer has to match several phrasings
 # or should be keyed to a form control's name rather than its label:
 #
@@ -35,3 +39,7 @@ answers:
 # "Preferred name" also answers a page rendering "Preferred Name *". A
 # question answered twice is an error rather than a silent last-one-wins, and
 # a malformed file is rejected whole rather than partially applied.
+#
+# Every question and every answer must be a quoted string. YAML reads a bare
+# yes, no, or on as a boolean and 2024 as a number, and this file refuses
+# those rather than guessing what you meant to type into the form.

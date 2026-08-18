@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .env
 *.db
+
+# Personal answers to application questions. Copy answers.example.yaml
+# instead; this file is yours and never belongs in the repository.
+answers.yaml

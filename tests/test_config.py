@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.config import Settings
 
@@ -55,3 +57,58 @@ def test_settings_ignores_unrelated_env(monkeypatch: pytest.MonkeyPatch) -> None
     settings = Settings(_env_file=None)
     assert settings.auto_submit is False
     assert os.environ.get("UNRELATED_ENV_VAR") == "should-not-affect-settings"
+
+
+class TestNumericBounds:
+    """Nonsense numbers are rejected at load, not absorbed at the call site.
+
+    A negative cap, a negative price, or a zero timeout is a typo in a `.env`
+    file. Loading it and coping later means the typo survives to whatever
+    code forgot to cope; refusing it means the run stops with the variable's
+    name in the error.
+    """
+
+    @pytest.mark.parametrize(
+        "variable",
+        [
+            "LINKEDIN_DAILY_CAP",
+            "JOBRIGHT_DAILY_CAP",
+            "WELLFOUND_DAILY_CAP",
+            "HANDSHAKE_DAILY_CAP",
+            "DELAY_MIN_MS",
+            "DELAY_MAX_MS",
+            "TOOLBAR_X",
+            "TOOLBAR_Y",
+            "ROUTINE_INPUT_PRICE",
+            "ROUTINE_OUTPUT_PRICE",
+            "ESCALATION_INPUT_PRICE",
+            "ESCALATION_OUTPUT_PRICE",
+        ],
+    )
+    def test_negative_values_are_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, variable: str
+    ) -> None:
+        monkeypatch.setenv(variable, "-1")
+        with pytest.raises(ValidationError) as excinfo:
+            Settings(_env_file=None)
+        assert variable.lower() in str(excinfo.value).lower()
+
+    @pytest.mark.parametrize(
+        "variable", ["MODEL_TIMEOUT_S", "MODEL_MAX_OUTPUT_TOKENS"]
+    )
+    def test_zero_is_rejected_where_it_would_disable_the_call(
+        self, monkeypatch: pytest.MonkeyPatch, variable: str
+    ) -> None:
+        monkeypatch.setenv(variable, "0")
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+
+    def test_zero_is_accepted_where_it_means_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A zero cap is a real instruction: apply to nothing on that board."""
+        monkeypatch.setenv("LINKEDIN_DAILY_CAP", "0")
+        monkeypatch.setenv("ROUTINE_INPUT_PRICE", "0")
+        settings = Settings(_env_file=None)
+        assert settings.linkedin_daily_cap == 0
+        assert settings.routine_input_price == Decimal("0")

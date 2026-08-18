@@ -5,7 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,10 +21,13 @@ class Settings(BaseSettings):
     auto_submit: bool = False
     log_field_values: bool = False
 
-    linkedin_daily_cap: int = 40
-    jobright_daily_cap: int = 40
-    wellfound_daily_cap: int = 40
-    handshake_daily_cap: int = 40
+    # ge=0, not gt=0: a zero cap is a real instruction ("apply to nothing on
+    # this board today"), while a negative one is a typo that would otherwise
+    # be silently clamped somewhere downstream.
+    linkedin_daily_cap: int = Field(default=40, ge=0)
+    jobright_daily_cap: int = Field(default=40, ge=0)
+    wellfound_daily_cap: int = Field(default=40, ge=0)
+    handshake_daily_cap: int = Field(default=40, ge=0)
 
     sqlite_path: Path = Path("./data/jobs.db")
     artifacts_path: Path = Path("./data/artifacts")
@@ -36,15 +39,15 @@ class Settings(BaseSettings):
     # refuses to run rather than press an arbitrary screen pixel on a machine
     # whose toolbar has never been measured. Set both via
     # scripts/calibrate_toolbar.py.
-    toolbar_x: int = 0
-    toolbar_y: int = 0
+    toolbar_x: int = Field(default=0, ge=0)
+    toolbar_y: int = Field(default=0, ge=0)
     #: Window the native tier activates (and verifies) before clicking.
     chrome_window_name: str = "Google Chrome"
     #: Explicit X window id, for when several windows match the name.
     chrome_window_id: str = ""
 
-    delay_min_ms: int = 500
-    delay_max_ms: int = 1500
+    delay_min_ms: int = Field(default=500, ge=0)
+    delay_max_ms: int = Field(default=1500, ge=0)
 
     routine_model_url: str = "https://api.openai.com/v1"
     routine_model_name: str = "gpt-4o-mini"
@@ -57,12 +60,15 @@ class Settings(BaseSettings):
     # Decimal, not float: prices are exact quantities of money, and
     # pydantic parses "0.15" into exactly Decimal("0.15") rather than the
     # nearest binary approximation, so token costs add up exactly.
-    routine_input_price: Decimal = Decimal("0.15")
-    routine_output_price: Decimal = Decimal("0.60")
-    escalation_input_price: Decimal = Decimal("2.50")
-    escalation_output_price: Decimal = Decimal("10.00")
+    routine_input_price: Decimal = Field(default=Decimal("0.15"), ge=0)
+    routine_output_price: Decimal = Field(default=Decimal("0.60"), ge=0)
+    escalation_input_price: Decimal = Field(default=Decimal("2.50"), ge=0)
+    escalation_output_price: Decimal = Field(default=Decimal("10.00"), ge=0)
 
     #: Canonical, human-authored answers consulted before any model.
     answers_path: Path = Path("./answers.yaml")
-    model_timeout_s: float = 30.0
-    model_max_output_tokens: int = 400
+    # gt=0 for both: a zero timeout or a zero output budget does not mean
+    # "unlimited", it means every call fails, which is a typo worth catching
+    # at load rather than one failed request at a time.
+    model_timeout_s: float = Field(default=30.0, gt=0)
+    model_max_output_tokens: int = Field(default=400, gt=0)

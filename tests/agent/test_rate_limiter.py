@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from app.agent.errors import RateLimitExceeded
 from app.agent.rate_limiter import RateDecision, RateLimiter
@@ -139,11 +140,25 @@ class TestCapEnforcement:
 
         assert db.count_rate_events(Board.WELLFOUND, DAY.date()) == 0
 
-    def test_a_negative_cap_is_treated_as_zero_not_unlimited(
+    def test_a_negative_cap_is_refused_by_configuration(self, tmp_path: Path) -> None:
+        with pytest.raises(ValidationError):
+            Settings(
+                _env_file=None,
+                sqlite_path=tmp_path / "rates.db",
+                handshake_daily_cap=-5,
+            )
+
+    def test_a_negative_cap_reaching_the_limiter_is_zero_not_unlimited(
         self, db: Database, clock: FrozenClock, tmp_path: Path
     ) -> None:
-        settings = Settings(
-            _env_file=None,
+        """Defence in depth for a `Settings` built without validation.
+
+        Configuration rejects a negative cap, so this can only arrive via
+        `model_construct` or a future field default. The limiter still has to
+        read it as "none allowed" rather than letting `count < -5` wave every
+        application through.
+        """
+        settings = Settings.model_construct(
             sqlite_path=tmp_path / "rates.db",
             handshake_daily_cap=-5,
         )
