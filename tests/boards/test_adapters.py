@@ -19,7 +19,6 @@ directly against those recorded shapes rather than by inspection:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 
