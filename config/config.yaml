@@ -1,0 +1,60 @@
+# Non-secret tunables. Secrets live in .env.
+
+daily:
+  # Applications to submit per day across all sources.
+  target: 50
+  # Wall-clock window the agent is allowed to work in (local time, 24h).
+  activeWindow:
+    start: "09:00"
+    end: "21:00"
+  # Randomised gap between applications, in seconds. The scheduler also spreads
+  # work across the active window, so these are floors, not the whole story.
+  gapSeconds:
+    min: 45
+    max: 210
+
+# Per-source collection. Caps are daily submission ceilings per source and exist
+# to keep automation footprints small on platforms that dislike it.
+sources:
+  jobright:
+    enabled: true
+    cap: 30
+    listUrl: "https://jobright.ai/jobs/recommend"
+  linkedin:
+    enabled: true
+    # Deliberately conservative: LinkedIn is the most aggressive at detecting
+    # and restricting automated activity.
+    cap: 10
+    onlyEasyApply: false
+  wellfound:
+    enabled: true
+    cap: 10
+  handshake:
+    enabled: false
+    cap: 5
+
+safety:
+  # Stop the whole run after this many consecutive failures. Protects against a
+  # broken selector silently burning the day's quota.
+  circuitBreakerFailures: 5
+  # Max LLM repair attempts on a single form page before escalating to a human.
+  maxRepairLoops: 3
+  # Max pages to traverse in one multi-step ATS flow (Workday runs 5-7).
+  maxFormSteps: 10
+  # How long to wait for a human to clear a CAPTCHA or 2FA prompt, in seconds.
+  humanWaitSeconds: 180
+  # Refuse to submit unless Jobright reports every required field filled.
+  requireAllRequiredFieldsFilled: true
+
+timeouts:
+  # All in milliseconds.
+  navigation: 45000
+  autofillSettle: 20000
+  emailVerification: 180000
+  elementWait: 12000
+
+# Where the agent looks for the resume to upload when an ATS asks for a file and
+# Jobright did not already attach one.
+assets:
+  resumePath: "./assets/resume.pdf"
+  coverLetterPath: ""

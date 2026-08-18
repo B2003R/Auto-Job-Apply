@@ -1,0 +1,55 @@
+# Selectors for the Jobright autofill extension's injected UI.
+#
+# These are intentionally data rather than code. The extension's markup is not
+# ours and will change without notice, so when autofill stops being detected the
+# fix belongs here and needs no redeploy. Run `npm run agent -- probe:autofill`
+# on a real application page to see what currently matches.
+#
+# Every list is tried in order, and the first visible match wins. Playwright
+# pierces open shadow roots for CSS selectors automatically, and all frames on
+# the page are searched, so entries do not need to account for either.
+
+# The button that starts autofill. `accessibleNames` are matched against the
+# button/link accessible name; `css` entries are raw selectors.
+trigger:
+  accessibleNames:
+    - "^autofill$"
+    - "^auto fill$"
+    - "autofill with jobright"
+    - "^fill( this)?( form)?$"
+    - "jobright.*autofill"
+    - "autofill.*jobright"
+  css:
+    - "[data-testid*='autofill' i]"
+    - "[class*='jobright' i] button"
+    - "[id*='jobright' i] button"
+    - "#jobright-autofill-button"
+    - "button[class*='autofill' i]"
+    - "[aria-label*='autofill' i]"
+
+# The panel the extension shows while and after filling. Used to read progress.
+panel:
+  css:
+    - "[class*='jobright' i][class*='panel' i]"
+    - "[id*='jobright' i]"
+    - "[class*='autofill' i][class*='progress' i]"
+    - "aside[class*='jobright' i]"
+
+# Text patterns for the required-field progress readout, for example
+# "13/13 required fields" or "13 of 13 fields filled". First capture group is
+# the filled count, second is the total.
+progressPatterns:
+  - "(\\d+)\\s*/\\s*(\\d+)\\s*(?:required\\s*)?fields?"
+  - "(\\d+)\\s+of\\s+(\\d+)\\s*(?:required\\s*)?fields?"
+  - "(\\d+)\\s*/\\s*(\\d+)\\s*required"
+  - "filled\\s*(\\d+)\\s*(?:/|of)\\s*(\\d+)"
+
+# Text that means the extension refused to act and a human or the LLM must.
+blockedPatterns:
+  - "sign in to jobright"
+  - "log in to jobright"
+  - "session expired"
+  - "unsupported (site|page|form)"
+  - "upgrade to (pro|premium)"
+  - "limit reached"
+  - "no fields (found|detected)"

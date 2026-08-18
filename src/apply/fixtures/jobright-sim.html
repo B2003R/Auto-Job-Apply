@@ -1,0 +1,61 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Application — Jobright autofill simulation</title>
+  </head>
+  <body>
+    <h1>Apply</h1>
+
+    <form>
+      <label for="first">First name *</label>
+      <input id="first" type="text" required />
+
+      <label for="last">Last name *</label>
+      <input id="last" type="text" required />
+
+      <label for="email">Email *</label>
+      <input id="email" type="email" required />
+
+      <label for="phone">Phone *</label>
+      <input id="phone" type="tel" required />
+    </form>
+
+    <!-- Stands in for the extension's injected UI: an in-page trigger plus a
+         side panel that reports required-field progress. Filling happens over
+         several ticks so the driver's settle-polling is actually exercised. -->
+    <div class="jobright-autofill-panel" id="jobright-panel">
+      <span id="jobright-progress">0/4 required fields</span>
+    </div>
+    <button type="button" id="jobright-autofill-button" aria-label="Autofill">Autofill</button>
+
+    <script>
+      const fields = [
+        ['first', 'Ada'],
+        ['last', 'Lovelace'],
+        ['email', 'ada@example.com'],
+        ['phone', '+1 555 0100'],
+      ];
+
+      // Simulates a per-field stall so the driver cannot pass by luck of timing.
+      const stallAt = Number(new URLSearchParams(location.search).get('stallAt') ?? '-1');
+
+      document.getElementById('jobright-autofill-button').addEventListener('click', () => {
+        let i = 0;
+        const tick = () => {
+          if (i >= fields.length) return;
+          if (i === stallAt) {
+            document.getElementById('jobright-progress').textContent =
+              i + '/4 required fields — unsupported form';
+            return;
+          }
+          const [id, value] = fields[i];
+          document.getElementById(id).value = value;
+          i += 1;
+          document.getElementById('jobright-progress').textContent = i + '/4 required fields';
+          setTimeout(tick, 300);
+        };
+        setTimeout(tick, 200);
+      });
+    </script>
+  </body>
+</html>

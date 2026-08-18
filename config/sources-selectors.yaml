@@ -1,0 +1,94 @@
+# Selectors for each job board's listing and apply controls.
+#
+# Externalised for the same reason as the Jobright extension selectors: this
+# markup belongs to someone else and changes without warning. When collection
+# stops finding jobs, the fix is almost always here rather than in code.
+#
+# `cardSelector` should match one posting in a list. The link/title/company
+# selectors are resolved relative to a card. Every list is tried in order and the
+# first that yields results wins.
+
+jobright:
+  cardSelectors:
+    - "[class*='job-card' i]"
+    - "[class*='jobCard' i]"
+    - "[data-testid*='job' i]"
+    - "div[class*='list'] a[href*='/jobs/']"
+  linkSelectors:
+    - "a[href*='/jobs/']"
+  titleSelectors:
+    - "[class*='title' i]"
+    - "h2"
+    - "h3"
+  companySelectors:
+    - "[class*='company' i]"
+    - "[class*='employer' i]"
+  locationSelectors:
+    - "[class*='location' i]"
+  applyNames:
+    - "^apply( now)?$"
+    - "^apply with autofill$"
+    - "^quick apply$"
+
+linkedin:
+  cardSelectors:
+    - "div.job-card-container"
+    - "li.jobs-search-results__list-item"
+    - "[data-job-id]"
+  linkSelectors:
+    - "a.job-card-container__link"
+    - "a[href*='/jobs/view/']"
+  titleSelectors:
+    - "a.job-card-container__link"
+    - "[class*='job-card-list__title' i]"
+    - "h3"
+  companySelectors:
+    - "[class*='job-card-container__primary-description' i]"
+    - "[class*='company-name' i]"
+    - "h4"
+  locationSelectors:
+    - "[class*='job-card-container__metadata' i]"
+    - "[class*='metadata-item' i]"
+  applyNames:
+    - "^easy apply$"
+    - "^apply$"
+
+wellfound:
+  cardSelectors:
+    - "[data-test='JobSearchResults'] > div"
+    - "div[class*='styles_component' i][class*='job' i]"
+    - "a[href*='/jobs/']"
+  linkSelectors:
+    - "a[href*='/jobs/']"
+  titleSelectors:
+    - "[class*='title' i]"
+    - "h4"
+    - "h3"
+  companySelectors:
+    - "[class*='company' i]"
+    - "h2"
+  locationSelectors:
+    - "[class*='location' i]"
+  applyNames:
+    - "^apply( now)?$"
+    - "^i'?m interested$"
+    - "^learn more$"
+
+handshake:
+  cardSelectors:
+    - "[data-hook='jobs-card']"
+    - "[class*='JobCard' i]"
+    - "a[href*='/jobs/']"
+  linkSelectors:
+    - "a[href*='/jobs/']"
+  titleSelectors:
+    - "[class*='title' i]"
+    - "h3"
+  companySelectors:
+    - "[class*='employer' i]"
+    - "[class*='company' i]"
+  locationSelectors:
+    - "[class*='location' i]"
+  applyNames:
+    - "^apply( now)?$"
+    - "^apply externally$"
