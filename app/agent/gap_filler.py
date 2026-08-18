@@ -199,9 +199,17 @@ _PROTECTED_PATTERNS: Mapping[ProtectedCategory, tuple[Pattern[str], ...]] = {
         re.compile(r"\bnotice\s+period\b", re.IGNORECASE),
         re.compile(r"\blast\s+(working\s+)?day\b", re.IGNORECASE),
         re.compile(r"\b(when|how\s+soon)\s+(can|could|would)\s+you\s+start\b", re.IGNORECASE),
-        re.compile(r"\bavailab(le|ility)\s+(date|to\s+start|start)\b", re.IGNORECASE),
+        # Bare "availability" is the start-date question with the word date
+        # left out, and it is how a great many forms ask it.
+        re.compile(r"\bavailab(le|ility)\b", re.IGNORECASE),
         re.compile(r"\bduration\s+of\s+employment\b", re.IGNORECASE),
         re.compile(r"\btenure\b", re.IGNORECASE),
+        # "Explain any gaps in your employment" reads as a prose prompt and
+        # answers to a set of dates only the applicant knows.
+        re.compile(r"\bgaps?\s+(in|between)\b", re.IGNORECASE),
+        re.compile(r"\b(employment|work|career|job)\s+gaps?\b", re.IGNORECASE),
+        re.compile(r"\b(employment|work|job)\s+histor(y|ies)\b", re.IGNORECASE),
+        re.compile(r"\bcareer\s+break\b|\bbreak\s+in\s+(employment|service)\b", re.IGNORECASE),
     ),
 }
 
@@ -248,8 +256,19 @@ _MODEL_VETO_PATTERNS: tuple[Pattern[str], ...] = (
     re.compile(r"\bgpa\b|\bgrade\s+point\b|\btranscript\b", re.IGNORECASE),
     re.compile(r"\bdegree\b|\bdiploma\b|\bgraduat(ed|ion)\b", re.IGNORECASE),
     re.compile(r"\blicen[cs]e\b|\bcertification\s+number\b", re.IGNORECASE),
-    re.compile(r"\bmedical\b|\bhealth\s+condition\b|\baccommodat(ion|ions|e)\b", re.IGNORECASE),
+    re.compile(r"\bmedical\b|\bhealth\b|\baccommodat(ion|ions|e)\b", re.IGNORECASE),
     re.compile(r"\bsalary\b|\bcompensation\b", re.IGNORECASE),
+    # Why someone left a job is a fact about that job, and a drafted reason
+    # is a claim about a former employer made in the applicant's name.
+    re.compile(r"\breasons?\s+for\s+leaving\b|\bwhy\s+.{0,20}\bleav(e|ing)\b", re.IGNORECASE),
+    re.compile(r"\bwhy\s+.{0,20}\b(you\s+)?left\b|\byou\s+left\b", re.IGNORECASE),
+    # The employer, the title, and the dates are what a form checks against a
+    # CV; a model filling them in is inventing an employment record.
+    re.compile(r"\b(current|previous|present|last|former)\s+employer\b", re.IGNORECASE),
+    re.compile(r"\bemployer'?s?\s+name\b|\bname\s+of\s+.{0,15}employer\b", re.IGNORECASE),
+    re.compile(r"\b(job|position|role)\s+title\b|\btitle\s+of\s+.{0,15}(job|role|position)\b", re.IGNORECASE),
+    re.compile(r"\b(family|famil(y|ies))\b|\bchildren\b|\bdependa?nts?\b", re.IGNORECASE),
+    re.compile(r"\bcaring\s+responsibilit(y|ies)\b|\bcarer\b|\bpregnan(t|cy)\b", re.IGNORECASE),
 )
 
 #: Category order is fixed so classification is deterministic when a label
@@ -318,8 +337,12 @@ def model_eligible(label: str) -> bool:
     a "why us?", or an open-ended "tell us about ..." is left to the
     applicant, because the alternative is a model inventing a fact about
     them in a field nobody classified.
+
+    camelCase is split first, exactly as it is for protected classification:
+    a page that renders its field name as the label ("reasonForLeaving") is
+    otherwise one unrecognised word, and the veto never fires.
     """
-    text = _WHITESPACE.sub(" ", label or "").strip()
+    text = _word_split(label or "").strip()
     if not text:
         return False
     if any(pattern.search(text) for pattern in _MODEL_VETO_PATTERNS):

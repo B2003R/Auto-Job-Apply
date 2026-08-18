@@ -29,6 +29,7 @@ from app.agent.gap_filler import (
     GapFiller,
     ProtectedCategory,
     Resolution,
+    model_eligible,
     protected_category_for,
 )
 from app.agent.model_router import Complexity, ModelAnswer, ModelTier, TokenUsage
@@ -290,6 +291,33 @@ class TestProtectedClassificationBreadth:
         ],
     )
     def test_employment_date_variants_in_ordinary_english(self, label: str) -> None:
+        assert protected_category_for(label) is ProtectedCategory.EMPLOYMENT_DATES
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "Availability",
+            "Availability *",
+            "Please state your availability",
+            "Are you available to start immediately?",
+            "When are you available?",
+            "Employment history",
+            "Work history",
+            "Do you have any gaps in your employment history?",
+            "Please explain any employment gaps",
+            "Gap in employment",
+            "Career break",
+        ],
+    )
+    def test_bare_availability_and_employment_gaps_are_date_facts(
+        self, label: str
+    ) -> None:
+        """These read as prose but answer to a date only the applicant knows.
+
+        "Availability" and "explain your employment gaps" are the same
+        questions as "start date" and "employment dates", asked without the
+        word date in them. A model given either writes a plausible timeline.
+        """
         assert protected_category_for(label) is ProtectedCategory.EMPLOYMENT_DATES
 
     @pytest.mark.parametrize(
@@ -871,6 +899,60 @@ class TestModelEligibility:
 
         assert router.questions == []
         assert plan.items[0].resolution is Resolution.HUMAN
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "Reason for leaving your current role",
+            "Why are you leaving your current job?",
+            "Tell us about why you left your last position",
+            "Current employer",
+            "Describe your current employer",
+            "Name of your present employer",
+            "Current job title",
+            "Describe your current job title and responsibilities",
+            "Tell us about your health",
+            "Describe any health issues that affect your work",
+            "Do you have any family or caring responsibilities?",
+            "Tell us about your children and dependants",
+            "Describe your family circumstances",
+        ],
+    )
+    async def test_facts_about_a_life_are_never_drafted(self, label: str) -> None:
+        """Employment, health, and family facts are the applicant's to state.
+
+        Each of these can be phrased as a prose prompt, and each has exactly
+        one true answer that lives in the applicant's head. A model writes a
+        confident wrong one.
+        """
+        router = RecordingRouter(text="A plausible paragraph of fiction.")
+
+        plan = await filler(router=router).fill(
+            [field(key="q", label=label, tag="textarea")]
+        )
+
+        assert router.questions == []
+        assert plan.items[0].resolution is Resolution.HUMAN
+        assert plan.blocks_auto_submit is True
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "reasonForLeaving",
+            "currentEmployer",
+            "currentJobTitle",
+            "healthConditions",
+            "familyStatus",
+        ],
+    )
+    def test_camel_case_labels_are_split_for_eligibility_too(self, name: str) -> None:
+        """A page whose label *is* the camelCase field name still gets caught.
+
+        Protected classification already splits camelCase; eligibility has to
+        as well, or `reasonForLeaving` reads as one unknown word and the veto
+        never fires.
+        """
+        assert model_eligible(f"Describe {name}") is False
 
     def test_the_reason_explains_why_the_model_was_not_used(self) -> None:
         plan = filler(router=RecordingRouter()).plan(
