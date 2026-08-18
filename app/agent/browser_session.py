@@ -8,6 +8,7 @@ installed. Only an actual `BrowserSession.start()` call touches Playwright.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -21,6 +22,8 @@ from app.agent.errors import (
     ProfileInUseError,
     ProfileLockedError,
     ProfileMissingError,
+    SingletonLockInfo,
+    TeardownError,
 )
 from app.config import Settings
 
@@ -40,18 +43,49 @@ SINGLETON_LOCK_FILENAMES: tuple[str, ...] = (
 )
 
 
-def detect_chrome_singleton_locks(profile_path: Path) -> list[str]:
-    """Return the names of Chrome singleton markers present at the profile root.
+def describe_chrome_singleton_locks(profile_path: Path) -> list[SingletonLockInfo]:
+    """Return rich diagnostics for every Chrome singleton marker present at
+    the profile root: which files exist, and (for `SingletonLock`, which
+    Chrome creates as a symlink encoding `"<hostname>-<pid>"`) whether the
+    owning pid looks active, stale, or could not be determined.
 
     `SingletonLock` is typically a symlink (sometimes dangling), so both
-    `exists()` and `is_symlink()` are checked.
+    `exists()` and `is_symlink()` are checked for presence. This is purely
+    diagnostic: presence alone (regardless of status) is always treated as a
+    profile-in-use condition by callers, and no marker is ever deleted here.
     """
-    found: list[str] = []
+    infos: list[SingletonLockInfo] = []
     for name in SINGLETON_LOCK_FILENAMES:
         candidate = profile_path / name
         if candidate.exists() or candidate.is_symlink():
-            found.append(name)
-    return found
+            infos.append(_describe_singleton_marker(candidate, name))
+    return infos
+
+
+def _describe_singleton_marker(candidate: Path, name: str) -> SingletonLockInfo:
+    if not candidate.is_symlink():
+        return SingletonLockInfo(filename=name, status="unknown")
+    try:
+        target = os.readlink(candidate)
+    except OSError:
+        return SingletonLockInfo(filename=name, status="unknown")
+
+    hostname, sep, pid_text = target.rpartition("-")
+    if not sep or not hostname or "/" in hostname or not pid_text.isdigit():
+        return SingletonLockInfo(filename=name, status="unknown")
+
+    pid = int(pid_text)
+    status = "active" if _pid_alive(pid) else "stale"
+    return SingletonLockInfo(filename=name, status=status, hostname=hostname, pid=pid)
+
+
+def detect_chrome_singleton_locks(profile_path: Path) -> list[str]:
+    """Backward-compatible presence check: just the filenames of whichever
+    singleton markers exist, with no status parsing. See
+    `describe_chrome_singleton_locks` for hostname/pid/active-stale-unknown
+    diagnostics.
+    """
+    return [info.filename for info in describe_chrome_singleton_locks(profile_path)]
 
 
 #: Playwright's Chromium defaults disable extensions and component extensions
@@ -197,6 +231,14 @@ class BrowserSession:
     binary to be installed. `lock_factory` defaults to the real `ProfileLock`
     and exists mainly so tests can inject a lock whose `release()` fails,
     proving teardown still completes every other step.
+
+    `start()` and `close()` share one internal `asyncio.Lock` so concurrent
+    calls on the same instance are serialized rather than racing: concurrent
+    `start()` calls become idempotent (only the first actually launches;
+    later ones simply wait and return the same context) instead of the
+    second colliding with the first's own profile lock, and a `close()`
+    issued while a `start()` is still in flight waits for that `start()` to
+    finish (success or failure) before tearing down whatever resulted.
     """
 
     def __init__(
@@ -212,6 +254,7 @@ class BrowserSession:
         self._lock: Any | None = None
         self._playwright: Any | None = None
         self._context: "BrowserContext | None" = None
+        self._guard = asyncio.Lock()
 
     @property
     def context(self) -> "BrowserContext":
@@ -220,6 +263,10 @@ class BrowserSession:
         return self._context
 
     async def start(self) -> "BrowserContext":
+        async with self._guard:
+            return await self._start_locked()
+
+    async def _start_locked(self) -> "BrowserContext":
         if self._context is not None:
             return self._context
 
@@ -232,9 +279,9 @@ class BrowserSession:
         self._lock = lock
 
         try:
-            singleton_files = detect_chrome_singleton_locks(profile_path)
-            if singleton_files:
-                raise ProfileInUseError(profile_path, singleton_files)
+            singleton_locks = describe_chrome_singleton_locks(profile_path)
+            if singleton_locks:
+                raise ProfileInUseError(profile_path, singleton_locks)
 
             playwright = await self._playwright_factory()
             self._playwright = playwright
@@ -250,19 +297,33 @@ class BrowserSession:
         return self._context
 
     async def close(self) -> None:
-        await self._teardown(primary_exc=None)
+        async with self._guard:
+            await self._teardown(primary_exc=None)
 
     async def _teardown(self, *, primary_exc: BaseException | None) -> None:
         """Best-effort teardown: always attempts context close, Playwright
         stop, and lock release, independently of one another, so a failure in
         one step never skips or masks another.
 
-        When `primary_exc` is set (a `start()` failure), teardown errors are
-        suppressed so the original failure is what propagates. When called
-        from `close()` directly (`primary_exc is None`), the first teardown
-        error encountered is re-raised after every step has been attempted.
+        Every failure is collected (not just the first). When `primary_exc`
+        is set (a `start()` failure), each teardown failure is attached to it
+        as a note (via `BaseException.add_note`) rather than raised, so the
+        original launch failure is still what propagates — but the details
+        are not lost. When called from `close()` directly (`primary_exc is
+        None`): zero failures raise nothing, exactly one failure raises that
+        failure's own exception directly (so narrow `except SomeError`
+        callers keep working), and two-or-more failures raise a
+        `TeardownError` aggregate that calls out a lock-release failure
+        first, since a leaked lock is the most safety-critical outcome.
+
+        `context` and `playwright` are always cleared before their teardown
+        action is attempted, whether or not it succeeds, since retrying
+        either after a failure is not generally safe. The profile lock is
+        different: it is only cleared on a *successful* `release()`, so a
+        failed release leaves the lock object retained on `self._lock` and a
+        later `close()` call will retry releasing the very same lock.
         """
-        captured: BaseException | None = None
+        failures: list[tuple[str, BaseException]] = []
 
         if self._context is not None:
             context = self._context
@@ -270,7 +331,7 @@ class BrowserSession:
             try:
                 await context.close()
             except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                captured = captured or exc
+                failures.append(("context_close", exc))
 
         if self._playwright is not None:
             playwright = self._playwright
@@ -280,15 +341,28 @@ class BrowserSession:
                 try:
                     await stop()
                 except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                    captured = captured or exc
+                    failures.append(("playwright_stop", exc))
 
         if self._lock is not None:
-            lock = self._lock
-            self._lock = None
             try:
-                await lock.release()
+                await self._lock.release()
             except Exception as exc:  # noqa: BLE001 - best-effort teardown
-                captured = captured or exc
+                failures.append(("lock_release", exc))
+                # Retained (not cleared) so a later close() can retry.
+            else:
+                self._lock = None
 
-        if primary_exc is None and captured is not None:
-            raise captured
+        if not failures:
+            return
+
+        if primary_exc is not None:
+            for step, failure in failures:
+                primary_exc.add_note(
+                    f"Cleanup issue during teardown after this failure ({step}): {failure}"
+                )
+            return
+
+        if len(failures) == 1:
+            raise failures[0][1]
+
+        raise TeardownError(failures)

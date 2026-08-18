@@ -21,8 +21,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from app.agent.browser_session import BrowserSession, ProfileLock, detect_chrome_singleton_locks
-from app.agent.errors import ExtensionNotFoundError, ProfileLockedError, ServiceWorkerNotFoundError
+from app.agent.browser_session import BrowserSession, ProfileLock, describe_chrome_singleton_locks
+from app.agent.errors import (
+    ExtensionNotFoundError,
+    ProfileLockedError,
+    ServiceWorkerNotFoundError,
+    ServiceWorkerUnresponsiveError,
+)
 from app.agent.extension import find_installed_extension, find_service_worker, probe_service_worker
 from app.config import Settings
 
@@ -123,9 +128,11 @@ async def _lock_check(profile_path: Path) -> tuple[DoctorCheck, bool]:
     `ERROR` (the lock is never auto-removed either way; a stale lock just
     means it is *probably* safe for an operator to remove it manually).
     Chrome's own `SingletonLock`/`SingletonSocket`/`SingletonCookie` markers
-    are checked too and are also never deleted. Any filesystem error while
-    checking either mechanism becomes a categorized `ERROR`, never a
-    traceback, and never leaks this function's own lock acquisition.
+    are checked too and are also never deleted, regardless of whether their
+    parsed active/stale/unknown status looks recoverable. Any filesystem
+    error while checking either mechanism — including a failure to release
+    *this function's own* throwaway probe lock — becomes a categorized
+    `ERROR`, never a traceback.
     """
     lock = ProfileLock(profile_path)
     try:
@@ -143,16 +150,26 @@ async def _lock_check(profile_path: Path) -> tuple[DoctorCheck, bool]:
         )
 
     try:
-        singleton_files = detect_chrome_singleton_locks(profile_path)
+        singleton_locks = describe_chrome_singleton_locks(profile_path)
         singleton_error: Exception | None = None
     except OSError as exc:
-        singleton_files = []
+        singleton_locks = []
         singleton_error = exc
 
     try:
         await lock.release()
-    except OSError:
-        pass  # best-effort; do not let release-time issues mask the result below
+    except OSError as exc:
+        return (
+            DoctorCheck(
+                DoctorCategory.PROFILE_LOCKED,
+                CheckStatus.ERROR,
+                "Doctor's own preflight probe lock could not be released "
+                f"({lock.lock_path}): {exc}. This lock file must be removed "
+                "manually (after confirming no other process is using this "
+                "profile) before a real browser session can start.",
+            ),
+            False,
+        )
 
     if singleton_error is not None:
         return (
@@ -165,15 +182,16 @@ async def _lock_check(profile_path: Path) -> tuple[DoctorCheck, bool]:
             False,
         )
 
-    if singleton_files:
+    if singleton_locks:
+        descriptions = ", ".join(lock_info.describe() for lock_info in singleton_locks)
         return (
             DoctorCheck(
                 DoctorCategory.PROFILE_LOCKED,
                 CheckStatus.ERROR,
-                "Chrome profile-in-use markers present: "
-                f"{', '.join(singleton_files)}. A Chrome process may already "
-                "have this profile open (or crashed without cleaning up); "
-                "these files are never removed automatically.",
+                f"Chrome profile-in-use markers present: {descriptions}. A "
+                "Chrome process may already have this profile open (or "
+                "crashed without cleaning up); these files are never "
+                "removed automatically.",
             ),
             False,
         )
@@ -235,7 +253,7 @@ async def _service_worker_check(
         try:
             worker = await find_service_worker(context, settings.jobright_extension_id, timeout_ms)
             await probe_service_worker(worker, settings.jobright_extension_id, timeout_ms)
-        except ServiceWorkerNotFoundError as exc:
+        except (ServiceWorkerNotFoundError, ServiceWorkerUnresponsiveError) as exc:
             return DoctorCheck(DoctorCategory.SERVICE_WORKER_DEAD, CheckStatus.ERROR, str(exc))
         except Exception as exc:
             return DoctorCheck(

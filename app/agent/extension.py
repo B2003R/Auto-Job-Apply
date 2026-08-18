@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from app.agent.errors import ExtensionNotFoundError, ServiceWorkerNotFoundError
+from app.agent.errors import (
+    ExtensionNotFoundError,
+    ServiceWorkerNotFoundError,
+    ServiceWorkerUnresponsiveError,
+)
 
 _PROFILE_DIRECTORY = "Default"
 #: Checked in this order: Secure Preferences is the tamper-evident source of
@@ -204,11 +208,20 @@ async def probe_service_worker(worker: Any, extension_id: str, timeout_ms: int) 
     underlying MV3 worker has been torn down; a bounded `evaluate()` call is
     the only reliable liveness signal, so doctor never reports a worker
     healthy purely because Playwright still has a reference to it.
+
+    Raises `ServiceWorkerUnresponsiveError` (never `ServiceWorkerNotFoundError`)
+    on any failure here: this function is only ever called on a worker that
+    `find_service_worker` already discovered, so "not found" wording would be
+    inaccurate — the worker exists, it just isn't answering.
     """
     evaluate = getattr(worker, "evaluate", None)
     if evaluate is None:
-        raise ServiceWorkerNotFoundError(extension_id, timeout_ms)
+        raise ServiceWorkerUnresponsiveError(
+            extension_id, timeout_ms, reason="worker handle has no evaluate() method"
+        )
     try:
         await asyncio.wait_for(evaluate("1 + 1"), timeout=timeout_ms / 1000)
     except Exception as exc:
-        raise ServiceWorkerNotFoundError(extension_id, timeout_ms) from exc
+        raise ServiceWorkerUnresponsiveError(
+            extension_id, timeout_ms, reason=f"evaluate() failed: {exc}"
+        ) from exc

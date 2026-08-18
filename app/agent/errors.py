@@ -15,6 +15,35 @@ class LockMetadata:
     acquired_at: str
 
 
+@dataclass(frozen=True)
+class SingletonLockInfo:
+    """Diagnostic info about one Chrome-internal singleton marker file.
+
+    `SingletonLock` is a symlink whose target Chrome encodes as
+    `"<hostname>-<pid>"`; when that can be parsed, `status` reports whether
+    the owning pid still appears alive ("active"), looks gone ("stale"), or
+    could not be determined ("unknown" — e.g. `SingletonSocket` and
+    `SingletonCookie` are plain files with no such encoding, or the symlink
+    target didn't match the expected shape). `status` is purely diagnostic:
+    every marker is always treated as a profile-in-use condition regardless
+    of status, and none are ever deleted automatically.
+    """
+
+    filename: str
+    status: str  # "active" | "stale" | "unknown"
+    hostname: str | None = None
+    pid: int | None = None
+
+    def describe(self) -> str:
+        if self.status in ("active", "stale") and self.pid is not None:
+            liveness = "no longer running" if self.status == "stale" else "running"
+            return (
+                f"{self.filename} ({self.status}: pid {self.pid} on host "
+                f"{self.hostname}, {liveness})"
+            )
+        return f"{self.filename} (status unknown)"
+
+
 class BrowserError(Exception):
     """Base class for browser/profile safety errors."""
 
@@ -75,12 +104,13 @@ class ProfileInUseError(BrowserError):
     files manually) before retrying.
     """
 
-    def __init__(self, profile_path: Path, singleton_files: list[str]) -> None:
+    def __init__(self, profile_path: Path, locks: list[SingletonLockInfo]) -> None:
         self.profile_path = profile_path
-        self.singleton_files = list(singleton_files)
-        names = ", ".join(self.singleton_files)
+        self.locks = list(locks)
+        self.singleton_files = [lock.filename for lock in self.locks]
+        descriptions = ", ".join(lock.describe() for lock in self.locks)
         super().__init__(
-            f"Chrome profile-in-use markers found in {profile_path}: {names}. "
+            f"Chrome profile-in-use markers found in {profile_path}: {descriptions}. "
             "A Chrome process may already have this profile open (or crashed "
             "without cleaning up). Close that Chrome process first; these "
             "files are never removed automatically."
@@ -101,7 +131,10 @@ class ExtensionNotFoundError(BrowserError):
 
 
 class ServiceWorkerNotFoundError(BrowserError):
-    """Raised when no matching extension service worker was discovered."""
+    """Raised when no matching extension service worker was ever discovered
+    within the timeout (including any wake attempt). Distinct from
+    `ServiceWorkerUnresponsiveError`, which means a worker WAS discovered but
+    failed a liveness probe."""
 
     def __init__(self, extension_id: str, timeout_ms: int) -> None:
         self.extension_id = extension_id
@@ -109,4 +142,57 @@ class ServiceWorkerNotFoundError(BrowserError):
         super().__init__(
             f"No service worker for extension {extension_id} discovered within "
             f"{timeout_ms}ms"
+        )
+
+
+class ServiceWorkerUnresponsiveError(BrowserError):
+    """Raised when a service worker WAS discovered but failed to respond to
+    a liveness probe (e.g. `evaluate()` raised, timed out, or the worker
+    handle had no usable `evaluate` at all).
+
+    Kept distinct from `ServiceWorkerNotFoundError` so a discovered-but-dead
+    worker is never described with "not found"/"not discovered" wording,
+    which would misleadingly suggest discovery itself failed.
+    """
+
+    def __init__(self, extension_id: str, timeout_ms: int, reason: str) -> None:
+        self.extension_id = extension_id
+        self.timeout_ms = timeout_ms
+        self.reason = reason
+        super().__init__(
+            f"Service worker for extension {extension_id} was discovered but "
+            f"did not respond within {timeout_ms}ms ({reason})"
+        )
+
+
+class TeardownError(BrowserError):
+    """Raised by `BrowserSession.close()` when *more than one* teardown step
+    (context close, Playwright stop, profile lock release) fails.
+
+    A single-step failure is raised directly as its own exception type so
+    narrow `except SomeSpecificError` callers keep working; this aggregate is
+    only used once there is genuinely more than one failure to report, since
+    picking just one would otherwise silently mask the others. The profile
+    lock failure (if any) is always called out first/most prominently since a
+    leaked lock is the most safety-critical outcome — it blocks every future
+    `start()` until an operator intervenes.
+    """
+
+    def __init__(self, failures: list[tuple[str, BaseException]]) -> None:
+        self.failures = list(failures)
+        lock_failures = [(step, exc) for step, exc in self.failures if step == "lock_release"]
+        other_failures = [(step, exc) for step, exc in self.failures if step != "lock_release"]
+
+        parts: list[str] = []
+        if lock_failures:
+            _, lock_exc = lock_failures[0]
+            parts.append(
+                "profile lock release failed and the lock is retained on this "
+                f"session for a retry on the next close() call: {lock_exc}"
+            )
+        for step, exc in other_failures:
+            parts.append(f"{step} failed: {exc}")
+
+        super().__init__(
+            "Browser session teardown encountered multiple errors: " + "; ".join(parts)
         )

@@ -271,10 +271,10 @@ class TestDoctorProfileLockFilesystemErrors:
         _write_extension(profile)
         settings = _settings(profile)
 
-        def _raise(profile_path: Path) -> list[str]:
+        def _raise(profile_path: Path) -> list[Any]:
             raise PermissionError("cannot stat SingletonLock")
 
-        monkeypatch.setattr(doctor, "detect_chrome_singleton_locks", _raise)
+        monkeypatch.setattr(doctor, "describe_chrome_singleton_locks", _raise)
 
         report = await run_doctor(settings)
 
@@ -283,6 +283,34 @@ class TestDoctorProfileLockFilesystemErrors:
         assert report.ok is False
         # Our own lock must still be released even though the singleton check failed.
         assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+    async def test_probe_lock_release_failure_becomes_categorized_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Doctor acquires its own throwaway probe lock to verify the
+        profile is available; if *that* lock can't be released, doctor must
+        report it (rather than silently leaving a lock behind that would
+        make the very next real `start()` fail with ProfileLockedError)."""
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        settings = _settings(profile)
+
+        async def _raise(self: Any) -> None:
+            raise PermissionError("cannot unlink probe lock")
+
+        monkeypatch.setattr(browser_session.ProfileLock, "release", _raise)
+
+        report = await run_doctor(settings)
+
+        check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
+        assert check.status is CheckStatus.ERROR
+        assert "cannot unlink probe lock" in check.message
+        assert report.ok is False
+        # Service worker check must be skipped: doctor's own probe lock is
+        # still present on disk, so a real start() would collide with it.
+        sw_check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert sw_check.status is CheckStatus.WARNING
 
 
 def _factory_that_must_not_be_called() -> Any:
@@ -332,6 +360,41 @@ class TestDoctorProfileInUseSingleton:
 
         check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
         assert check.status is CheckStatus.WARNING
+
+    async def test_reports_active_status_with_pid_when_singleton_owner_is_alive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        (profile / "SingletonLock").symlink_to("some-host-4242")
+        monkeypatch.setattr(browser_session, "_pid_alive", lambda pid: True)
+        settings = _settings(profile)
+
+        report = await run_doctor(settings, session_factory=_factory_that_must_not_be_called())
+
+        check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
+        assert check.status is CheckStatus.ERROR
+        assert "active" in check.message
+        assert "4242" in check.message
+
+    async def test_reports_stale_status_when_singleton_owner_is_dead(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        (profile / "SingletonLock").symlink_to("gone-host-999999")
+        monkeypatch.setattr(browser_session, "_pid_alive", lambda pid: False)
+        settings = _settings(profile)
+
+        report = await run_doctor(settings, session_factory=_factory_that_must_not_be_called())
+
+        check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
+        # Still ERROR even though it looks stale: singleton markers are
+        # never auto-deleted or downgraded.
+        assert check.status is CheckStatus.ERROR
+        assert "stale" in check.message
 
 
 class TestDoctorExtension:
@@ -506,6 +569,10 @@ class TestDoctorServiceWorker:
         check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
         assert check.status is CheckStatus.ERROR
         assert report.ok is False
+        # Must not be reported as "not found"/"not discovered" — the worker
+        # WAS discovered, it just failed to respond.
+        assert "discovered" in check.message
+        assert "not found" not in check.message.lower()
 
     async def test_session_close_error_does_not_crash_doctor_or_mask_ok_result(
         self, tmp_path: Path

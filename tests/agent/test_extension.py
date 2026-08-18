@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import pytest
 
-from app.agent.errors import ServiceWorkerNotFoundError
+from app.agent.errors import ServiceWorkerNotFoundError, ServiceWorkerUnresponsiveError
 from app.agent.extension import (
     ExtensionInstall,
     find_installed_extension,
@@ -421,34 +421,59 @@ class TestFindServiceWorkerBoundedWake:
 
 
 class TestProbeServiceWorker:
+    """A worker returned by `find_service_worker` was definitely discovered;
+    if it then fails to respond, that must be reported distinctly from
+    "not discovered" — a discovered-but-unresponsive worker must never be
+    described with "not found"/"discovered within" style wording.
+    """
+
     async def test_succeeds_when_evaluate_resolves(self) -> None:
         worker = FakeWorker(url="chrome-extension://x/background.js", evaluate_result=2)
 
         await probe_service_worker(worker, EXTENSION_ID, timeout_ms=1000)  # must not raise
 
-    async def test_raises_service_worker_not_found_when_evaluate_raises(self) -> None:
+    async def test_raises_unresponsive_error_when_evaluate_raises(self) -> None:
         worker = FakeWorker(
             url="chrome-extension://x/background.js",
             evaluate_error=RuntimeError("worker terminated"),
         )
 
-        with pytest.raises(ServiceWorkerNotFoundError) as excinfo:
+        with pytest.raises(ServiceWorkerUnresponsiveError) as excinfo:
             await probe_service_worker(worker, EXTENSION_ID, timeout_ms=1000)
 
         assert excinfo.value.extension_id == EXTENSION_ID
+        message = str(excinfo.value)
+        assert "discovered" in message  # confirms it WAS discovered
+        assert "not found" not in message.lower()
+        assert "worker terminated" in message
 
-    async def test_raises_service_worker_not_found_when_evaluate_times_out(self) -> None:
+    async def test_raises_unresponsive_error_when_evaluate_times_out(self) -> None:
         worker = FakeWorker(url="chrome-extension://x/background.js", evaluate_delay=5.0)
 
         started = asyncio.get_event_loop().time()
-        with pytest.raises(ServiceWorkerNotFoundError):
+        with pytest.raises(ServiceWorkerUnresponsiveError):
             await probe_service_worker(worker, EXTENSION_ID, timeout_ms=50)
         elapsed = asyncio.get_event_loop().time() - started
 
         assert elapsed < 1.0
 
-    async def test_raises_service_worker_not_found_when_worker_lacks_evaluate(self) -> None:
+    async def test_raises_unresponsive_error_when_worker_lacks_evaluate(self) -> None:
         worker = FakeWorker(url="chrome-extension://x/background.js", has_evaluate=False)
 
-        with pytest.raises(ServiceWorkerNotFoundError):
+        with pytest.raises(ServiceWorkerUnresponsiveError) as excinfo:
             await probe_service_worker(worker, EXTENSION_ID, timeout_ms=1000)
+
+        assert "discovered" in str(excinfo.value)
+
+    async def test_unresponsive_error_is_not_a_not_found_error(self) -> None:
+        """The two failure modes are semantically distinct and must not be
+        conflated under a single exception type."""
+        worker = FakeWorker(
+            url="chrome-extension://x/background.js",
+            evaluate_error=RuntimeError("worker terminated"),
+        )
+
+        with pytest.raises(ServiceWorkerUnresponsiveError) as excinfo:
+            await probe_service_worker(worker, EXTENSION_ID, timeout_ms=1000)
+
+        assert not isinstance(excinfo.value, ServiceWorkerNotFoundError)
