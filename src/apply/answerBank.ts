@@ -47,6 +47,12 @@ const profileSchema = z.object({
 
 const answersSchema = z.object({
   standard: z.record(z.string(), z.string()).default({}),
+  // Opt-in permission to tick terms/privacy/accuracy acknowledgements. Defaults
+  // to false so an operator who never configures it gets escalation, not
+  // silent consent given in their name.
+  consent: z
+    .object({ acceptTermsAndPolicies: z.boolean().default(false) })
+    .default({ acceptTermsAndPolicies: false }),
   eeo: z.record(z.string(), z.string()).default({}),
   skillYears: z.record(z.string(), z.string()).default({}),
   custom: z
@@ -172,6 +178,21 @@ export function lookupAnswer(question: string, bank: AnswerBank): string | null 
   ];
   for (const [pattern, value] of standardMatchers) {
     if (pattern.test(q) && value) return value;
+  }
+
+  // Acknowledgement checkboxes, only when the operator has granted permission.
+  // Without the flag these fall through to null and the application escalates.
+  if (answers.consent.acceptTermsAndPolicies) {
+    const consentPatterns = [
+      /accept .*(terms|conditions|privacy|policy|agreement)/,
+      /agree (to|with) .*(terms|conditions|privacy|policy|agreement)/,
+      /(have )?read and (accept|agree|understand)/,
+      /i (certify|confirm|acknowledge|attest)/,
+      /consent to .*(processing|storage|collection|use) of/,
+      /privacy (policy|notice|statement)/,
+      /terms (of (use|service)|and conditions)/,
+    ];
+    if (consentPatterns.some((pattern) => pattern.test(q))) return 'Yes';
   }
 
   const eeoMatchers: Array<[RegExp, string | undefined]> = [

@@ -26,6 +26,16 @@ standard:
   # Answered on "have you previously worked here" style questions.
   previouslyEmployedHere: "No"
 
+# Acknowledgement checkboxes: terms of use, privacy notices, and "I certify the
+# information given is accurate" attestations. Practically every application has
+# at least one and will not submit until it is ticked.
+#
+# This is an explicit permission rather than something the agent infers, because
+# ticking these is an affirmative act made in your name. Set to false and the
+# agent will hand any application containing one to you instead of ticking it.
+consent:
+  acceptTermsAndPolicies: true
+
 # Equal Employment Opportunity and related questions. These are voluntary to
 # answer in the US; "Decline to self-identify" is a valid, complete answer that
 # every compliant form accepts, so it is the default here.
