@@ -1,0 +1,18 @@
+# Selectors for linkedin.com job listing pages.
+#
+# `easy_apply_indicator` matches the "Easy Apply" control that opens
+# LinkedIn's own in-page application modal. That modal is not supported by
+# this agent (see app/boards/linkedin.py) — it is LinkedIn's own multi-step
+# form with no external ATS page for the rest of the graph to detect or
+# drive — so its presence alone causes the listing to be skipped, regardless
+# of what `apply_button` also matches on the same page.
+#
+# `apply_button` matches the plain external Apply control, which navigates
+# to the employer's own application page (often a supported ATS).
+#
+# These are CSS selectors and may be edited freely as LinkedIn's markup
+# changes; no code change is needed to update them.
+board: linkedin
+selectors:
+  easy_apply_indicator: "button.jobs-apply-button[aria-label*='Easy Apply' i]"
+  apply_button: "button.jobs-apply-button:not([aria-label*='Easy Apply' i])"

@@ -1,0 +1,14 @@
+# Selectors for wellfound.com (and angel.co) job listing pages.
+#
+# `in_app_apply_indicator` matches Wellfound's in-app apply control, which
+# starts a multi-step application flow hosted entirely on wellfound.com. As
+# with LinkedIn's Easy Apply, there is no external ATS page for the rest of
+# the graph to drive, so its presence alone causes the listing to be
+# skipped (see app/boards/wellfound.py).
+#
+# `apply_button` matches an external apply link, for the listings that offer
+# one instead of (or alongside) the in-app flow.
+board: wellfound
+selectors:
+  in_app_apply_indicator: "[data-test='startup-apply-in-app']"
+  apply_button: "a[data-test='startup-apply-external']"
