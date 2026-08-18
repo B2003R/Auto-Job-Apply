@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
+    from app.agent.form_scanner import FormDiff, FormSnapshot
+    from app.agent.jobright_trigger import TierAttempt
 
 
 @dataclass(frozen=True)
@@ -162,6 +167,76 @@ class ServiceWorkerUnresponsiveError(BrowserError):
         super().__init__(
             f"Service worker for extension {extension_id} was discovered but "
             f"did not respond within {timeout_ms}ms ({reason})"
+        )
+
+
+class FormSettleTimeout(BrowserError):
+    """Raised when a page never reaches mutation/value quiescence in time.
+
+    Carries the last snapshot and the last diff against the caller's
+    baseline so a caller (or an operator reading logs) can still see how far
+    the page got, instead of only learning that it never stopped changing.
+    """
+
+    def __init__(
+        self,
+        quiet_ms: int,
+        timeout_ms: int,
+        snapshot: "FormSnapshot",
+        diff: "FormDiff",
+    ) -> None:
+        self.quiet_ms = quiet_ms
+        self.timeout_ms = timeout_ms
+        self.snapshot = snapshot
+        self.diff = diff
+        super().__init__(
+            f"Form never stayed unchanged for {quiet_ms}ms within {timeout_ms}ms; "
+            f"last snapshot had {len(snapshot.fields)} field(s) with "
+            f"{len(diff.changed)} change(s) versus the baseline"
+        )
+
+
+class NativeClickError(BrowserError):
+    """Base class for native (OS-level) toolbar click failures."""
+
+
+class NativeClickUnavailable(NativeClickError):
+    """Raised when a native toolbar click cannot even be attempted.
+
+    Distinct from `NativeClickFailed`: this means a precondition is missing
+    (no `xdotool`, no X display, uncalibrated coordinates), so nothing was
+    executed and no pointer was moved.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Native toolbar click unavailable: {reason}")
+
+
+class NativeClickFailed(NativeClickError):
+    """Raised when a native toolbar command ran but did not succeed."""
+
+    def __init__(self, command: Sequence[str], reason: str) -> None:
+        self.command = tuple(command)
+        self.reason = reason
+        super().__init__(f"Native toolbar click failed ({' '.join(self.command)}): {reason}")
+
+
+class TriggerFailed(BrowserError):
+    """Raised when every Jobright Autofill trigger tier failed.
+
+    Retains one diagnostic per attempted tier, in attempt order, so an
+    operator can see which tier got how far rather than only that the last
+    one failed.
+    """
+
+    def __init__(self, attempts: Sequence["TierAttempt"]) -> None:
+        self.attempts = tuple(attempts)
+        details = "; ".join(f"{attempt.tier.value}: {attempt.detail}" for attempt in self.attempts)
+        super().__init__(
+            f"All {len(self.attempts)} Jobright Autofill trigger tier(s) failed. {details}"
+            if self.attempts
+            else "No Jobright Autofill trigger tiers were configured"
         )
 
 
