@@ -66,6 +66,9 @@ const envSchema = z.object({
   WEBMAIL_PROVIDER: z.enum(['gmail', 'outlook']).default('gmail'),
   VAULT_KEY: z.string().optional(),
   NOTIFY_WEBHOOK: z.string().optional(),
+  // Redirect all runtime state (database, screenshots, exports). Exists so tests
+  // cannot write into a real run's application history.
+  AGENT_DATA_DIR: z.string().optional(),
 });
 
 export const runModes = ['dry-run', 'review', 'auto'] as const;
@@ -125,7 +128,7 @@ export function loadConfig(options: { requireEnv?: boolean } = {}): AppConfig {
   }
   const env = parsedEnv.data as Env;
 
-  const dataDir = resolve(PROJECT_ROOT, 'data');
+  const dataDir = env.AGENT_DATA_DIR ? projectPath(env.AGENT_DATA_DIR) : resolve(PROJECT_ROOT, 'data');
   cached = {
     ...file,
     env,
