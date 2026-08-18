@@ -1,0 +1,4 @@
+pydantic>=2.0
+pydantic-settings>=2.0
+aiosqlite>=0.20.0
+pytest>=8.0
