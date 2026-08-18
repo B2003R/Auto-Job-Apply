@@ -1,0 +1,41 @@
+# Copy to config/profile.yaml and fill in. Git-ignored: this is personal data.
+#
+# This is the ONLY source of facts about you that the agent may put into an
+# application. The verifier is instructed that it may copy from here and from
+# answers.yaml and nothing else; a required question with no match escalates to
+# you instead of being guessed. That rule is what keeps every submitted
+# application factually accurate.
+
+identity:
+  firstName: "Ada"
+  lastName: "Lovelace"
+  # Must match APPLICATION_EMAIL in .env, since ATS verification mail is read
+  # from that mailbox.
+  email: "ada@example.com"
+  phone: "+1 555 010 0100"
+
+location:
+  street: "1 Analytical Engine Way"
+  city: "San Francisco"
+  state: "CA"
+  postalCode: "94105"
+  country: "United States"
+
+links:
+  linkedin: "https://www.linkedin.com/in/example"
+  github: "https://github.com/example"
+  portfolio: ""
+
+# Used when a form asks for the current or most recent role in free-text fields.
+currentRole:
+  title: "Senior Software Engineer"
+  company: "Example Corp"
+  startDate: "2023-04"
+  # Leave blank if this is your current job.
+  endDate: ""
+
+education:
+  - degree: "B.S. Computer Science"
+    school: "Example University"
+    graduationYear: 2019
+    gpa: ""

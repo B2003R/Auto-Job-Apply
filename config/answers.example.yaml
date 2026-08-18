@@ -1,0 +1,69 @@
+# Copy to config/answers.yaml and fill in. Git-ignored: this is personal data.
+#
+# The recurring screening questions ATS forms ask. The verifier may only answer a
+# question by copying a value from here or from profile.yaml. If a required
+# question matches nothing, the agent records it in the unanswered_questions
+# table and hands the application to you rather than inventing an answer. Run
+# `npm run status` to see which questions are blocking applications, then add
+# them here.
+
+# Fixed answers to the questions almost every US application asks.
+standard:
+  authorizedToWorkInUS: "Yes"
+  requiresVisaSponsorship: "No"
+  requiresSponsorshipNowOrFuture: "No"
+  willingToRelocate: "No"
+  openToRemote: "Yes"
+  hasNonCompete: "No"
+  # Free text, used when a form asks for expected or desired compensation.
+  salaryExpectation: "180000"
+  # Used for "when can you start" and notice-period questions.
+  earliestStartDate: "2 weeks from offer"
+  yearsOfProfessionalExperience: "6"
+  highestDegree: "Bachelor's Degree"
+  # Some forms ask how you heard about the role.
+  referralSource: "Company website"
+  # Answered on "have you previously worked here" style questions.
+  previouslyEmployedHere: "No"
+
+# Equal Employment Opportunity and related questions. These are voluntary to
+# answer in the US; "Decline to self-identify" is a valid, complete answer that
+# every compliant form accepts, so it is the default here.
+eeo:
+  gender: "Decline to self-identify"
+  race: "Decline to self-identify"
+  hispanicOrLatino: "Decline to self-identify"
+  veteranStatus: "I don't wish to answer"
+  disabilityStatus: "I don't wish to answer"
+
+# Years of experience per skill, for the "how many years of X" grids that Workday
+# and iCIMS like. Keys are matched case-insensitively against the question.
+skillYears:
+  python: "6"
+  typescript: "5"
+  javascript: "6"
+  react: "4"
+  sql: "6"
+  aws: "4"
+  kubernetes: "3"
+
+# Anything not covered above. `match` is a case-insensitive regular expression
+# tested against the question text; the first match wins. Prefer adding entries
+# here over loosening the no-invention rule.
+custom:
+  - match: "why do you want to work (at|for)"
+    answer: >-
+      I am drawn to teams solving hard infrastructure problems at scale, and the
+      role's emphasis on systems ownership matches how I like to work.
+  - match: "notice period"
+    answer: "2 weeks"
+  - match: "current (annual )?(salary|compensation)"
+    answer: "Prefer not to disclose"
+  - match: "do you have a (valid )?driver'?s license"
+    answer: "Yes"
+  - match: "are you at least 18"
+    answer: "Yes"
+  - match: "criminal|felony|convicted"
+    answer: "No"
+  - match: "how did you hear about"
+    answer: "Company website"
