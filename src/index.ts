@@ -3,6 +3,7 @@ import { runModes, type RunMode } from './config.ts';
 import { logger } from './logger.ts';
 import { closeDb } from './store/db.ts';
 import { printStatus } from './commands/status.ts';
+import { setupBrowser } from './commands/setupBrowser.ts';
 
 interface Command {
   describe: string;
@@ -17,6 +18,10 @@ export interface CliArgs {
 }
 
 const commands: Record<string, Command> = {
+  'setup:browser': {
+    describe: 'One-time: provision the dedicated Chrome profile and sign in',
+    run: async () => setupBrowser(),
+  },
   status: {
     describe: 'Show queue depth, today\'s counters, and recent failures',
     run: async () => printStatus(),
