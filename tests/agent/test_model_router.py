@@ -62,12 +62,19 @@ def completion_payload(
     text: str = "Eight years.",
     prompt_tokens: int = 1_000,
     completion_tokens: int = 20,
+    finish_reason: str | None = "stop",
     **overrides: Any,
 ) -> dict[str, Any]:
+    choice: dict[str, Any] = {
+        "index": 0,
+        "message": {"role": "assistant", "content": text},
+    }
+    if finish_reason is not None:
+        choice["finish_reason"] = finish_reason
     payload: dict[str, Any] = {
         "id": "chatcmpl-1",
         "model": "routine-model",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}}],
+        "choices": [choice],
         "usage": {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -453,6 +460,203 @@ class TestFailureModes:
 
         with pytest.raises(ModelResponseError):
             await router.complete(QUESTION)
+
+
+class TestTruncationAndRefusal:
+    """A partial answer and a polite refusal are both "no answer".
+
+    Text that stopped at the token limit reads like prose and would be typed
+    into a form mid-sentence, and "I'm sorry, I don't have enough information"
+    reads like an answer to anything that only checks for the literal word
+    UNKNOWN. Both have to come back as "ask the applicant".
+    """
+
+    @pytest.mark.parametrize("finish_reason", ["length", "max_tokens"])
+    async def test_a_truncated_answer_is_an_error_not_a_partial_answer(
+        self, finish_reason: str
+    ) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200,
+                json=completion_payload(
+                    text="I would be delighted to join because",
+                    finish_reason=finish_reason,
+                ),
+            )
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        assert "truncat" in str(excinfo.value).lower()
+
+    async def test_a_content_filtered_answer_is_declined(self) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200,
+                json=completion_payload(
+                    text="I cannot help with that.", finish_reason="content_filter"
+                ),
+            )
+        )
+        router, _ = build_router(transport)
+
+        assert (await router.complete(QUESTION)).declined is True
+
+    @pytest.mark.parametrize("finish_reason", ["stop", None])
+    async def test_a_completed_answer_is_returned(
+        self, finish_reason: str | None
+    ) -> None:
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                200, json=completion_payload(finish_reason=finish_reason)
+            )
+        )
+        router, _ = build_router(transport)
+
+        assert (await router.complete(QUESTION)).text == "Eight years."
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "UNKNOWN",
+            "unknown",
+            "  UNKNOWN.  ",
+            "UNKNOWN - I was not given enough information.",
+            "I'm sorry, but I can't answer that.",
+            "I am sorry, I cannot answer this question.",
+            "I'm unable to determine that from the question alone.",
+            "I don't have enough information to answer.",
+            "As an AI language model, I do not know the applicant's details.",
+            "I apologize, but there is not enough information here.",
+            "Sorry, I cannot help with this request.",
+            "There is insufficient information to answer this question.",
+            "I cannot determine the answer from the question alone.",
+        ],
+    )
+    def test_refusals_and_apologies_count_as_declined(self, text: str) -> None:
+        answer = ModelAnswer(
+            text=text,
+            tier=ModelTier.ROUTINE,
+            model="routine-model",
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            cost=Decimal("0"),
+        )
+
+        assert answer.declined is True
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Eight years.",
+            "I have known this team's work for years and cannot imagine a better fit.",
+            "My unknown-unknowns list is short; I ship and then measure.",
+            "I would describe my style as sorry-not-sorry about writing tests first.",
+        ],
+    )
+    def test_a_real_answer_is_not_mistaken_for_a_refusal(self, text: str) -> None:
+        answer = ModelAnswer(
+            text=text,
+            tier=ModelTier.ROUTINE,
+            model="routine-model",
+            usage=TokenUsage(input_tokens=1, output_tokens=1),
+            cost=Decimal("0"),
+        )
+
+        assert answer.declined is False
+
+    async def test_an_explicit_refusal_field_declines(self) -> None:
+        """OpenAI reports a hard refusal in `message.refusal`, not in content."""
+        payload = completion_payload()
+        payload["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": None,
+            "refusal": "I can't help with that.",
+        }
+        transport = RecordingTransport(lambda request: httpx.Response(200, json=payload))
+        router, _ = build_router(transport)
+
+        assert (await router.complete(QUESTION)).declined is True
+
+
+class TestErrorExcerptRedaction:
+    """The key is removed from the whole body before any of it is quoted.
+
+    Truncating first and redacting after leaves a key that straddles the cut
+    as an unmatched prefix in the message — the exact case where redaction is
+    most needed and least likely to be noticed.
+    """
+
+    @pytest.mark.parametrize("offset", [-8, -4, -1, 0, 1, 4])
+    async def test_a_key_straddling_the_cut_never_survives(self, offset: int) -> None:
+        from app.agent.model_router import _MAX_ERROR_DETAIL_CHARS
+
+        padding = "x" * (_MAX_ERROR_DETAIL_CHARS + offset)
+        body = f"{padding}{API_KEY} rejected"
+        transport = RecordingTransport(lambda request: httpx.Response(401, text=body))
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        message = str(excinfo.value)
+        assert API_KEY not in message
+        for cut in range(8, len(API_KEY)):
+            assert API_KEY[:cut] not in message
+
+    async def test_a_non_json_body_hiding_a_key_is_redacted(self) -> None:
+        from app.agent.model_router import _MAX_ERROR_DETAIL_CHARS
+
+        body = "<html>" + "y" * (_MAX_ERROR_DETAIL_CHARS - 3) + API_KEY + "</html>"
+        transport = RecordingTransport(lambda request: httpx.Response(200, text=body))
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        message = str(excinfo.value)
+        for cut in range(8, len(API_KEY)):
+            assert API_KEY[:cut] not in message
+
+    async def test_a_provider_truncated_key_is_also_scrubbed(self) -> None:
+        """Providers echo keys half-masked; a long prefix is still a secret."""
+        transport = RecordingTransport(
+            lambda request: httpx.Response(
+                401, text=f"Incorrect API key provided: {API_KEY[:20]}****"
+            )
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        assert API_KEY[:20] not in str(excinfo.value)
+
+    async def test_a_short_coincidental_prefix_is_not_scrubbed(self) -> None:
+        """Redaction must not eat the message; "sk-" is not the key."""
+        transport = RecordingTransport(
+            lambda request: httpx.Response(401, text="Incorrect API key: sk-***")
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        assert "Incorrect API key" in str(excinfo.value)
+
+    async def test_the_excerpt_is_still_bounded(self) -> None:
+        from app.agent.model_router import _MAX_ERROR_DETAIL_CHARS
+
+        transport = RecordingTransport(
+            lambda request: httpx.Response(500, text="z" * 10_000)
+        )
+        router, _ = build_router(transport)
+
+        with pytest.raises(ModelResponseError) as excinfo:
+            await router.complete(QUESTION)
+
+        assert len(str(excinfo.value)) < _MAX_ERROR_DETAIL_CHARS + 200
 
 
 class TestOptionalDependency:

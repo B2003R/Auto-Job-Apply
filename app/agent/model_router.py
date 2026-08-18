@@ -12,6 +12,12 @@ the *least* trusted source of an answer in this project:
   here, at the only place that could actually transmit them, in addition to
   being excluded upstream by the gap filler. Defence in depth, because the
   cost of the failure is an invented answer submitted under someone's name.
+* **A partial answer is not an answer.** A completion that stopped at the
+  token limit is rejected rather than returned, because truncated prose still
+  reads like prose and would be typed into a form mid-sentence. A refusal —
+  reported by `finish_reason`, by `message.refusal`, or simply written out as
+  "I'm sorry, I don't have enough information" — comes back as `declined`, so
+  the field goes to the applicant instead.
 * **Cost is exact.** Token prices are `Decimal` from configuration to
   arithmetic; a fraction of a cent per call compounds over thousands of
   calls, and a float would make the ledger disagree with the invoice. Usage
@@ -27,6 +33,7 @@ dependency.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -51,6 +58,35 @@ SYSTEM_PROMPT = (
 _MAX_ERROR_DETAIL_CHARS = 300
 
 _REDACTED = "***redacted***"
+
+#: Shortest key prefix treated as secret. Below this a "prefix" is just a
+#: provider's scheme marker ("sk-") appearing in ordinary prose.
+_MIN_REDACTED_PREFIX_CHARS = 12
+
+#: `finish_reason` values that mean the text stopped short of the answer.
+#: A truncated draft still reads like prose, so accepting one would type
+#: half a sentence into someone's application.
+_TRUNCATED_FINISH_REASONS = frozenset({"length", "max_tokens", "content_length"})
+
+#: `finish_reason` values that mean the provider withheld an answer. Unlike
+#: truncation this is not a fault to raise on; it is the model declining,
+#: which routes the field to the applicant.
+_DECLINED_FINISH_REASONS = frozenset({"content_filter", "refusal"})
+
+#: Ways a model says "I can't answer this". Anchored at the start, because
+#: a genuine answer can easily *contain* "cannot" or "unknown" ("my
+#: unknown-unknowns list is short") while an actual refusal opens with one.
+_DECLINED_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^unknown\b", re.IGNORECASE),
+    re.compile(r"^(i'?m|i am)\s+(sorry|unable|not able|afraid)\b", re.IGNORECASE),
+    re.compile(r"^sorry\b", re.IGNORECASE),
+    re.compile(r"^(i|we)\s+(apologi[sz]e|cannot|can'?t|can not)\b", re.IGNORECASE),
+    re.compile(r"^(i|we)\s+(do not|don'?t)\s+(have|know)\b", re.IGNORECASE),
+    re.compile(r"^as an ai\b", re.IGNORECASE),
+    re.compile(r"^unfortunately,?\s+(i|we)\b", re.IGNORECASE),
+    re.compile(r"^there (is|are)\s+(insufficient|not enough|no)\b", re.IGNORECASE),
+    re.compile(r"^(insufficient|not enough|no)\s+information\b", re.IGNORECASE),
+)
 
 
 class Complexity(str, Enum):
@@ -111,15 +147,26 @@ class ModelAnswer:
     model: str
     usage: TokenUsage
     cost: Decimal
+    #: Set when the provider itself reported a refusal, independently of what
+    #: the text says.
+    refused: bool = False
 
     @property
     def declined(self) -> bool:
         """Whether the model said it could not answer.
 
         A declined answer is not a gap filled; the caller must route the
-        field to a human rather than typing "UNKNOWN" into a form.
+        field to a human rather than typing "UNKNOWN" — or "I'm sorry, I
+        don't have enough information about the applicant" — into a form.
+
+        Matching is anchored at the start of the reply rather than searching
+        anywhere in it, so a real answer that happens to contain "cannot" or
+        "unknown" is still an answer.
         """
-        return self.text.strip().upper() == "UNKNOWN"
+        if self.refused:
+            return True
+        text = self.text.strip()
+        return any(pattern.search(text) for pattern in _DECLINED_PATTERNS)
 
 
 def token_cost(profile: ModelProfile, usage: TokenUsage) -> Decimal:
@@ -243,9 +290,7 @@ class ModelRouter:
             ) from None
 
         if response.status_code != 200:
-            raise ModelResponseError(
-                response.status_code, self._redact(self._excerpt(response))
-            )
+            raise ModelResponseError(response.status_code, self._detail(response))
         return self._parse(response, profile)
 
     def _parse(self, response: Any, profile: ModelProfile) -> ModelAnswer:
@@ -254,7 +299,7 @@ class ModelRouter:
         except Exception:  # noqa: BLE001 - a non-JSON body is unusable
             raise ModelResponseError(
                 response.status_code,
-                "response body was not JSON: " + self._redact(self._excerpt(response)),
+                "response body was not JSON: " + self._detail(response),
             ) from None
 
         if not isinstance(body, Mapping):
@@ -263,21 +308,42 @@ class ModelRouter:
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ModelResponseError(response.status_code, "response carried no choices")
-        message = choices[0].get("message") if isinstance(choices[0], Mapping) else None
-        content = message.get("content") if isinstance(message, Mapping) else None
+        choice = choices[0] if isinstance(choices[0], Mapping) else {}
+        message = choice.get("message") if isinstance(choice, Mapping) else None
+        message = message if isinstance(message, Mapping) else {}
+
+        finish_reason = choice.get("finish_reason")
+        finish = finish_reason.strip().lower() if isinstance(finish_reason, str) else ""
+        if finish in _TRUNCATED_FINISH_REASONS:
+            raise ModelResponseError(
+                response.status_code,
+                f"answer was truncated at the output limit (finish_reason "
+                f"{finish!r}); a partial answer must not be typed into a form",
+            )
+
+        refusal = message.get("refusal")
+        refused = finish in _DECLINED_FINISH_REASONS or bool(
+            isinstance(refusal, str) and refusal.strip()
+        )
+
+        content = message.get("content")
         text = content.strip() if isinstance(content, str) else ""
-        if not text:
+        if not text and not refused:
             raise ModelResponseError(
                 response.status_code, "response carried an empty answer"
             )
 
         usage = self._parse_usage(body.get("usage"), response.status_code)
         return ModelAnswer(
-            text=text,
+            # A refusal with no content still needs a text: `UNKNOWN` is the
+            # word this module's own system prompt asks for, so the caller
+            # sees one shape of "no answer" rather than two.
+            text=text or "UNKNOWN",
             tier=profile.tier,
             model=profile.name,
             usage=usage,
             cost=token_cost(profile, usage),
+            refused=refused,
         )
 
     @staticmethod
@@ -328,17 +394,36 @@ class ModelRouter:
             raise ModelUnavailable("httpx is unavailable")
         return httpx
 
-    @staticmethod
-    def _excerpt(response: Any) -> str:
+    def _detail(self, response: Any) -> str:
+        """Quote a bounded piece of a response body, key-free.
+
+        Redaction runs over the *whole* body before the excerpt is cut. Doing
+        it the other way round leaves a key that straddles the cut as an
+        unmatched prefix in the message: the exact leak redaction exists to
+        prevent, and one that only appears when the body happens to be the
+        wrong length.
+        """
         try:
-            text = response.text
+            text = str(response.text)
         except Exception:  # noqa: BLE001 - undecodable bodies still need a message
             return "<unreadable response body>"
-        return str(text)[:_MAX_ERROR_DETAIL_CHARS]
+        return self._redact(text)[:_MAX_ERROR_DETAIL_CHARS]
 
     def _redact(self, text: str) -> str:
-        """Strip the API key from anything that might be logged or raised."""
+        """Strip the API key from anything that might be logged or raised.
+
+        Long prefixes go too: providers echo keys half-masked ("Incorrect API
+        key provided: sk-abc123...****"), and a 16-character prefix of a
+        secret is still a piece of the secret. The floor keeps the scrub from
+        eating ordinary text that merely starts the same way ("sk-").
+        """
         key = self._api_key()
-        if key and key in text:
-            return text.replace(key, _REDACTED)
-        return text
+        if not key:
+            return text
+        scrubbed = text.replace(key, _REDACTED)
+        for length in range(len(key) - 1, _MIN_REDACTED_PREFIX_CHARS - 1, -1):
+            prefix = key[:length]
+            if prefix in scrubbed:
+                scrubbed = scrubbed.replace(prefix, _REDACTED)
+                break
+        return scrubbed
