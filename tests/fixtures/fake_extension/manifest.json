@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Jobright Autofill Stub",
+  "version": "0.1.0",
+  "description": "Offline test stub for Jobright Autofill behavior.",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://127.0.0.1/*", "http://localhost/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Jobright Autofill Stub"
+  }
+}

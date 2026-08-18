@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Workday Application</title>
+</head>
+<body>
+  <div data-automation-id="jobApplicationPage">
+    <form class="workday-application">
+      <label for="wd-first-name">First name *</label>
+      <input id="wd-first-name" name="firstName" type="text" required
+             data-automation-id="legalNameSection_firstName">
+
+      <label for="wd-last-name">Last name *</label>
+      <input id="wd-last-name" name="lastName" type="text" required
+             data-automation-id="legalNameSection_lastName">
+
+      <label for="wd-email">Email *</label>
+      <input id="wd-email" name="email" type="email" required
+             data-automation-id="email">
+
+      <label for="wd-phone">Phone</label>
+      <input id="wd-phone" name="phone" type="tel"
+             data-automation-id="phone">
+
+      <label for="wd-notes">Additional information</label>
+      <textarea id="wd-notes" name="additionalInformation" rows="4"
+                data-automation-id="additionalInformation"></textarea>
+
+      <button type="submit">Submit</button>
+    </form>
+  </div>
+</body>
+</html>
