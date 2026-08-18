@@ -4,6 +4,10 @@ import { logger } from './logger.ts';
 import { closeDb } from './store/db.ts';
 import { printStatus } from './commands/status.ts';
 import { setupBrowser } from './commands/setupBrowser.ts';
+import { collectJobs } from './commands/collect.ts';
+import { runApplications } from './commands/run.ts';
+import { exportDay } from './commands/exportDay.ts';
+import { vaultExport } from './commands/vaultExport.ts';
 
 interface Command {
   describe: string;
@@ -22,9 +26,25 @@ const commands: Record<string, Command> = {
     describe: 'One-time: provision the dedicated Chrome profile and sign in',
     run: async () => setupBrowser(),
   },
+  collect: {
+    describe: 'Fill the queue from the enabled job boards',
+    run: async (args) => collectJobs(args),
+  },
+  run: {
+    describe: 'Work the queue, applying up to the daily target',
+    run: async (args) => runApplications(args),
+  },
+  export: {
+    describe: 'Write the day\'s CSV report and failed-URL list',
+    run: async (args) => exportDay(args),
+  },
   status: {
     describe: 'Show queue depth, today\'s counters, and recent failures',
     run: async () => printStatus(),
+  },
+  'vault:export': {
+    describe: 'Print ATS accounts the agent created, with passwords',
+    run: async () => vaultExport(),
   },
 };
 
