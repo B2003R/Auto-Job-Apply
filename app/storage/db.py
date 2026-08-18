@@ -266,32 +266,17 @@ class Database:
             conn.commit()
 
     def count_rate_events(self, board: Board, utc_day: date) -> int:
-        start = datetime(
-            utc_day.year,
-            utc_day.month,
-            utc_day.day,
-            tzinfo=timezone.utc,
-        )
-        end = datetime(
-            utc_day.year,
-            utc_day.month,
-            utc_day.day,
-            23,
-            59,
-            59,
-            999999,
-            tzinfo=timezone.utc,
-        )
+        day_start = f"{utc_day.isoformat()}T00:00:00+00:00"
         with self.connect() as conn:
             row = conn.execute(
                 """
                 SELECT COUNT(*) AS count
                 FROM rate_events
                 WHERE board = ?
-                  AND timestamp >= ?
-                  AND timestamp <= ?
+                  AND julianday(timestamp) >= julianday(?)
+                  AND julianday(timestamp) < julianday(?) + 1
                 """,
-                (board.value, _format_ts(start), _format_ts(end)),
+                (board.value, day_start, day_start),
             ).fetchone()
         return int(row["count"])
 

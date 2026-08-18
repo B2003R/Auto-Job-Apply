@@ -10,8 +10,13 @@ import pytest
 from app.config import Settings
 
 
-def test_settings_safe_defaults() -> None:
-    settings = Settings()
+def test_settings_safe_defaults(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("AUTO_SUBMIT=true\nLOG_FIELD_VALUES=true\n")
+    monkeypatch.chdir(tmp_path)
+
+    settings = Settings(_env_file=None)
+
     assert settings.auto_submit is False
     assert settings.log_field_values is False
     assert settings.linkedin_daily_cap == 40
@@ -31,7 +36,7 @@ def test_settings_env_parsing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
     monkeypatch.setenv("TOOLBAR_X", "1200")
     monkeypatch.setenv("TOOLBAR_Y", "80")
 
-    settings = Settings()
+    settings = Settings(_env_file=None)
 
     assert settings.auto_submit is True
     assert settings.log_field_values is True
@@ -47,6 +52,6 @@ def test_settings_env_parsing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -
 
 def test_settings_ignores_unrelated_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UNRELATED_ENV_VAR", "should-not-affect-settings")
-    settings = Settings()
+    settings = Settings(_env_file=None)
     assert settings.auto_submit is False
     assert os.environ.get("UNRELATED_ENV_VAR") == "should-not-affect-settings"

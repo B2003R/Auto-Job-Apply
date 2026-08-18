@@ -122,6 +122,41 @@ def test_rate_counts_use_utc_date(db: Database) -> None:
     assert db.count_rate_events(board, yesterday.date()) == 1
 
 
+def test_rate_counts_utc_day_boundaries(db: Database) -> None:
+    board = Board.LINKEDIN
+    target_day = datetime(2026, 8, 18, tzinfo=timezone.utc).date()
+
+    last_instant = datetime(2026, 8, 18, 23, 59, 59, 999999, tzinfo=timezone.utc)
+    first_next_day = datetime(2026, 8, 19, 0, 0, 0, tzinfo=timezone.utc)
+    last_previous_day = datetime(2026, 8, 17, 23, 59, 59, 999999, tzinfo=timezone.utc)
+
+    db.record_rate_event(board, "apply", last_instant)
+    db.record_rate_event(board, "apply", first_next_day)
+    db.record_rate_event(board, "apply", last_previous_day)
+
+    assert db.count_rate_events(board, target_day) == 1
+
+
+def test_rate_counts_handle_alternate_iso_timestamp_formats(db: Database) -> None:
+    board = Board.LINKEDIN
+    target_day = datetime(2026, 8, 18, tzinfo=timezone.utc).date()
+
+    db.record_rate_event(
+        board,
+        "apply",
+        datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc),
+    )
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO rate_events (board, action, timestamp) VALUES (?, ?, ?)",
+            (board.value, "apply", "2026-08-18T15:30:00Z"),
+        )
+        conn.commit()
+
+    assert db.count_rate_events(board, target_day) == 2
+
+
 def test_field_values_redacted_when_logging_disabled(db: Database) -> None:
     settings = db.settings
     logger = ApplicationLogger(db, settings)
