@@ -7,10 +7,15 @@
     "moduleResolution": "bundler",
     "outDir": "dist",
     "rootDir": "src",
-    // Source imports carry explicit .ts extensions so tsx and Node's native
-    // resolver agree; the rewrite flag keeps `tsc` emit working anyway.
+    // The project runs directly on Node's type stripping rather than a bundler,
+    // which requires explicit .ts import extensions. The rewrite flag keeps
+    // `tsc` emit working anyway. erasableSyntaxOnly makes tsc reject syntax Node
+    // cannot strip (enums, namespaces, parameter properties) instead of letting
+    // it fail at run time.
     "allowImportingTsExtensions": true,
     "rewriteRelativeImportExtensions": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true,

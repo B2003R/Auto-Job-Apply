@@ -1,0 +1,86 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Senior Engineer — Application</title>
+    <style>
+      .hidden { display: none; }
+      .field-error { color: red; }
+    </style>
+  </head>
+  <body>
+    <h1>Apply for Senior Engineer</h1>
+
+    <div role="alert" class="error-banner">Please correct the errors below before continuing.</div>
+
+    <form>
+      <!-- Standard explicit label -->
+      <label for="first">First name *</label>
+      <input id="first" name="first_name" type="text" value="Ada" required />
+
+      <!-- aria-label only -->
+      <input aria-label="Last name" name="last_name" type="text" value="" required />
+
+      <!-- Label wrapping the control -->
+      <label>Email address <input name="email" type="email" value="ada@example.com" required /></label>
+
+      <!-- Styled div acting as a label, no <label> element at all -->
+      <div class="form-row">
+        <div class="field-label">Phone number *</div>
+        <input name="phone" type="tel" value="" />
+      </div>
+
+      <!-- aria-labelledby -->
+      <span id="linkedin-label">LinkedIn profile</span>
+      <input aria-labelledby="linkedin-label" name="linkedin" type="url" value="" />
+
+      <!-- Invalid field with a described-by error message -->
+      <label for="years">Years of experience</label>
+      <input
+        id="years"
+        name="years"
+        type="number"
+        value="abc"
+        aria-invalid="true"
+        aria-describedby="years-error"
+      />
+      <span id="years-error" class="field-error">Enter a whole number.</span>
+
+      <!-- Select -->
+      <label for="auth">Are you authorized to work in the US? *</label>
+      <select id="auth" name="auth" required>
+        <option value=""></option>
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+      </select>
+
+      <!-- Radio group: should collapse into a single logical field -->
+      <fieldset>
+        <legend>Will you require visa sponsorship?</legend>
+        <label for="spon-yes">Yes</label>
+        <input id="spon-yes" type="radio" name="sponsorship" value="yes" />
+        <label for="spon-no">No</label>
+        <input id="spon-no" type="radio" name="sponsorship" value="no" checked />
+      </fieldset>
+
+      <!-- Checkbox -->
+      <label for="terms">I accept the terms</label>
+      <input id="terms" type="checkbox" name="terms" required />
+
+      <!-- File upload -->
+      <label for="resume">Resume *</label>
+      <input id="resume" name="resume" type="file" />
+
+      <!-- Free text -->
+      <label for="why">Why do you want to work here?</label>
+      <textarea id="why" name="why"></textarea>
+
+      <!-- Must be ignored: hidden input and display:none control -->
+      <input type="hidden" name="csrf" value="tok" />
+      <input class="hidden" name="invisible" type="text" value="ignored" />
+
+      <button type="button">Back</button>
+      <button type="button">Save and Continue</button>
+      <button type="submit">Submit Application</button>
+    </form>
+  </body>
+</html>

@@ -10,16 +10,17 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "agent": "tsx src/index.ts",
-    "setup:browser": "tsx src/index.ts setup:browser",
-    "collect": "tsx src/index.ts collect",
-    "run:dry": "tsx src/index.ts run --mode dry-run",
-    "run:review": "tsx src/index.ts run --mode review",
-    "run:auto": "tsx src/index.ts run --mode auto",
-    "export": "tsx src/index.ts export",
-    "status": "tsx src/index.ts status",
-    "vault:export": "tsx src/index.ts vault:export",
-    "test": "tsx --test src/**/*.test.ts"
+    "agent": "node --experimental-strip-types --no-warnings=ExperimentalWarning src/index.ts",
+    "setup:browser": "npm run agent -- setup:browser",
+    "collect": "npm run agent -- collect",
+    "run:dry": "npm run agent -- run --mode dry-run",
+    "run:review": "npm run agent -- run --mode review",
+    "run:auto": "npm run agent -- run --mode auto",
+    "export": "npm run agent -- export",
+    "status": "npm run agent -- status",
+    "vault:export": "npm run agent -- vault:export",
+    "test": "node --experimental-strip-types --no-warnings=ExperimentalWarning --test 'src/**/*.test.ts'",
+    "test:browser": "xvfb-run -a npm test"
   },
   "dependencies": {
     "better-sqlite3": "^12.4.1",
@@ -32,7 +33,6 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.9.2",
-    "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   }
 }
