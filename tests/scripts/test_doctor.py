@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from app.agent import browser_session
+from app.agent.native_click import CommandResult
 from app.config import Settings
 from scripts import doctor
 from scripts.doctor import CheckStatus, DoctorCategory, run_doctor
@@ -17,7 +18,14 @@ from scripts.doctor import CheckStatus, DoctorCategory, run_doctor
 EXTENSION_ID = "abcextensionid1234567890abcdefg"
 
 
-def _settings(profile: Path, *, toolbar_x: int = 0, toolbar_y: int = 0) -> Settings:
+def _settings(
+    profile: Path,
+    *,
+    toolbar_x: int = 0,
+    toolbar_y: int = 0,
+    chrome_window_name: str = "Google Chrome",
+    chrome_window_id: str = "",
+) -> Settings:
     return Settings(
         _env_file=None,
         chrome_executable=Path("/usr/bin/google-chrome"),
@@ -25,6 +33,8 @@ def _settings(profile: Path, *, toolbar_x: int = 0, toolbar_y: int = 0) -> Setti
         jobright_extension_id=EXTENSION_ID,
         toolbar_x=toolbar_x,
         toolbar_y=toolbar_y,
+        chrome_window_name=chrome_window_name,
+        chrome_window_id=chrome_window_id,
     )
 
 
@@ -46,6 +56,31 @@ def _write_extension(profile: Path, *, enabled: bool = True) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _result(*, returncode: int = 0, stdout: str = "", stderr: str = "") -> CommandResult:
+    return CommandResult(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+class RecordingRunner:
+    """Records xdotool invocations doctor makes and replays scripted results."""
+
+    def __init__(self, results: Any = None) -> None:
+        self.calls: list[tuple[Any, float, Any]] = []
+        self._results = list(results) if results is not None else []
+
+    async def __call__(self, argv: Any, timeout_s: float, env: Any = None) -> CommandResult:
+        self.calls.append((argv, timeout_s, env))
+        if not self._results:
+            return _result()
+        result = self._results.pop(0) if len(self._results) > 1 else self._results[0]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    @property
+    def argvs(self) -> list[list[str]]:
+        return [list(argv) for argv, _, _ in self.calls]
 
 
 def _category_check(report: Any, category: DoctorCategory) -> Any:
@@ -664,6 +699,156 @@ class TestDoctorXdotoolAndCalibration:
 
         check = _category_check(report, DoctorCategory.CALIBRATION_INVALID)
         assert check.status is CheckStatus.OK
+
+
+class TestDoctorNativeTierRequirements:
+    """The native tier's own preconditions, checked through injected seams —
+    no X server, no xdotool, and no window is ever touched."""
+
+    def _calibrated(self, profile: Path, **overrides: Any) -> Settings:
+        return _settings(profile, toolbar_x=1200, toolbar_y=80, **overrides)
+
+    async def _run(
+        self,
+        tmp_path: Path,
+        settings: Settings,
+        *,
+        runner: Any = None,
+        environ: dict[str, str] | None = None,
+        which: Any = None,
+    ) -> Any:
+        _write_extension(settings.chrome_profile_path)
+        worker = FakeWorker(url=f"chrome-extension://{EXTENSION_ID}/background.js")
+        context = FakeContext(service_workers=[worker])
+        return await run_doctor(
+            settings,
+            session_factory=_factory_returning(context),
+            runner=runner or RecordingRunner(),
+            environ=environ if environ is not None else {"DISPLAY": ":0"},
+            which=which or (lambda name: "/usr/bin/xdotool"),
+        )
+
+    async def test_missing_display_is_reported_when_calibrated(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        report = await self._run(
+            tmp_path, self._calibrated(profile), environ={}
+        )
+
+        check = _category_check(report, DoctorCategory.DISPLAY_MISSING)
+        assert check.status is CheckStatus.WARNING
+        assert "DISPLAY" in check.message
+
+    async def test_present_display_is_ok(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        report = await self._run(tmp_path, self._calibrated(profile))
+
+        check = _category_check(report, DoctorCategory.DISPLAY_MISSING)
+        assert check.status is CheckStatus.OK
+
+    async def test_native_checks_are_skipped_without_calibration(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner()
+
+        report = await self._run(
+            tmp_path, _settings(profile), runner=runner, environ={}
+        )
+
+        display = _category_check(report, DoctorCategory.DISPLAY_MISSING)
+        window = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert display.status is CheckStatus.OK
+        assert window.status is CheckStatus.OK
+        assert "not calibrated" in window.message
+        assert runner.calls == []
+
+    async def test_exactly_one_matching_window_is_ok(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner([_result(stdout="12345\n")])
+
+        report = await self._run(tmp_path, self._calibrated(profile), runner=runner)
+
+        check = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert check.status is CheckStatus.OK
+        assert runner.argvs == [
+            ["/usr/bin/xdotool", "search", "--onlyvisible", "--name", "Google Chrome"]
+        ]
+
+    async def test_no_matching_window_is_a_warning(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner([_result(returncode=1)])
+
+        report = await self._run(tmp_path, self._calibrated(profile), runner=runner)
+
+        check = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert check.status is CheckStatus.WARNING
+        assert "Google Chrome" in check.message
+
+    async def test_ambiguous_windows_point_at_chrome_window_id(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner([_result(stdout="111\n222\n")])
+
+        report = await self._run(tmp_path, self._calibrated(profile), runner=runner)
+
+        check = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert check.status is CheckStatus.WARNING
+        assert "CHROME_WINDOW_ID" in check.message
+
+    async def test_configured_window_id_needs_no_search(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner()
+
+        report = await self._run(
+            tmp_path, self._calibrated(profile, chrome_window_id="42"), runner=runner
+        )
+
+        check = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert check.status is CheckStatus.OK
+        assert "42" in check.message
+        assert runner.calls == []
+
+    async def test_missing_xdotool_makes_the_window_unverifiable(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner()
+
+        report = await self._run(
+            tmp_path,
+            self._calibrated(profile),
+            runner=runner,
+            which=lambda name: None,
+        )
+
+        check = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert check.status is CheckStatus.WARNING
+        assert "xdotool" in check.message
+        assert runner.calls == []
+
+    async def test_the_search_runs_with_a_minimal_environment(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner([_result(stdout="12345\n")])
+
+        await self._run(
+            tmp_path,
+            self._calibrated(profile),
+            runner=runner,
+            environ={"DISPLAY": ":0", "HOME": "/home/user", "OPENAI_API_KEY": "sk-secret"},
+        )
+
+        assert [env for _, _, env in runner.calls] == [
+            {"DISPLAY": ":0", "HOME": "/home/user"}
+        ]
+
+    async def test_a_failing_search_never_escapes_as_a_traceback(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        runner = RecordingRunner([OSError("xdotool vanished")])
+
+        report = await self._run(tmp_path, self._calibrated(profile), runner=runner)
+
+        check = _category_check(report, DoctorCategory.CHROME_WINDOW_UNRESOLVED)
+        assert check.status is CheckStatus.WARNING
+        assert "xdotool vanished" in check.message
 
 
 class TestDoctorMain:

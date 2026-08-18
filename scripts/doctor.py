@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import shutil
 import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from app.agent.browser_session import BrowserSession, ProfileLock, describe_chrome_singleton_locks
 from app.agent.errors import (
@@ -29,6 +30,14 @@ from app.agent.errors import (
     ServiceWorkerUnresponsiveError,
 )
 from app.agent.extension import find_installed_extension, find_service_worker, probe_service_worker
+from app.agent.native_click import (
+    DEFAULT_TIMEOUT_MS as DEFAULT_NATIVE_TIMEOUT_MS,
+    XDOTOOL_BINARY,
+    CommandRunner,
+    Which,
+    minimal_env,
+    run_command,
+)
 from app.config import Settings
 
 DEFAULT_SERVICE_WORKER_TIMEOUT_MS = 5000
@@ -41,6 +50,8 @@ class DoctorCategory(str, Enum):
     SERVICE_WORKER_DEAD = "service_worker_dead"
     XDOTOOL_MISSING = "xdotool_missing"
     CALIBRATION_INVALID = "calibration_invalid"
+    DISPLAY_MISSING = "display_missing"
+    CHROME_WINDOW_UNRESOLVED = "chrome_window_unresolved"
 
 
 class CheckStatus(str, Enum):
@@ -73,10 +84,26 @@ async def run_doctor(
     *,
     session_factory: SessionFactory | None = None,
     service_worker_timeout_ms: int = DEFAULT_SERVICE_WORKER_TIMEOUT_MS,
+    runner: CommandRunner | None = None,
+    which: Which | None = None,
+    environ: Mapping[str, str] | None = None,
 ) -> DoctorReport:
     checks: list[DoctorCheck] = []
     profile_path = settings.chrome_profile_path
     factory = session_factory or BrowserSession
+    resolved_runner = runner if runner is not None else run_command
+    resolved_which = which if which is not None else shutil.which
+    resolved_environ = environ if environ is not None else os.environ
+
+    async def native_checks() -> list[DoctorCheck]:
+        return [
+            _xdotool_check(),
+            _calibration_check(settings),
+            _display_check(settings, resolved_environ),
+            await _chrome_window_check(
+                settings, resolved_runner, resolved_which, resolved_environ
+            ),
+        ]
 
     if not profile_path.exists():
         checks.append(
@@ -86,8 +113,7 @@ async def run_doctor(
                 f"Profile directory missing: {profile_path}",
             )
         )
-        checks.append(_xdotool_check())
-        checks.append(_calibration_check(settings))
+        checks.extend(await native_checks())
         return DoctorReport(checks)
 
     checks.append(
@@ -116,8 +142,7 @@ async def run_doctor(
             )
         )
 
-    checks.append(_xdotool_check())
-    checks.append(_calibration_check(settings))
+    checks.extend(await native_checks())
     return DoctorReport(checks)
 
 
@@ -299,6 +324,102 @@ def _calibration_check(settings: Settings) -> DoctorCheck:
         DoctorCategory.CALIBRATION_INVALID,
         CheckStatus.OK,
         f"toolbar coordinates configured: ({settings.toolbar_x}, {settings.toolbar_y})",
+    )
+
+
+def _native_tier_enabled(settings: Settings) -> bool:
+    """Whether the operator asked for the native toolbar-click tier at all."""
+    return settings.toolbar_x > 0 and settings.toolbar_y > 0
+
+
+def _display_check(settings: Settings, environ: Mapping[str, str]) -> DoctorCheck:
+    if not _native_tier_enabled(settings):
+        return DoctorCheck(
+            DoctorCategory.DISPLAY_MISSING,
+            CheckStatus.OK,
+            "X display not required: toolbar coordinates are not calibrated, so "
+            "the native toolbar-click tier is disabled",
+        )
+    if not environ.get("DISPLAY"):
+        return DoctorCheck(
+            DoctorCategory.DISPLAY_MISSING,
+            CheckStatus.WARNING,
+            "toolbar coordinates are calibrated but DISPLAY is unset, so the "
+            "native toolbar-click tier will refuse to run; start a headed X "
+            "session (or xvfb-run) or clear TOOLBAR_X/TOOLBAR_Y",
+        )
+    return DoctorCheck(
+        DoctorCategory.DISPLAY_MISSING,
+        CheckStatus.OK,
+        f"X display available: DISPLAY={environ.get('DISPLAY')}",
+    )
+
+
+async def _chrome_window_check(
+    settings: Settings, runner: CommandRunner, which: Which, environ: Mapping[str, str]
+) -> DoctorCheck:
+    """Check that the native tier could resolve exactly one Chrome window.
+
+    Only ever runs `xdotool search`, which reads the window list; nothing is
+    activated, moved, or clicked, so this is safe to run at any time.
+    """
+    category = DoctorCategory.CHROME_WINDOW_UNRESOLVED
+    if not _native_tier_enabled(settings):
+        return DoctorCheck(
+            category,
+            CheckStatus.OK,
+            "Chrome window not required: toolbar coordinates are not calibrated, "
+            "so the native toolbar-click tier is disabled",
+        )
+    if settings.chrome_window_id:
+        return DoctorCheck(
+            category,
+            CheckStatus.OK,
+            f"native tier will use the configured CHROME_WINDOW_ID={settings.chrome_window_id}",
+        )
+
+    binary = which(XDOTOOL_BINARY)
+    if not binary:
+        return DoctorCheck(
+            category,
+            CheckStatus.WARNING,
+            "cannot verify the target Chrome window: xdotool is not on PATH, so "
+            "the native toolbar-click tier is unavailable anyway",
+        )
+
+    argv = [binary, "search", "--onlyvisible", "--name", settings.chrome_window_name]
+    try:
+        result = await runner(argv, DEFAULT_NATIVE_TIMEOUT_MS / 1000, minimal_env(environ))
+    except Exception as exc:  # noqa: BLE001 - a doctor check never raises
+        return DoctorCheck(
+            category,
+            CheckStatus.WARNING,
+            f"could not list windows with xdotool: {exc}",
+        )
+
+    ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not ids:
+        detail = result.stderr.strip()
+        return DoctorCheck(
+            category,
+            CheckStatus.WARNING,
+            f"no visible window matches CHROME_WINDOW_NAME={settings.chrome_window_name!r}"
+            + (f" ({detail})" if detail else "")
+            + "; the native toolbar-click tier will refuse to click",
+        )
+    if len(ids) > 1:
+        return DoctorCheck(
+            category,
+            CheckStatus.WARNING,
+            f"{len(ids)} visible windows match "
+            f"CHROME_WINDOW_NAME={settings.chrome_window_name!r} ({', '.join(ids)}); "
+            "set CHROME_WINDOW_ID so the native tier knows which one holds the "
+            "extension toolbar",
+        )
+    return DoctorCheck(
+        category,
+        CheckStatus.OK,
+        f"exactly one visible window matches {settings.chrome_window_name!r} (id {ids[0]})",
     )
 
 

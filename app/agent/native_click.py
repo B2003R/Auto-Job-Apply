@@ -40,7 +40,10 @@ XDOTOOL_BINARY = "xdotool"
 DEFAULT_TIMEOUT_MS = 5_000
 LEFT_BUTTON = 1
 #: Variables a child xdotool process actually needs to reach the X server.
-X_ENV_VARS: tuple[str, ...] = ("DISPLAY", "XAUTHORITY")
+#: `HOME` is included because without an explicit `XAUTHORITY` an X client
+#: falls back to `$HOME/.Xauthority`; dropping it would leave every command
+#: unable to authenticate on an otherwise working display.
+X_ENV_VARS: tuple[str, ...] = ("DISPLAY", "XAUTHORITY", "HOME")
 _WINDOW_ID = re.compile(r"^[0-9]+$")
 
 
@@ -107,11 +110,11 @@ def resolve_display(environ: Mapping[str, str]) -> str:
 
 
 def minimal_env(environ: Mapping[str, str]) -> dict[str, str]:
-    """The smallest environment an X client needs.
+    """The smallest environment an X client needs, and nothing else.
 
     Passing the agent's whole environment to a subprocess would hand model
     API keys and database paths to a process that only needs to talk to the
-    X server.
+    X server; passing too little would break X authentication instead.
     """
     return {name: environ[name] for name in X_ENV_VARS if environ.get(name)}
 

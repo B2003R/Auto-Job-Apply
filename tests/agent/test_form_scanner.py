@@ -15,7 +15,7 @@ from typing import Any, Iterable, Sequence
 
 import pytest
 
-from app.agent.errors import FormSettleTimeout
+from app.agent.errors import FormSettleTimeout, SnapshotScannerMismatch
 from app.agent.form_scanner import (
     DEFAULT_FIRST_CHANGE_TIMEOUT_MS,
     FIELD_SCAN_SCRIPT,
@@ -72,6 +72,7 @@ class FakeFrame:
         evaluate_error: Exception | None = None,
         name: str = "",
         parent: "FakeFrame | None" = None,
+        omit_digest: bool = False,
     ) -> None:
         self.url = url
         self.name = name
@@ -82,6 +83,7 @@ class FakeFrame:
         self._batches: list[Any] = list(batches) if batches is not None else [[]]
         self._mutations: list[int] = list(mutations) if mutations is not None else [0]
         self._evaluate_error = evaluate_error
+        self._omit_digest = omit_digest
         self.scripts: list[str] = []
         self.scan_options: list[Any] = []
         self.scan_calls = 0
@@ -101,8 +103,7 @@ class FakeFrame:
             return [self._render(record, options) for record in self._advance(self._batches)]
         raise AssertionError(f"unexpected script evaluated: {script[:60]!r}")
 
-    @staticmethod
-    def _render(record: Any, options: Any) -> Any:
+    def _render(self, record: Any, options: Any) -> Any:
         """Mimic the in-page script: digest in page, values only on request."""
         if not isinstance(record, dict):
             return record
@@ -122,6 +123,8 @@ class FakeFrame:
         )
         if options.get("captureValues"):
             rendered["value"] = value
+        if self._omit_digest:
+            rendered.pop("valueDigest", None)
         return rendered
 
     @staticmethod
@@ -434,6 +437,99 @@ class TestValuePrivacy:
         assert "crypto.subtle" in FIELD_SCAN_SCRIPT
         assert "HMAC" in FIELD_SCAN_SCRIPT
         assert "SHA-256" in FIELD_SCAN_SCRIPT
+
+
+class TestScannerIdentity:
+    async def test_snapshot_is_stamped_with_the_scanner_that_took_it(self) -> None:
+        scanner = FormScanner()
+
+        snapshot = await snapshot_of([raw_field()], scanner=scanner)
+
+        assert snapshot.scanner_id == scanner.scanner_id
+        assert snapshot.scanner_id
+
+    async def test_scanner_ids_differ_between_instances(self) -> None:
+        assert FormScanner().scanner_id != FormScanner().scanner_id
+
+    async def test_scanners_sharing_a_digest_key_are_compatible(self) -> None:
+        key = b"a-shared-key-for-two-scanners---"
+        one = FormScanner(digest_key=key)
+        two = FormScanner(digest_key=key)
+
+        before = await snapshot_of([raw_field(value="")], scanner=one)
+        after = await snapshot_of([raw_field(value="Ada")], scanner=two)
+
+        assert one.scanner_id == two.scanner_id
+        assert before.diff(after).has_changes is True
+
+    async def test_diffing_across_scanners_fails_loudly(self) -> None:
+        before = await snapshot_of([raw_field(value="")])
+        after = await snapshot_of([raw_field(value="")])
+
+        with pytest.raises(SnapshotScannerMismatch) as excinfo:
+            before.diff(after)
+
+        message = str(excinfo.value)
+        assert before.scanner_id in message
+        assert after.scanner_id in message
+
+    async def test_unstamped_snapshots_stay_comparable(self) -> None:
+        stamped = await snapshot_of([raw_field()])
+
+        assert stamped.diff(FormSnapshot()).removed
+        assert FormSnapshot().diff(stamped).added
+
+    async def test_settling_against_a_foreign_baseline_scans_nothing(self) -> None:
+        previous = await snapshot_of([raw_field()])
+        frame = FakeFrame(MAIN_URL, batches=[[raw_field()]])
+        scanner = FormScanner()
+
+        with pytest.raises(SnapshotScannerMismatch):
+            await scanner.wait_for_settle(FakePage(frame), previous)
+
+        assert frame.scan_calls == 0
+
+
+class TestMissingDigests:
+    async def test_records_without_a_digest_are_not_hashed_as_empty(self) -> None:
+        """Digesting a value the page never sent would give every field the
+        same digest, making a filled form look unchanged."""
+        frame = FakeFrame(
+            MAIN_URL,
+            batches=[[raw_field(value="Ada"), raw_field(name="email", value="a@b.co")]],
+            omit_digest=True,
+        )
+
+        snapshot = await FormScanner().snapshot(FakePage(frame))
+
+        assert snapshot.fields == ()
+        assert len(snapshot.skipped_frames) == 1
+        assert "digest" in snapshot.skipped_frames[0].reason
+        assert snapshot.coverage_complete is False
+
+    async def test_a_digestless_frame_does_not_hide_the_others(self) -> None:
+        main = FakeFrame(MAIN_URL, batches=[[raw_field()]])
+        broken = FakeFrame(
+            "https://ats.example.com/embed",
+            batches=[[raw_field(name="broken")]],
+            parent=main,
+            omit_digest=True,
+        )
+
+        snapshot = await FormScanner().snapshot(FakePage(main, [broken]))
+
+        assert [field.name for field in snapshot.fields] == ["first_name"]
+        assert snapshot.skipped_frames[0].frame_url == "https://ats.example.com/embed"
+
+    async def test_captured_values_are_digested_locally_when_the_page_omits_it(self) -> None:
+        frame = FakeFrame(MAIN_URL, batches=[[raw_field(value="Ada")]], omit_digest=True)
+        scanner = FormScanner(capture_values=True)
+
+        snapshot = await scanner.snapshot(FakePage(frame))
+
+        key = bytes.fromhex(frame.scan_options[0]["digestKey"])
+        assert snapshot.fields[0].value_digest == compute_value_digest(key, "Ada")
+        assert snapshot.skipped_frames == ()
 
 
 class TestFrameTraversal:

@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
-from app.agent.errors import FormSettleTimeout
+from app.agent.errors import FormSettleTimeout, SnapshotScannerMismatch
 
 DEFAULT_QUIET_MS = 600
 DEFAULT_SETTLE_TIMEOUT_MS = 15_000
@@ -524,6 +524,9 @@ class FormSnapshot:
 
     fields: tuple[FormField, ...] = ()
     skipped_frames: tuple[FrameSkip, ...] = ()
+    #: Identity of the scanner that took this snapshot. Empty means
+    #: "hand-built", which stays comparable with anything.
+    scanner_id: str = ""
 
     def by_key(self) -> Mapping[str, FormField]:
         return {field.key: field for field in self.fields}
@@ -532,6 +535,11 @@ class FormSnapshot:
     def coverage_complete(self) -> bool:
         """Whether every frame of the page was actually scanned."""
         return not self.skipped_frames
+
+    def require_same_scanner(self, other: "FormSnapshot") -> None:
+        """Refuse to compare snapshots whose digests are not comparable."""
+        if self.scanner_id and other.scanner_id and self.scanner_id != other.scanner_id:
+            raise SnapshotScannerMismatch(self.scanner_id, other.scanner_id)
 
     def required_gaps(self) -> tuple[FormField, ...]:
         return tuple(field for field in self.fields if field.is_required_gap)
@@ -556,6 +564,7 @@ class FormSnapshot:
         )
 
     def diff(self, after: "FormSnapshot") -> FormDiff:
+        self.require_same_scanner(after)
         before_by_key = self.by_key()
         after_by_key = after.by_key()
 
@@ -621,6 +630,10 @@ class SettleResult:
 
 Clock = Callable[[], float]
 Sleeper = Callable[[float], Awaitable[None]]
+
+
+class _MissingDigest(Exception):
+    """A frame's records arrived without the in-page digests they promise."""
 
 
 def _digest(value: str, length: int) -> str:
@@ -837,6 +850,14 @@ class FormScanner:
         # stable identifier, and a fresh key stops values being correlated
         # across runs or recovered by dictionary attack from logs.
         self._digest_key = digest_key if digest_key is not None else secrets.token_bytes(32)
+        # Derived from the key (never the key itself) so two scanners built
+        # with the same explicit key are correctly treated as compatible.
+        self._scanner_id = hashlib.sha256(self._digest_key).hexdigest()[:16]
+
+    @property
+    def scanner_id(self) -> str:
+        """Identity stamped on snapshots to keep digests comparable."""
+        return self._scanner_id
 
     async def snapshot(self, page: Any) -> FormSnapshot:
         """Scan every same-origin frame, including open shadow roots."""
@@ -859,11 +880,24 @@ class FormScanner:
                 # abort the whole scan; navigation/detachment is routine here.
                 skipped.append(FrameSkip(frame_url, f"evaluation failed: {exc}"))
                 continue
-            fields.extend(
-                self._parse_records(frame_url, frame_chain(frame), records, seen_identities)
-            )
+            try:
+                fields.extend(
+                    self._parse_records(
+                        frame_url, frame_chain(frame), records, seen_identities
+                    )
+                )
+            except _MissingDigest as exc:
+                # Digesting a value the page never sent would give every field
+                # in this frame the identical digest of "", so a filled form
+                # would look unchanged. Report the frame as unscanned instead.
+                skipped.append(FrameSkip(frame_url, str(exc)))
+                continue
 
-        return FormSnapshot(fields=tuple(fields), skipped_frames=tuple(skipped))
+        return FormSnapshot(
+            fields=tuple(fields),
+            skipped_frames=tuple(skipped),
+            scanner_id=self._scanner_id,
+        )
 
     async def wait_for_settle(
         self,
@@ -888,7 +922,12 @@ class FormScanner:
 
         `timeout_ms` bounds both phases together; exceeding it raises
         `FormSettleTimeout` carrying the last unsettled `SettleResult`.
+
+        Raises `SnapshotScannerMismatch` — before touching the page — when
+        `previous` came from a different scanner, since every field would
+        otherwise look changed.
         """
+        previous.require_same_scanner(FormSnapshot(scanner_id=self._scanner_id))
         started = self._clock()
         deadline_s = timeout_ms / 1000
         quiet_s = quiet_ms / 1000
@@ -1019,6 +1058,12 @@ class FormScanner:
 
         digest = _as_text(record.get("valueDigest"))
         if not digest:
+            if not has_value:
+                raise _MissingDigest(
+                    "field records carried no value digest and no value, so their "
+                    "values cannot be compared without silently digesting empty "
+                    "strings; this frame's fields are reported as unscanned"
+                )
             digest = compute_value_digest(self._digest_key, value)
 
         if "filled" in record:

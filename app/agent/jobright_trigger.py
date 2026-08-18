@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
 
-from app.agent.errors import FormSettleTimeout, TriggerFailed
+from app.agent.errors import FormSettleTimeout, SnapshotScannerMismatch, TriggerFailed
 from app.agent.extension import find_service_worker, probe_service_worker
 from app.agent.form_scanner import (
     DEFAULT_FIRST_CHANGE_TIMEOUT_MS,
@@ -116,12 +116,14 @@ class TriggerResult:
 #:
 #: Only genuinely interactive elements are considered — not "anything with an
 #: `aria-label`/`data-testid`/`onclick`", which on a real ATS page matches
-#: wrappers, tracking divs, and whole page sections. An element's accessible
-#: name is taken from its own attributes, or from its text only when that
-#: text is short enough to belong to a control; candidates larger than a
-#: fraction of the viewport are rejected outright, and among what remains the
-#: smallest (and, at equal size, deepest) wins — a real button is small and
-#: sits at the bottom of the tree, a container is neither.
+#: wrappers, tracking divs, and whole page sections — and anchors qualify only
+#: when they act as controls (`role="button"`, or a `#`/`javascript:` href)
+#: rather than navigating away from the half-filled application. An element's
+#: accessible name is taken from its own attributes, or from its text only
+#: when that text is short enough to belong to a control; candidates larger
+#: than a fraction of the viewport are rejected outright, and among what
+#: remains the smallest (and, at equal size, deepest) wins — a real button is
+#: small and sits at the bottom of the tree, a container is neither.
 AUTOFILL_QUERY_SCRIPT = """
 (() => {
   const MATCH = /autofill/i;
@@ -136,8 +138,21 @@ AUTOFILL_QUERY_SCRIPT = """
     'summary',
     '[role="button"]',
     '[role="menuitem"]',
-    '[role="link"]',
   ].join(', ');
+
+  // An <a href="/help/autofill"> navigates away instead of filling anything,
+  // and clicking it would abandon the application form. Only anchors that
+  // behave as in-page controls qualify.
+  const isActionableAnchor = (el) => {
+    if (el.tagName.toLowerCase() !== 'a') {
+      return true;
+    }
+    if ((el.getAttribute('role') || '').trim().toLowerCase() === 'button') {
+      return true;
+    }
+    const href = (el.getAttribute('href') || '').trim();
+    return href === '' || href.startsWith('#') || href.toLowerCase().startsWith('javascript:');
+  };
 
   const viewportArea = Math.max(
     1,
@@ -197,7 +212,7 @@ AUTOFILL_QUERY_SCRIPT = """
       return;
     }
     for (const el of found) {
-      if (!MATCH.test(accessibleName(el))) {
+      if (!MATCH.test(accessibleName(el)) || !isActionableAnchor(el)) {
         continue;
       }
       const usable = usableRect(el);
@@ -590,6 +605,7 @@ class ServiceWorkerTier:
         clicker: AutofillClicker | None = None,
         sleep: Sleeper = asyncio.sleep,
         popup_timeout_ms: int = DEFAULT_POPUP_TIMEOUT_MS,
+        dispatch_grace_ms: int = DEFAULT_DISPATCH_GRACE_MS,
     ) -> None:
         self._extension_id = extension_id
         self._worker_finder = worker_finder
@@ -598,6 +614,7 @@ class ServiceWorkerTier:
         self._clicker = clicker if clicker is not None else DeepAutofillClicker()
         self._sleep = sleep
         self._popup_timeout_ms = popup_timeout_ms
+        self._dispatch_grace_ms = dispatch_grace_ms
 
     async def attempt(self, page: Any) -> str:
         context = getattr(page, "context", None)
@@ -643,6 +660,9 @@ class ServiceWorkerTier:
         try:
             await _bring_to_front(page)
             detail = await self._clicker.click_in(popup)
+            # Same grace the popup tier gives: let the popup's own handler
+            # dispatch its message before the page it lives in disappears.
+            await self._sleep(self._dispatch_grace_ms / 1000)
         finally:
             await _close_quietly(popup)
         return f"service worker dispatched {method} and {detail}"
@@ -668,12 +688,14 @@ class NativeToolbarTier:
         clicker: AutofillClicker | None = None,
         sleep: Sleeper = asyncio.sleep,
         popup_timeout_ms: int = DEFAULT_POPUP_TIMEOUT_MS,
+        dispatch_grace_ms: int = DEFAULT_DISPATCH_GRACE_MS,
     ) -> None:
         self._native_click = native_click
         self._extension_id = extension_id
         self._clicker = clicker if clicker is not None else DeepAutofillClicker()
         self._sleep = sleep
         self._popup_timeout_ms = popup_timeout_ms
+        self._dispatch_grace_ms = dispatch_grace_ms
 
     async def attempt(self, page: Any) -> str:
         if self._native_click is None:
@@ -703,6 +725,7 @@ class NativeToolbarTier:
         try:
             await _bring_to_front(page)
             clicked = await self._clicker.click_in(popup)
+            await self._sleep(self._dispatch_grace_ms / 1000)
         except TierActionError as exc:
             return f"{detail}; the extension popup opened but {exc}"
         finally:
@@ -781,12 +804,21 @@ class JobrightTrigger:
         snapshot: FormSnapshot = await self._scanner.snapshot(page)
         return snapshot
 
+    def _require_own_baseline(self, before: FormSnapshot) -> None:
+        scanner_id = str(getattr(self._scanner, "scanner_id", "") or "")
+        if scanner_id and before.scanner_id and before.scanner_id != scanner_id:
+            raise SnapshotScannerMismatch(before.scanner_id, scanner_id)
+
     async def trigger(self, page: Any, before: FormSnapshot) -> TriggerResult:
         """Trigger Autofill and return the tier that actually changed fields.
 
         Raises `TriggerFailed` — carrying one diagnostic per attempted tier —
-        when no tier both acted and produced observable field changes.
+        when no tier both acted and produced observable field changes, and
+        `SnapshotScannerMismatch` (before acting at all) when `before` was
+        taken with a different scanner, whose digests would make every field
+        look changed.
         """
+        self._require_own_baseline(before)
         attempts: list[TierAttempt] = []
 
         for tier in self._tiers:
@@ -805,7 +837,7 @@ class JobrightTrigger:
                     first_change_timeout_ms=self._first_change_timeout_ms,
                 )
             except FormSettleTimeout as exc:
-                if self._require_field_changes and exc.result.diff.has_changes:
+                if exc.result.diff.has_changes:
                     # The tier worked: fields demonstrably changed. The page
                     # merely never went quiet (a spinner, a poller, an
                     # animation). Firing another tier now would re-trigger

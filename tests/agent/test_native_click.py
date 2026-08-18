@@ -159,6 +159,7 @@ class TestNativeCommandEnvironment:
         environ = {
             "DISPLAY": ":0",
             "XAUTHORITY": "/home/user/.Xauthority",
+            "HOME": "/home/user",
             "OPENAI_API_KEY": "sk-secret",
             "PATH": "/usr/bin",
         }
@@ -166,9 +167,40 @@ class TestNativeCommandEnvironment:
         await build_click(runner=runner, environ=environ).click()
 
         for _, _, env in runner.calls:
-            assert env == {"DISPLAY": ":0", "XAUTHORITY": "/home/user/.Xauthority"}
+            assert env == {
+                "DISPLAY": ":0",
+                "XAUTHORITY": "/home/user/.Xauthority",
+                "HOME": "/home/user",
+            }
 
-    async def test_xauthority_is_omitted_when_unset(self) -> None:
+    async def test_home_is_kept_so_the_default_xauthority_is_findable(self) -> None:
+        """Without XAUTHORITY an X client falls back to $HOME/.Xauthority, so
+        dropping HOME too would make every command fail to authenticate."""
+        runner = RecordingRunner(window_search_results())
+
+        await build_click(
+            runner=runner, environ={"DISPLAY": ":3", "HOME": "/home/user"}
+        ).click()
+
+        for _, _, env in runner.calls:
+            assert env == {"DISPLAY": ":3", "HOME": "/home/user"}
+
+    async def test_secrets_never_reach_the_subprocess(self) -> None:
+        runner = RecordingRunner(window_search_results())
+        environ = {
+            "DISPLAY": ":0",
+            "HOME": "/home/user",
+            "OPENAI_API_KEY": "sk-secret",
+            "SQLITE_PATH": "/data/jobs.db",
+        }
+
+        await build_click(runner=runner, environ=environ).click()
+
+        for _, _, env in runner.calls:
+            assert "sk-secret" not in str(env)
+            assert set(env) <= {"DISPLAY", "XAUTHORITY", "HOME"}
+
+    async def test_absent_variables_are_simply_omitted(self) -> None:
         runner = RecordingRunner(window_search_results())
 
         await build_click(runner=runner, environ={"DISPLAY": ":3"}).click()
@@ -397,11 +429,13 @@ class TestCalibrationScript:
             ["--countdown", "0"],
             runner=runner,
             which=which_found,
-            environ={"DISPLAY": ":0", "OPENAI_API_KEY": "sk-secret"},
+            environ={"DISPLAY": ":0", "HOME": "/home/user", "OPENAI_API_KEY": "sk-secret"},
             sleep=lambda _seconds: None,
         )
 
-        assert [env for _, _, env in runner.calls] == [{"DISPLAY": ":0"}]
+        assert [env for _, _, env in runner.calls] == [
+            {"DISPLAY": ":0", "HOME": "/home/user"}
+        ]
 
     def test_counts_down_before_sampling_the_pointer(self) -> None:
         slept: list[float] = []

@@ -17,6 +17,7 @@ from app.agent.errors import (
     FormSettleTimeout,
     NativeClickUnavailable,
     ServiceWorkerNotFoundError,
+    SnapshotScannerMismatch,
     TriggerFailed,
 )
 from app.agent.form_scanner import FormDiff, FormField, FormSnapshot, SettleResult
@@ -153,8 +154,9 @@ class RecordingTier:
 class FakeScanner:
     """Scanner double returning scripted settle results (or raising)."""
 
-    def __init__(self, results: Sequence[Any]) -> None:
+    def __init__(self, results: Sequence[Any], scanner_id: str = "") -> None:
         self._results = list(results)
+        self.scanner_id = scanner_id
         self.calls: list[dict[str, Any]] = []
 
     async def wait_for_settle(
@@ -307,6 +309,16 @@ class FakeWorker:
         if isinstance(self._result, Exception):
             raise self._result
         return self._result
+
+
+class RecordingSleep:
+    """Sleeper that logs its waits so grace periods can be ordered."""
+
+    def __init__(self, log: list[Any]) -> None:
+        self.log = log
+
+    async def __call__(self, seconds: float) -> None:
+        self.log.append(("sleep", seconds))
 
 
 class FakeNativeClick:
@@ -513,22 +525,25 @@ class TestSettleTimeoutHandling:
         assert result.tier is TriggerTier.EXTENSION_POPUP
         assert "never settled" in result.attempts[0].detail
 
-    async def test_timeout_with_changes_is_a_failure_when_verification_is_off(self) -> None:
-        """With verification disabled there is no change signal to trust, so a
-        timeout stays a failure rather than becoming an unverified success."""
+    async def test_timeout_with_changes_succeeds_even_without_change_verification(
+        self,
+    ) -> None:
+        """Observed changes mean the form was filled; re-triggering it because
+        verification happens to be disabled is the same double-fill hazard."""
         log: list[str] = []
         before, timeout = timeout_with_changes()
-        _, settled = settle_with_changes()
         tiers = [
             RecordingTier(TriggerTier.IN_PAGE, log),
             RecordingTier(TriggerTier.EXTENSION_POPUP, log),
         ]
 
         result = await build_trigger(
-            tiers, FakeScanner([timeout, settled]), require_field_changes=False
+            tiers, FakeScanner([timeout]), require_field_changes=False
         ).trigger(FakePage(ATS_URL), before)
 
-        assert result.tier is TriggerTier.EXTENSION_POPUP
+        assert log == [TriggerTier.IN_PAGE.value]
+        assert result.tier is TriggerTier.IN_PAGE
+        assert result.settled is False
 
 
 class TestFailureModes:
@@ -609,6 +624,32 @@ class TestFailureModes:
             await build_trigger([], FakeScanner([settled])).trigger(
                 FakePage(ATS_URL), before
             )
+
+
+class TestForeignBaseline:
+    async def test_a_baseline_from_another_scanner_is_refused_before_acting(self) -> None:
+        log: list[str] = []
+        scanner = FakeScanner([settle_with_changes()[1]], scanner_id="scanner-a")
+        tiers = [RecordingTier(TriggerTier.IN_PAGE, log)]
+        foreign = FormSnapshot(fields=(make_field(),), scanner_id="scanner-b")
+
+        with pytest.raises(SnapshotScannerMismatch) as excinfo:
+            await build_trigger(tiers, scanner).trigger(FakePage(ATS_URL), foreign)
+
+        assert log == []
+        assert "scanner-b" in str(excinfo.value)
+
+    async def test_a_baseline_from_the_same_scanner_is_accepted(self) -> None:
+        log: list[str] = []
+        before, settled = settle_with_changes()
+        scanner = FakeScanner([settled], scanner_id="scanner-a")
+        stamped = FormSnapshot(fields=before.fields, scanner_id="scanner-a")
+
+        result = await build_trigger([RecordingTier(TriggerTier.IN_PAGE, log)], scanner).trigger(
+            FakePage(ATS_URL), stamped
+        )
+
+        assert result.tier is TriggerTier.IN_PAGE
 
 
 class TestBaselineScanner:
@@ -707,6 +748,21 @@ class TestDeepAutofillQueryScript:
         assert "sort" in AUTOFILL_QUERY_SCRIPT
         assert "area" in AUTOFILL_QUERY_SCRIPT
         assert "depth" in AUTOFILL_QUERY_SCRIPT
+
+    def test_script_rejects_navigational_anchors(self) -> None:
+        """A link labelled 'Autofill help' navigates away instead of filling."""
+        assert "javascript:" in AUTOFILL_QUERY_SCRIPT
+        assert "'#'" in AUTOFILL_QUERY_SCRIPT
+        # Defined *and* applied to every candidate, not merely present.
+        assert "!isActionableAnchor(el)" in AUTOFILL_QUERY_SCRIPT
+        assert AUTOFILL_QUERY_SCRIPT.count("isActionableAnchor") >= 2
+
+    def test_script_keeps_anchors_that_behave_as_buttons(self) -> None:
+        anchor_rule = AUTOFILL_QUERY_SCRIPT[
+            AUTOFILL_QUERY_SCRIPT.index("isActionableAnchor") :
+        ][:600]
+        assert "role" in anchor_rule
+        assert "button" in anchor_rule
 
 
 class TestInPageTier:
@@ -1013,6 +1069,52 @@ class TestServiceWorkerTier:
         assert stale_popup.closed is False
         assert not [event for event in log if event[0] == "down"]
 
+    async def test_grace_period_precedes_closing_the_popup_it_opened(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+        popup = popup_page(log)
+
+        class OpeningWorker(FakeWorker):
+            async def evaluate(self, script: str, *args: Any) -> Any:
+                result = await super().evaluate(script, *args)
+                context.pages.append(popup)
+                return result
+
+        tier = self._tier(
+            OpeningWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log),
+            sleep=RecordingSleep(log),
+            dispatch_grace_ms=250,
+        )
+
+        await tier.attempt(page)
+
+        names = event_names(log)
+        assert ("sleep", 0.25) in log
+        assert names.index("sleep") > names.index("up")
+        assert names.index("sleep") < names.index("popup.close")
+
+    async def test_popup_is_closed_even_when_its_control_is_missing(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+        popup = popup_page(log, with_control=False)
+
+        class OpeningWorker(FakeWorker):
+            async def evaluate(self, script: str, *args: Any) -> Any:
+                result = await super().evaluate(script, *args)
+                context.pages.append(popup)
+                return result
+
+        tier = self._tier(
+            OpeningWorker({"ok": True, "method": "action.openPopup", "reason": ""}, log)
+        )
+
+        with pytest.raises(TierActionError):
+            await tier.attempt(page)
+
+        assert popup.closed is True
+
     async def test_reports_when_no_popup_page_becomes_reachable(self) -> None:
         tier = self._tier(FakeWorker({"ok": True, "method": "action.openPopup", "reason": ""}))
 
@@ -1094,6 +1196,44 @@ class TestNativeToolbarTier:
         assert stale_popup.closed is False
         assert not [event for event in log if event[0] == "down"]
         assert "xdotool" in detail
+
+    async def test_grace_period_precedes_closing_the_popup_it_opened(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+        popup = popup_page(log)
+
+        class OpeningNativeClick(FakeNativeClick):
+            async def click(self) -> None:
+                await super().click()
+                context.pages.append(popup)
+
+        await self._tier(
+            OpeningNativeClick(log),
+            sleep=RecordingSleep(log),
+            dispatch_grace_ms=250,
+        ).attempt(page)
+
+        names = event_names(log)
+        assert ("sleep", 0.25) in log
+        assert names.index("sleep") > names.index("up")
+        assert names.index("sleep") < names.index("popup.close")
+
+    async def test_popup_is_closed_even_when_its_control_is_missing(self) -> None:
+        log: list[Any] = []
+        context = FakeContext(log)
+        page = FakePage(ATS_URL, log=log, context=context, name="ats")
+        popup = popup_page(log, with_control=False)
+
+        class OpeningNativeClick(FakeNativeClick):
+            async def click(self) -> None:
+                await super().click()
+                context.pages.append(popup)
+
+        detail = await self._tier(OpeningNativeClick(log)).attempt(page)
+
+        assert popup.closed is True
+        assert "popup opened but" in detail
 
 
 async def _noop_sleep(seconds: float) -> None:

@@ -199,6 +199,26 @@ class FormSettleTimeout(BrowserError):
         return self.result.diff
 
 
+class SnapshotScannerMismatch(BrowserError):
+    """Raised when snapshots from two different scanners are compared.
+
+    Value digests are keyed per `FormScanner` instance, so comparing across
+    instances would report every field as changed — a silent false positive
+    that would make an autofill trigger look successful when nothing
+    happened. Comparing is refused instead.
+    """
+
+    def __init__(self, left: str, right: str) -> None:
+        self.left = left
+        self.right = right
+        super().__init__(
+            f"Snapshots come from different scanners ({left} vs {right}); their "
+            "value digests are keyed per scanner and cannot be compared. Take the "
+            "baseline and the result with the same FormScanner instance (e.g. via "
+            "JobrightTrigger.baseline)."
+        )
+
+
 class NativeClickError(BrowserError):
     """Base class for native (OS-level) toolbar click failures."""
 
