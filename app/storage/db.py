@@ -159,7 +159,13 @@ class Database:
             try:
                 yield conn
             except BaseException:
-                conn.execute("ROLLBACK")
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    # SQLite may have already aborted the transaction. The
+                    # caller's exception is the real story, so it is never
+                    # replaced by a rollback bookkeeping error.
+                    pass
                 raise
             conn.execute("COMMIT")
 

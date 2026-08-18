@@ -362,6 +362,23 @@ class TestConcurrency:
 
 
 class TestAtomicStorage:
+    def test_a_failure_inside_the_transaction_rolls_back_and_propagates(
+        self, db: Database
+    ) -> None:
+        boom = RuntimeError("interrupted mid-admission")
+
+        with pytest.raises(RuntimeError) as excinfo:
+            with db.immediate_transaction() as conn:
+                conn.execute(
+                    "INSERT INTO rate_events (board, action, timestamp) VALUES (?, ?, ?)",
+                    (Board.LINKEDIN.value, "apply", DAY.isoformat()),
+                )
+                raise boom
+
+        assert excinfo.value is boom
+        assert db.count_rate_events(Board.LINKEDIN, DAY.date()) == 0
+
+
     def test_the_database_refuses_to_insert_past_the_cap(self, db: Database) -> None:
         recorded_first, count_first = db.try_record_rate_event(
             Board.LINKEDIN, "apply", DAY, cap=1
