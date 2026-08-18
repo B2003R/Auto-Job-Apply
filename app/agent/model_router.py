@@ -174,6 +174,10 @@ class ModelAnswer:
 
     text: str
     tier: ModelTier
+    #: What the provider said answered — the configured model, or the dated
+    #: snapshot of it that was actually served. Anything else is refused
+    #: before an answer is built, so this is never a model whose prices were
+    #: not the ones the cost was computed from.
     model: str
     usage: TokenUsage
     cost: Decimal
