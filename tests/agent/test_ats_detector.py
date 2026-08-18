@@ -191,6 +191,106 @@ class TestDomMarkers:
         assert isinstance(detect_ats("https://careers.acme.com", html), AtsKind)
 
 
+class TestEvidenceStrength:
+    """A single generic vendor word is not enough to claim an ATS.
+
+    Company pages mention their tooling constantly — a blog class, a CSS
+    theme name, a tracking attribute — and each of those alone would classify
+    the page under the old scoring. Only vendor-specific markers (an ATS URL,
+    a provider attribute, a framework identifier) may decide it on their own.
+    """
+
+    @pytest.mark.parametrize(
+        "markup",
+        [
+            '<div class="greenhouse">',
+            '<div class="greenhouse-blog-teaser">',
+            '<section id="lever">',
+            '<div class="workday">',
+            '<span data-testid="lever">',
+        ],
+    )
+    def test_one_generic_vendor_token_is_not_enough(self, markup: str) -> None:
+        html = f"<html><body>{markup}</body></html>"
+        assert detect_ats("https://careers.acme.com/apply", html) is AtsKind.UNKNOWN
+
+    @pytest.mark.parametrize(
+        "markup,expected",
+        [
+            ('<form data-source="greenhouse">', AtsKind.GREENHOUSE),
+            ('<form data-provider="lever">', AtsKind.LEVER),
+            ('<form data-ats="workday">', AtsKind.WORKDAY),
+            ('<div id="grnhse_app">', AtsKind.GREENHOUSE),
+            ('<form class="lever-application-form">', AtsKind.LEVER),
+            ('<form class="workday-application">', AtsKind.WORKDAY),
+            ('<iframe id="icimsJobsIframe">', AtsKind.ICIMS),
+            ('<div class="smartrecruiters-widget">', AtsKind.SMARTRECRUITERS),
+        ],
+    )
+    def test_vendor_specific_markers_still_decide_alone(
+        self, markup: str, expected: AtsKind
+    ) -> None:
+        html = f"<html><body>{markup}</body></html>"
+        assert detect_ats("https://careers.acme.com/apply", html) is expected
+
+    def test_an_exact_ats_url_still_decides_alone(self) -> None:
+        assert detect_ats("https://boards.greenhouse.io/acme/jobs/1", "") is (
+            AtsKind.GREENHOUSE
+        )
+
+    def test_repeating_a_generic_token_does_not_manufacture_evidence(self) -> None:
+        """A themed page says "greenhouse" in every wrapper; that is one fact."""
+        html = (
+            '<html><body><div class="greenhouse"><p class="greenhouse"></p>'
+            '<span id="greenhouse"></span><a rel="greenhouse"></a></div></body></html>'
+        )
+        assert detect_ats("https://careers.acme.com/apply", html) is AtsKind.UNKNOWN
+
+    def test_a_generic_token_is_still_reported_as_evidence(self) -> None:
+        detection = classify_ats(
+            "https://careers.acme.com/apply", '<div class="greenhouse"></div>'
+        )
+        assert detection.kind is AtsKind.UNKNOWN
+        assert detection.confidence == 0.0
+        assert [signal.marker for signal in detection.signals] == ["greenhouse"]
+
+
+class TestMetaTags:
+    @pytest.mark.parametrize(
+        "name,expected",
+        [
+            ("generator", AtsKind.GREENHOUSE),
+            ("application-name", AtsKind.GREENHOUSE),
+            ("powered-by", AtsKind.GREENHOUSE),
+        ],
+    )
+    def test_framework_metadata_classifies(self, name: str, expected: AtsKind) -> None:
+        html = f'<html><head><meta name="{name}" content="Greenhouse"></head></html>'
+        assert detect_ats("https://careers.acme.com/jobs/1", html) is expected
+
+    @pytest.mark.parametrize(
+        "tag",
+        [
+            '<meta name="description" content="We cut greenhouse gas emissions">',
+            '<meta name="keywords" content="greenhouse, lever, workday, careers">',
+            '<meta property="og:title" content="Lever Careers at Acme">',
+            '<meta property="og:description" content="Our greenhouse programme">',
+            '<meta name="twitter:title" content="Workday of an engineer">',
+            '<meta itemprop="name" content="iCIMS partner programme">',
+        ],
+    )
+    def test_marketing_metadata_never_classifies(self, tag: str) -> None:
+        html = f"<html><head>{tag}</head></html>"
+        assert detect_ats("https://careers.acme.com/jobs/1", html) is AtsKind.UNKNOWN
+
+    def test_an_og_url_pointing_at_an_ats_does_not_classify_on_its_own(self) -> None:
+        html = (
+            '<html><head><meta property="og:url" '
+            'content="https://boards.greenhouse.io/acme/jobs/1"></head></html>'
+        )
+        assert detect_ats("https://blog.acme.com/we-are-hiring", html) is AtsKind.UNKNOWN
+
+
 class TestRecordedFixtures:
     @pytest.mark.parametrize(
         "name,expected",
