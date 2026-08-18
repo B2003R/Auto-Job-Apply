@@ -9,7 +9,7 @@
   "content_scripts": [
     {
       "matches": ["http://127.0.0.1/*", "http://localhost/*"],
-      "js": ["content.js"],
+      "js": ["stub_gap_contract.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

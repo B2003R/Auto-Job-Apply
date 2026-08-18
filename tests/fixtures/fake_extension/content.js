@@ -3,26 +3,16 @@
   const PANEL_ID = "jobright-stub-panel";
   const STATUS_ID = "jobright-stub-status";
   const BUTTON_ID = "jobright-stub-autofill";
+  const contractBySlug = globalThis.JOBRIGHT_STUB_GAP_CONTRACT ?? {};
 
-  const PARTIAL_VALUES = {
-    first_name: "Alex",
-    lastName: "Rivera",
-    email: "alex.rivera@example.com",
-    applicant_name: "Alex Rivera",
-    applicant_email: "alex.rivera@example.com",
-  };
-
-  const REQUIRED_INPUT_LEFT_EMPTY = new Set([
-    "phone",
-    "applicant_phone",
-  ]);
-
-  const TEXTAREA_LEFT_EMPTY = new Set([
-    "cover_letter",
-    "comments",
-    "additionalInformation",
-    "additional_notes",
-  ]);
+  function detectActiveContract() {
+    for (const [slug, contract] of Object.entries(contractBySlug)) {
+      if (document.querySelector(contract.detect.selector)) {
+        return { slug, contract };
+      }
+    }
+    return null;
+  }
 
   function ensurePanel() {
     let host = document.getElementById(HOST_ID);
@@ -81,19 +71,39 @@
     shadow.getElementById(STATUS_ID).textContent = message;
   }
 
-  function fillField(field) {
-    const key = field.name || field.id;
+  function fieldKey(field) {
+    return field.name || field.id || "";
+  }
+
+  function shouldSkipField(field, contract) {
+    const key = fieldKey(field);
     if (!key) {
+      return true;
+    }
+    if (
+      key === contract.required_input_left_empty &&
+      field.tagName === "INPUT"
+    ) {
+      return true;
+    }
+    if (
+      key === contract.textarea_left_empty &&
+      field.tagName === "TEXTAREA"
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function fillField(field, contract) {
+    const key = fieldKey(field);
+    if (!key || shouldSkipField(field, contract)) {
       return false;
     }
-    if (REQUIRED_INPUT_LEFT_EMPTY.has(key)) {
-      return false;
-    }
-    if (TEXTAREA_LEFT_EMPTY.has(key) && field.tagName === "TEXTAREA") {
-      return false;
-    }
-    if (Object.prototype.hasOwnProperty.call(PARTIAL_VALUES, key)) {
-      field.value = PARTIAL_VALUES[key];
+    if (
+      Object.prototype.hasOwnProperty.call(contract.partial_values, key)
+    ) {
+      field.value = contract.partial_values[key];
       field.dispatchEvent(new Event("input", { bubbles: true }));
       field.dispatchEvent(new Event("change", { bubbles: true }));
       return true;
@@ -101,7 +111,21 @@
     return false;
   }
 
+  function countEmptyRequiredControls() {
+    return Array.from(
+      document.querySelectorAll("input, textarea, select"),
+    ).filter((field) => field.required && !String(field.value ?? "").trim())
+      .length;
+  }
+
   async function runAutofill(shadow) {
+    const active = detectActiveContract();
+    if (!active) {
+      setStatus(shadow, "No ATS gap contract matched");
+      return;
+    }
+
+    const { contract } = active;
     const button = shadow.getElementById(BUTTON_ID);
     button.disabled = true;
     setStatus(shadow, "Autofill in progress…");
@@ -113,18 +137,22 @@
 
     for (const field of fields) {
       await new Promise((resolve) => setTimeout(resolve, 25));
-      if (fillField(field)) {
+      if (fillField(field, contract)) {
         filled += 1;
         setStatus(shadow, `Filled ${filled} field(s)…`);
       }
     }
 
-    setStatus(shadow, `Autofill complete (${filled} filled)`);
+    const remainingRequired = countEmptyRequiredControls();
+    setStatus(
+      shadow,
+      `Autofill complete (${filled} filled, ${remainingRequired} required empty)`,
+    );
     button.disabled = false;
 
     document.dispatchEvent(
       new CustomEvent("jobright-stub-complete", {
-        detail: { filled, remainingRequired: 2 },
+        detail: { filled, remainingRequired },
       }),
     );
   }
