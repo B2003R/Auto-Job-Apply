@@ -15,13 +15,16 @@ each adapter:
 
 * **A listing URL is only opened once its host is confirmed to belong to the
   board.** A selector map names CSS selectors, not domains; if a listing URL
-  merely *looked* like the right board
-  (`linkedin.com.evil.example`, `wellfound.co`), an adapter would still
-  dutifully click whatever matched `apply_button` on an attacker's page.
-  `open_listing` raises `UntrustedListingUrlError` — and never calls
-  `page.goto` at all — for anything that is not the board's own registrable
-  domain or a subdomain of it, mirroring the same suffix rule
-  `app.agent.ats_detector` uses for ATS hosts.
+  merely *looked* like the right board (`linkedin.com.evil.example`,
+  `wellfound.co`), an adapter would still dutifully click whatever matched
+  `apply_button` on an attacker's page. Worse, Python's `urlsplit` and a real
+  browser's WHATWG URL parser disagree about several inputs — a backslash, a
+  userinfo `@`, a malformed port, a control character — so trusting Python's
+  parsed host alone is not enough. `require_trusted_host` fully validates and
+  IDNA-normalises the URL, closing those specific disagreements, before
+  `open_listing` ever calls `page.goto`; anything it does not fully trust
+  raises `UntrustedListingUrlError` with `page.goto` never called at all,
+  mirroring the same suffix rule `app.agent.ats_detector` uses for ATS hosts.
 * **A selector map is validated before an adapter can use it.** A missing
   key, an empty selector, or a file that declares the wrong board is refused
   at load time with a specific complaint, rather than surfacing later as "no
@@ -73,21 +76,25 @@ class SelectorMapError(BoardAdapterError):
 
 
 class UntrustedListingUrlError(BoardAdapterError):
-    """Raised when a listing URL's host does not belong to the configured board.
+    """Raised when a listing URL is not safely known to belong to `board`.
 
-    Nothing is navigated when this is raised: `open_listing` checks the host
-    before ever calling `page.goto`, so a lookalike domain is never even
-    requested, let alone clicked into.
+    Nothing is navigated when this is raised: `open_listing` fully validates
+    and normalises the URL before ever calling `page.goto`, so a lookalike
+    domain — or a URL exploiting some disagreement between Python's `urlsplit`
+    and a real browser's WHATWG URL parser — is never even requested, let
+    alone clicked into. `reason` names the specific thing that was refused
+    (wrong scheme, a backslash, userinfo, a malformed port, an unrecognised
+    host, ...), for logs and diagnostics.
     """
 
-    def __init__(self, board: Board, url: str) -> None:
+    def __init__(self, board: Board, url: str, reason: str) -> None:
         self.board = board
         self.url = url
+        self.reason = reason
         super().__init__(
-            f"Refusing to open {url!r} as a {board.value} listing: its host is "
-            f"not a recognised {board.value} domain (or a subdomain of one). "
-            "This guards against following a lookalike domain and clicking "
-            "whatever it presents as the apply control."
+            f"Refusing to open {url!r} as a {board.value} listing: {reason}. "
+            "This guards against following a lookalike or confusingly-parsed "
+            "URL and clicking whatever it presents as the apply control."
         )
 
 
@@ -164,7 +171,10 @@ class BoardAdapter(Protocol):
         """Validate that `url` belongs to this board, then navigate to it.
 
         Raises `UntrustedListingUrlError` — before touching `page` at all —
-        when the host is not this board's own domain or a subdomain of it.
+        when `url` is not safely known to be this board's own domain or a
+        subdomain of it: an unrecognised host, a non-http(s) scheme, or any
+        of the specific ways Python's URL parser and a real browser's can
+        disagree (see `require_trusted_host`).
         """
         ...
 
@@ -302,30 +312,172 @@ def _validate_selector_map(
     return SelectorMap(board=board, source=source, selectors=selectors)
 
 
-def _split_host(url: str) -> str:
+#: Schemes `open_listing` will ever navigate to. Nothing else — `javascript:`,
+#: `data:`, `file:`, a bare `chrome-extension:`, or a protocol-relative URL
+#: with no scheme at all — is a real board listing.
+_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
+#: Every C0 control character and DEL, *except* tab/CR/LF. Python's `urlsplit`
+#: already deletes tab/CR/LF from anywhere in the URL before parsing it (the
+#: same first step WHATWG's URL parser performs), so those three are safe by
+#: construction; every other control character is left untouched by
+#: `urlsplit` and is refused explicitly here, since a browser and a naive
+#: string-based host check could disagree about what a stray NUL or DEL
+#: means.
+_FORBIDDEN_CONTROL_CHARS = frozenset(
+    chr(code) for code in range(0x20) if code not in (0x09, 0x0A, 0x0D)
+) | {chr(0x7F)}
+
+
+@dataclass(frozen=True)
+class _HostCheck:
+    """The result of parsing and normalising a listing URL's host.
+
+    `host` is only ever set when `ok` is true, and is always the
+    lowercased, IDNA/nameprep-normalised ASCII form of the host actually
+    parsed — the same form board-domain matching compares against.
+    """
+
+    ok: bool
+    host: str = ""
+    reason: str = ""
+
+
+def _normalize_idna_host(host: str) -> str | None:
+    """ASCII-normalise `host` the way a WHATWG URL parser would.
+
+    Every label is IDNA/nameprep-encoded via Python's built-in `idna` codec
+    and the result is lowercased with any trailing dot stripped. A plain
+    ASCII host round-trips unchanged; a full-width or otherwise-foldable
+    Unicode host that a real browser would resolve to a plain ASCII domain
+    (nameprep folds full-width Latin letters to their ASCII equivalents, for
+    example) normalises to that same ASCII domain here. A host that cannot
+    be represented in ASCII at all — including every genuine Unicode
+    homoglyph, which encodes to an `xn--`-prefixed label — fails to encode
+    and returns `None`: IDNA-encoding a non-ASCII label can never produce a
+    bare, unprefixed ASCII string, so this can never be tricked into
+    matching a plain ASCII board domain it should not.
+    """
     try:
-        host = urlsplit(url).hostname or ""
-    except ValueError:  # malformed IPv6 literals and similar
-        return ""
-    return host.strip().lower().rstrip(".")
+        return host.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError:
+        return None
+
+
+def _check_listing_url(url: str) -> _HostCheck:
+    """Parse and validate `url`, never trusting Python's parser alone.
+
+    Every check below exists because Python's `urlsplit` and a real
+    browser's WHATWG URL parser can disagree about the very same string —
+    see `app/boards/base.py`'s module docstring and `tests/boards/
+    test_url_gate.py` for the specific confusions each one closes. Nothing
+    here ever calls `page.goto`; a caller decides what "not ok" means.
+    """
+    if not isinstance(url, str) or not url:
+        return _HostCheck(False, reason="the URL is empty")
+
+    if any(ch in _FORBIDDEN_CONTROL_CHARS for ch in url):
+        return _HostCheck(False, reason="the URL contains an ASCII control character")
+
+    if "\\" in url:
+        # WHATWG URL parsing treats a backslash exactly like a forward slash
+        # for "special" schemes (http/https among them); Python's urlsplit
+        # does not, and instead reads it as a literal character. That gap is
+        # exploitable both ways — "https://evil.example\\@linkedin.com/"
+        # parses in Python to hostname "linkedin.com" while a real browser
+        # navigates to "evil.example" with a path of "/@linkedin.com/".
+        # Rather than reimplementing WHATWG's backslash normalisation, any
+        # backslash anywhere in the URL is refused outright: a legitimate
+        # listing URL never needs one.
+        return _HostCheck(False, reason="the URL contains a backslash")
+
+    try:
+        parts = urlsplit(url)
+    except ValueError as exc:
+        return _HostCheck(False, reason=f"the URL could not be parsed: {exc}")
+
+    if parts.scheme.lower() not in _ALLOWED_SCHEMES:
+        return _HostCheck(False, reason=f"scheme {parts.scheme!r} is not http or https")
+
+    if parts.username is not None or parts.password is not None:
+        # A legitimate listing URL never carries userinfo. Beyond being
+        # unnecessary, "https://linkedin.com@evil.example/" and
+        # "https://evil.example@linkedin.com/" are exactly the classic
+        # userinfo-confusion shapes; refusing any userinfo outright is
+        # simpler and safer than trusting either parser's idea of which side
+        # of the "@" is the real host.
+        return _HostCheck(
+            False, reason="the URL contains userinfo (a username/password before the host)"
+        )
+
+    try:
+        raw_host = parts.hostname
+        _ = parts.port  # accessed only to trigger its own ValueError, if any
+    except ValueError as exc:
+        return _HostCheck(False, reason=f"the host or port could not be parsed: {exc}")
+
+    if not raw_host:
+        return _HostCheck(False, reason="the URL has no host")
+
+    if "%" in raw_host:
+        # A legitimate DNS label never contains a literal percent sign.
+        # `urlsplit().hostname` does not percent-decode, so this can never
+        # coincide with a real board domain either way — refusing it
+        # outright is simpler than reasoning about what some other decoder
+        # might make of it.
+        return _HostCheck(False, reason="the host contains a percent-encoded sequence")
+
+    host = _normalize_idna_host(raw_host)
+    if host is None:
+        return _HostCheck(False, reason="the host could not be normalised (invalid IDNA label)")
+
+    return _HostCheck(True, host=host)
+
+
+def _host_matches_board(host: str, board: Board) -> bool:
+    """Whether `host` (already IDNA/nameprep-normalised) is `board`'s own
+    registrable domain, or a subdomain of it.
+
+    Matched as an exact host or a dotted suffix, never a substring, so
+    `linkedin.com.evil.example` and `notlinkedin.com` are refused just like
+    `app.agent.ats_detector` refuses the equivalent ATS lookalikes.
+    """
+    for domain in BOARD_HOSTS.get(board, ()):
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
 
 
 def host_owned_by_board(url: str, board: Board) -> bool:
     """Whether `url`'s host is `board`'s own registrable domain (or a subdomain).
 
-    Matched as an exact host or a dotted suffix, never a substring, so
-    `linkedin.com.evil.example` and `notlinkedin.com` are refused just like
-    `app.agent.ats_detector` refuses the equivalent ATS lookalikes. The query
-    string and path are never consulted: only the host in the address bar
-    says who actually served the page.
+    A non-raising boolean predicate over the same hardened parsing as
+    `require_trusted_host`: every URL shape that function refuses, this
+    returns `False` for. The query string and path are never consulted:
+    only the (normalised) host says who actually served the page.
     """
-    host = _split_host(url)
-    if not host:
+    check = _check_listing_url(url)
+    if not check.ok:
         return False
-    for domain in BOARD_HOSTS.get(board, ()):
-        if host == domain or host.endswith("." + domain):
-            return True
-    return False
+    return _host_matches_board(check.host, board)
+
+
+def require_trusted_host(url: str, board: Board) -> None:
+    """Raise `UntrustedListingUrlError` unless `url` is safe to open as `board`.
+
+    This is the only thing `BaseBoardAdapter.open_listing` consults before
+    calling `page.goto`; see `_check_listing_url` for the specific parser
+    disagreements it closes.
+    """
+    check = _check_listing_url(url)
+    if not check.ok:
+        raise UntrustedListingUrlError(board, url, check.reason)
+    if not _host_matches_board(check.host, board):
+        raise UntrustedListingUrlError(
+            board,
+            url,
+            f"host {check.host!r} is not a recognised {board.value} domain (or a subdomain of one)",
+        )
 
 
 async def _find_single(page: Any, selector: str) -> Any | None:
@@ -423,8 +575,7 @@ class BaseBoardAdapter:
         self.selectors = selectors
 
     async def open_listing(self, page: Any, url: str) -> ListingResult:
-        if not host_owned_by_board(url, self.board):
-            raise UntrustedListingUrlError(self.board, url)
+        require_trusted_host(url, self.board)
         goto = getattr(page, "goto", None)
         if goto is None:
             raise BoardAdapterError(
