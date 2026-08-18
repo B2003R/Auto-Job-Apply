@@ -12,15 +12,17 @@ dependencies = [
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
     "aiosqlite>=0.20.0",
+    "playwright>=1.40",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["app*"]
+include = ["app*", "scripts*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+asyncio_mode = "auto"
