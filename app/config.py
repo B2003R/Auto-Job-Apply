@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -48,9 +50,19 @@ class Settings(BaseSettings):
     routine_model_name: str = "gpt-4o-mini"
     escalation_model_url: str = "https://api.openai.com/v1"
     escalation_model_name: str = "gpt-4o"
-    openai_api_key: str = ""
+    # SecretStr, so the key cannot reach a log line, a repr, or a traceback
+    # by accident; reading it requires an explicit get_secret_value() call.
+    openai_api_key: SecretStr = SecretStr("")
 
-    routine_input_price: float = 0.15
-    routine_output_price: float = 0.60
-    escalation_input_price: float = 2.50
-    escalation_output_price: float = 10.00
+    # Decimal, not float: prices are exact quantities of money, and
+    # pydantic parses "0.15" into exactly Decimal("0.15") rather than the
+    # nearest binary approximation, so token costs add up exactly.
+    routine_input_price: Decimal = Decimal("0.15")
+    routine_output_price: Decimal = Decimal("0.60")
+    escalation_input_price: Decimal = Decimal("2.50")
+    escalation_output_price: Decimal = Decimal("10.00")
+
+    #: Canonical, human-authored answers consulted before any model.
+    answers_path: Path = Path("./answers.yaml")
+    model_timeout_s: float = 30.0
+    model_max_output_tokens: int = 400

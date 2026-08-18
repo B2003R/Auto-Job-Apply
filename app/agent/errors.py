@@ -1,14 +1,16 @@
-"""Typed exceptions for browser/profile safety."""
+"""Typed exceptions for browser, profile, rate, and model safety."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard, types only
     from app.agent.form_scanner import FormDiff, FormSnapshot, SettleResult
     from app.agent.jobright_trigger import TierAttempt
+    from app.storage.models import Board
 
 
 @dataclass(frozen=True)
@@ -294,3 +296,103 @@ class TeardownError(BrowserError):
         super().__init__(
             "Browser session teardown encountered multiple errors: " + "; ".join(parts)
         )
+
+
+class SafetyError(Exception):
+    """Base class for refusals that protect the account or the applicant.
+
+    Deliberately *not* a `BrowserError`: these are policy outcomes, not
+    browser malfunctions, and a caller that swallows browser errors must not
+    accidentally swallow a rate cap or a protected-question refusal too.
+    """
+
+
+class RateLimitExceeded(SafetyError):
+    """Raised when a board's per-UTC-day cap has already been reached.
+
+    There is no bypass: the only ways forward are to wait for
+    `next_reset_at` or to raise the configured cap in the environment, both
+    of which are deliberate operator actions.
+    """
+
+    def __init__(
+        self,
+        board: "Board",
+        cap: int,
+        count: int,
+        next_reset_at: datetime,
+    ) -> None:
+        self.board = board
+        self.cap = cap
+        self.count = count
+        self.next_reset_at = next_reset_at
+        super().__init__(
+            f"Daily cap reached for {board.value}: {count} of {cap} action(s) already "
+            f"recorded for this UTC day. The count resets at "
+            f"{next_reset_at.isoformat()}; there is no runtime override, so either "
+            "wait for the reset or raise the configured cap."
+        )
+
+
+class ProtectedQuestionError(SafetyError):
+    """Raised when a protected question was about to be sent to a model.
+
+    Visa/sponsorship, EEO/demographic, compensation, and employment-date
+    answers are the applicant's to give. A model asked for one would produce
+    a plausible sentence with no basis in fact, which is exactly the failure
+    this project exists to prevent, so the request is refused at the boundary
+    that would otherwise perform it.
+    """
+
+    def __init__(self, category: str, question: str) -> None:
+        self.category = category
+        self.question = question
+        super().__init__(
+            f"Refusing to ask a model a {category} question: {question!r}. "
+            "Answers in this category must come from the applicant, either "
+            "through the canonical answers file or through the approval gate."
+        )
+
+
+class ModelError(Exception):
+    """Base class for model-routing failures."""
+
+
+class ModelUnavailable(ModelError):
+    """Raised when a completion cannot even be attempted.
+
+    A missing API key, a missing `httpx`, or an unusable endpoint all mean no
+    request was made; the caller escalates the question to a human rather
+    than treating the gap as answered.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"Model completion unavailable: {reason}")
+
+
+class ModelResponseError(ModelError):
+    """Raised when the provider replied with something unusable.
+
+    Carries a redacted excerpt only: the request's credentials are never
+    echoed back into a message, a log, or a traceback.
+    """
+
+    def __init__(self, status: int, detail: str) -> None:
+        self.status = status
+        self.detail = detail
+        super().__init__(f"Model request failed with status {status}: {detail}")
+
+
+class AnswerBookError(Exception):
+    """Raised when the canonical answers file cannot be trusted.
+
+    A malformed answers file is never partially applied: a typo that silently
+    dropped one entry would send a question a human already answered to a
+    model instead.
+    """
+
+    def __init__(self, path: str, reason: str) -> None:
+        self.path = path
+        self.reason = reason
+        super().__init__(f"Canonical answers file {path} is unusable: {reason}")

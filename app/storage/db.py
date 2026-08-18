@@ -80,8 +80,26 @@ _SCHEMA_STATEMENTS = (
 )
 
 
+#: Shared UTC-day predicate for rate events. Counting and admission must use
+#: exactly the same window, or a cap could be checked over one day's rows and
+#: enforced against another's.
+_RATE_DAY_PREDICATE = (
+    "board = ? AND julianday(timestamp) >= julianday(?) "
+    "AND julianday(timestamp) < julianday(?) + 1"
+)
+
+#: How long a connection waits for a write lock before giving up. Admission
+#: serializes concurrent workers on a single immediate transaction, so a brief
+#: wait under contention is expected and must not surface as an error.
+_BUSY_TIMEOUT_MS = 5_000
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _day_start(utc_day: date) -> str:
+    return f"{utc_day.isoformat()}T00:00:00+00:00"
 
 
 def _format_ts(value: datetime) -> str:
@@ -119,10 +137,31 @@ class Database:
         conn = sqlite3.connect(self._settings.sqlite_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         try:
             yield conn
         finally:
             conn.close()
+
+    @contextmanager
+    def immediate_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Open a write-locked transaction that commits or rolls back as one.
+
+        `BEGIN IMMEDIATE` takes the write lock up front, so a read performed
+        inside the block cannot be invalidated by another connection before
+        the matching write lands. That is what makes a read-then-write
+        decision (check a cap, then record an event) atomic rather than
+        merely sequential.
+        """
+        with self.connect() as conn:
+            conn.isolation_level = None  # explicit transaction control
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+            conn.execute("COMMIT")
 
     def enqueue_job(self, listing_url: str, board: Board) -> int:
         now = _format_ts(_utc_now())
@@ -266,19 +305,50 @@ class Database:
             conn.commit()
 
     def count_rate_events(self, board: Board, utc_day: date) -> int:
-        day_start = f"{utc_day.isoformat()}T00:00:00+00:00"
+        day_start = _day_start(utc_day)
         with self.connect() as conn:
             row = conn.execute(
-                """
-                SELECT COUNT(*) AS count
-                FROM rate_events
-                WHERE board = ?
-                  AND julianday(timestamp) >= julianday(?)
-                  AND julianday(timestamp) < julianday(?) + 1
-                """,
+                f"SELECT COUNT(*) AS count FROM rate_events WHERE {_RATE_DAY_PREDICATE}",
                 (board.value, day_start, day_start),
             ).fetchone()
         return int(row["count"])
+
+    def try_record_rate_event(
+        self,
+        board: Board,
+        action: str,
+        timestamp: datetime,
+        cap: int,
+    ) -> tuple[bool, int]:
+        """Record an event only if the board is still under `cap` that UTC day.
+
+        Returns `(recorded, count)` where `count` is the board's event count
+        for that day *after* the attempt. The count and the insert happen
+        inside one immediate transaction, so two workers that both see 39 of
+        40 cannot both be admitted: the second one's check runs after the
+        first one's write is committed, not before it.
+        """
+        moment = timestamp if timestamp.tzinfo is not None else timestamp.replace(
+            tzinfo=timezone.utc
+        )
+        moment = moment.astimezone(timezone.utc)
+        day_start = _day_start(moment.date())
+        window = (board.value, day_start, day_start)
+
+        with self.immediate_transaction() as conn:
+            count = int(
+                conn.execute(
+                    f"SELECT COUNT(*) AS count FROM rate_events WHERE {_RATE_DAY_PREDICATE}",
+                    window,
+                ).fetchone()["count"]
+            )
+            if count >= max(0, cap):
+                return False, count
+            conn.execute(
+                "INSERT INTO rate_events (board, action, timestamp) VALUES (?, ?, ?)",
+                (board.value, action, _format_ts(moment)),
+            )
+            return True, count + 1
 
     def save_application_field(
         self,

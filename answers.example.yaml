@@ -1,0 +1,37 @@
+# Canonical answers: the questions you have already decided how to answer.
+#
+# Copy this file to the path in ANSWERS_PATH (default ./answers.yaml) and
+# edit it. Every entry here is treated as *your* answer, attributed to you
+# rather than to a model, and is used before any model is consulted.
+#
+# This is also the only way a protected question — visa/sponsorship,
+# EEO/demographics, compensation, employment dates — is ever filled without
+# stopping for you at the approval gate, because a model is never allowed to
+# answer one and nothing infers one on your behalf. Even then, a protected
+# question still forces the approval gate to run before submission.
+#
+# Two shapes are accepted. The short one maps a question to an answer:
+
+answers:
+  "Preferred name": "Alex Kim"
+  "How did you hear about us?": "Company careers page"
+
+# The long one is a list, for when one answer has to match several phrasings
+# or should be keyed to a form control's name rather than its label:
+#
+# answers:
+#   - question: "Why do you want to work here?"
+#     value: "I have followed this team's work on ..."
+#     aliases:
+#       - "What interests you about this role?"
+#       - "Why are you applying?"
+#   - question: "LinkedIn profile"
+#     value: "https://www.linkedin.com/in/example"
+#     names:
+#       - linkedin_url
+#       - urls[LinkedIn]
+#
+# Matching ignores case, surrounding whitespace, and trailing decoration, so
+# "Preferred name" also answers a page rendering "Preferred Name *". A
+# question answered twice is an error rather than a silent last-one-wins, and
+# a malformed file is rejected whole rather than partially applied.

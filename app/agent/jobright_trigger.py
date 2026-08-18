@@ -46,6 +46,7 @@ from app.agent.form_scanner import (
     SettleResult,
     same_origin_frames,
 )
+from app.agent.humanize import Humanizer
 from app.agent.native_click import NativeToolbarClick
 from app.config import Settings
 
@@ -389,10 +390,14 @@ class DeepAutofillClicker:
         self._sleep = sleep
         self._rng = rng if rng is not None else random.Random(seed)
         self._script = script
-        self._min_steps = min_steps
-        self._max_steps = max_steps
         self._max_area_fraction = max_area_fraction
         self._min_container_area = min_container_area
+        self._humanizer = Humanizer(
+            sleep=sleep,
+            rng=self._rng,
+            min_steps=min_steps,
+            max_steps=max_steps,
+        )
 
     async def click_in(self, page: Any) -> str:
         frames, _ = same_origin_frames(page)
@@ -451,28 +456,7 @@ class DeepAutofillClicker:
         if mouse is None:
             raise TierActionError("page exposes no mouse for a human-like click")
 
-        target_x = box["x"] + box["width"] * self._rng.uniform(0.35, 0.65)
-        target_y = box["y"] + box["height"] * self._rng.uniform(0.35, 0.65)
-        start_x = target_x - self._rng.uniform(80, 220)
-        start_y = target_y - self._rng.uniform(60, 160)
-        steps = self._rng.randint(self._min_steps, self._max_steps)
-
-        for step in range(1, steps + 1):
-            progress = step / steps
-            # Smoothstep easing: accelerate away from the start, decelerate
-            # into the target, the way a hand-driven pointer does.
-            eased = progress * progress * (3 - 2 * progress)
-            jitter_x = 0.0 if step == steps else self._rng.uniform(-1.5, 1.5)
-            jitter_y = 0.0 if step == steps else self._rng.uniform(-1.5, 1.5)
-            await mouse.move(
-                start_x + (target_x - start_x) * eased + jitter_x,
-                start_y + (target_y - start_y) * eased + jitter_y,
-            )
-            await self._sleep(self._rng.uniform(0.012, 0.035))
-
-        await mouse.down()
-        await self._sleep(self._rng.uniform(0.04, 0.09))
-        await mouse.up()
+        await self._humanizer.move_and_click(mouse, box)
 
     async def _reject_oversized(self, page: Any, box: Mapping[str, float]) -> None:
         """Refuse to click something the size of the page itself.
