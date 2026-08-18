@@ -31,7 +31,9 @@ Refusing four categories still leaves everything nobody thought to name, so
 model routing is additionally an *allowlist*: unless the label reads as a
 request for written prose, the gap goes to the applicant. "Reason for
 leaving", "Highest level of education", "Have you ever been convicted of a
-felony?" are all questions a model would answer fluently and falsely.
+felony?" are all questions a model would answer fluently and falsely. A short
+veto list overrides the allowlist where a prose shape wraps a fact —
+"Describe your criminal record" is long-form and still unanswerable.
 
 `blocks_auto_submit` is read as "is it safe to submit", so it also covers
 every gap that simply has no answer yet — including a plan that was only
@@ -159,10 +161,14 @@ _PROTECTED_PATTERNS: Mapping[ProtectedCategory, tuple[Pattern[str], ...]] = {
         re.compile(r"\breligion\b|\breligious\b", re.IGNORECASE),
         # `\bage\b` is safe next to "language", "average", and "manager",
         # which have no word boundary before "age".
-        re.compile(r"\bage\b|\bages\b", re.IGNORECASE),
+        re.compile(r"\bages?\b", re.IGNORECASE),
         re.compile(r"\blgbtq?\+?\b|\bqueer\b", re.IGNORECASE),
         re.compile(r"\btransgender\b|\bnon[-_\s]?binary\b", re.IGNORECASE),
         re.compile(r"\bcaste\b", re.IGNORECASE),
+        # A DEI prompt asks about identity and values, so it is the
+        # applicant's to answer — and naming it here rather than letting
+        # "equity" match as compensation keeps the recorded category honest.
+        re.compile(r"\bdiversity\b|\binclusion\b", re.IGNORECASE),
         re.compile(r"\bindigenous\b|\baboriginal\b", re.IGNORECASE),
     ),
     ProtectedCategory.COMPENSATION: (
@@ -224,6 +230,26 @@ _MODEL_ELIGIBLE_PATTERNS: tuple[Pattern[str], ...] = (
     re.compile(r"\bwhat\s+makes\s+you\b|\bwhy\s+are\s+you\s+a\s+(good|great)\s+fit\b", re.IGNORECASE),
     re.compile(r"\bmotivat(es|ion|ions)\b", re.IGNORECASE),
     re.compile(r"\bin\s+your\s+own\s+words\b", re.IGNORECASE),
+)
+
+#: Subjects that override the allowlist. "Describe ..." makes a question
+#: long-form, not answerable: a model asked to describe an applicant's
+#: convictions, clearance, grades, or references will write a confident
+#: paragraph of fiction. These are checked after the prose patterns so a
+#: prose-shaped question about a fact still goes to the applicant.
+_MODEL_VETO_PATTERNS: tuple[Pattern[str], ...] = (
+    re.compile(r"\bcrimin(al|ally)\b|\bconvict(ed|ion|ions)?\b|\bfelon(y|ies)\b", re.IGNORECASE),
+    re.compile(r"\bmisdemean(o|ou)r\b|\barrest(ed|s)?\b|\bincarcerat", re.IGNORECASE),
+    re.compile(r"\bbackground\s+(check|screen)", re.IGNORECASE),
+    re.compile(r"\bdrug\s+(test|screen)", re.IGNORECASE),
+    re.compile(r"\bsecurity\s+clearance\b|\bclearance\s+level\b", re.IGNORECASE),
+    re.compile(r"\bdisciplinar(y|ies)\b|\bterminat(ed|ion)\b|\bdismissed\b|\bfired\b", re.IGNORECASE),
+    re.compile(r"\breferences?\b|\breferee\b", re.IGNORECASE),
+    re.compile(r"\bgpa\b|\bgrade\s+point\b|\btranscript\b", re.IGNORECASE),
+    re.compile(r"\bdegree\b|\bdiploma\b|\bgraduat(ed|ion)\b", re.IGNORECASE),
+    re.compile(r"\blicen[cs]e\b|\bcertification\s+number\b", re.IGNORECASE),
+    re.compile(r"\bmedical\b|\bhealth\s+condition\b|\baccommodat(ion|ions|e)\b", re.IGNORECASE),
+    re.compile(r"\bsalary\b|\bcompensation\b", re.IGNORECASE),
 )
 
 #: Category order is fixed so classification is deterministic when a label
@@ -295,6 +321,8 @@ def model_eligible(label: str) -> bool:
     """
     text = _WHITESPACE.sub(" ", label or "").strip()
     if not text:
+        return False
+    if any(pattern.search(text) for pattern in _MODEL_VETO_PATTERNS):
         return False
     return any(pattern.search(text) for pattern in _MODEL_ELIGIBLE_PATTERNS)
 
@@ -889,8 +917,7 @@ def _human_only_control(field: FormField) -> bool:
     an attestation — "I certify", "I agree", "I am a protected veteran" —
     and ticking one is a statement made in the applicant's name.
     """
-    field_type = (field.field_type or "").strip().lower()
-    return field_type in _HUMAN_ONLY_TYPES or field.tag.strip().lower() == "file"
+    return (field.field_type or "").strip().lower() in _HUMAN_ONLY_TYPES
 
 
 def _prompt_label(label: str) -> str:

@@ -254,6 +254,7 @@ class TestProtectedClassificationBreadth:
             "Are you transgender?",
             "Do you identify as non-binary?",
             "Caste",
+            "Describe your commitment to diversity, equity, and inclusion",
         ],
     )
     def test_demographic_variants_in_ordinary_english(self, label: str) -> None:
@@ -838,6 +839,38 @@ class TestModelEligibility:
         assert item.answer is None
         assert item.question is None
         assert plan.blocks_auto_submit is True
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "Describe any criminal convictions",
+            "Please describe your felony conviction",
+            "Tell us about your security clearance",
+            "Describe your disciplinary history",
+            "Describe the results of your most recent drug screening",
+            "Tell us about your medical accommodations",
+            "Describe your highest degree and GPA",
+            "Describe the circumstances of your termination",
+            "Tell us about your references",
+        ],
+    )
+    async def test_a_prose_prompt_asking_for_a_fact_still_stops(
+        self, label: str
+    ) -> None:
+        """"Describe ..." makes a question long-form, not answerable.
+
+        A model asked to describe an applicant's convictions, clearance, or
+        grades will write a confident paragraph of fiction, so the prose
+        shape is vetoed when the subject is a fact about the person.
+        """
+        router = RecordingRouter(text="I have none, and here is why.")
+
+        plan = await filler(router=router).fill(
+            [field(key="q", label=label, tag="textarea")]
+        )
+
+        assert router.questions == []
+        assert plan.items[0].resolution is Resolution.HUMAN
 
     def test_the_reason_explains_why_the_model_was_not_used(self) -> None:
         plan = filler(router=RecordingRouter()).plan(
