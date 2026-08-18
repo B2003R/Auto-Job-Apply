@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets and local configuration
+.env
+.env.local
+
+# Personal profile data: never commit resumes or answer banks
+config/answers.yaml
+config/profile.yaml
+assets/
+
+# Runtime state: database, screenshots, exports, browser profile
+data/
+.browser-profile/
+
+# OS noise
+.DS_Store
+Thumbs.db
