@@ -308,9 +308,9 @@ class ModelRouter:
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ModelResponseError(response.status_code, "response carried no choices")
-        choice = choices[0] if isinstance(choices[0], Mapping) else {}
-        message = choice.get("message") if isinstance(choice, Mapping) else None
-        message = message if isinstance(message, Mapping) else {}
+        choice: Mapping[str, Any] = choices[0] if isinstance(choices[0], Mapping) else {}
+        raw_message = choice.get("message")
+        message: Mapping[str, Any] = raw_message if isinstance(raw_message, Mapping) else {}
 
         finish_reason = choice.get("finish_reason")
         finish = finish_reason.strip().lower() if isinstance(finish_reason, str) else ""
@@ -322,8 +322,8 @@ class ModelRouter:
             )
 
         refusal = message.get("refusal")
-        refused = finish in _DECLINED_FINISH_REASONS or bool(
-            isinstance(refusal, str) and refusal.strip()
+        refused = finish in _DECLINED_FINISH_REASONS or (
+            isinstance(refusal, str) and bool(refusal.strip())
         )
 
         content = message.get("content")

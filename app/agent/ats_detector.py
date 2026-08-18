@@ -371,7 +371,10 @@ def _token_kind(
 def _dom_signals(html: str) -> tuple[AtsSignal, ...]:
     """Signals from attribute names, attribute values, and embedded URLs.
 
-    Text nodes are never read, so page copy cannot influence the answer.
+    Text nodes are never read, so page copy cannot influence the answer, and
+    comments are stripped first: markup that is commented out is not what the
+    page is rendering, so a stale integration snippet cannot decide the
+    classification.
     """
     if not html:
         return ()
