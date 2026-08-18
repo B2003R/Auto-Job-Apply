@@ -64,6 +64,29 @@ class ProfileLockedError(BrowserError):
         )
 
 
+class ProfileInUseError(BrowserError):
+    """Raised when Chrome's own singleton markers indicate a Chrome process
+    already has this profile open, independent of this project's own
+    `.job-apply-lock.json`.
+
+    These files (`SingletonLock`, `SingletonSocket`, `SingletonCookie`) are
+    Chrome-internal and are never deleted by this project; an operator must
+    close the other Chrome process (or confirm it is gone and remove the
+    files manually) before retrying.
+    """
+
+    def __init__(self, profile_path: Path, singleton_files: list[str]) -> None:
+        self.profile_path = profile_path
+        self.singleton_files = list(singleton_files)
+        names = ", ".join(self.singleton_files)
+        super().__init__(
+            f"Chrome profile-in-use markers found in {profile_path}: {names}. "
+            "A Chrome process may already have this profile open (or crashed "
+            "without cleaning up). Close that Chrome process first; these "
+            "files are never removed automatically."
+        )
+
+
 class ExtensionNotFoundError(BrowserError):
     """Raised when the extension cannot be verified as installed via Chrome
     profile preference files."""

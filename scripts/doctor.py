@@ -4,6 +4,10 @@ Distinguishes actionable failure categories (missing profile, locked profile,
 missing extension, dead service worker, missing xdotool, invalid toolbar
 calibration) without requiring a real browser: `session_factory` defaults to
 the real `BrowserSession` but can be swapped for a fake in tests.
+
+Every check is wrapped so that filesystem errors and unexpected
+browser/worker errors always become a categorized `ERROR` check — this
+script never lets an unhandled exception surface as a raw traceback.
 """
 
 from __future__ import annotations
@@ -14,11 +18,12 @@ import shutil
 import sys
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from app.agent.browser_session import BrowserSession, ProfileLock
+from app.agent.browser_session import BrowserSession, ProfileLock, detect_chrome_singleton_locks
 from app.agent.errors import ExtensionNotFoundError, ProfileLockedError, ServiceWorkerNotFoundError
-from app.agent.extension import find_installed_extension, find_service_worker
+from app.agent.extension import find_installed_extension, find_service_worker, probe_service_worker
 from app.config import Settings
 
 DEFAULT_SERVICE_WORKER_TIMEOUT_MS = 5000
@@ -90,19 +95,8 @@ async def run_doctor(
 
     checks.append(_extension_check(settings))
 
-    lock_available = False
-    lock = ProfileLock(profile_path)
-    try:
-        await lock.acquire()
-    except ProfileLockedError as exc:
-        status = CheckStatus.WARNING if exc.stale else CheckStatus.ERROR
-        checks.append(DoctorCheck(DoctorCategory.PROFILE_LOCKED, status, str(exc)))
-    else:
-        checks.append(
-            DoctorCheck(DoctorCategory.PROFILE_LOCKED, CheckStatus.OK, "Profile lock acquired")
-        )
-        await lock.release()
-        lock_available = True
+    lock_check, lock_available = await _lock_check(profile_path)
+    checks.append(lock_check)
 
     if lock_available:
         checks.append(
@@ -122,16 +116,95 @@ async def run_doctor(
     return DoctorReport(checks)
 
 
+async def _lock_check(profile_path: Path) -> tuple[DoctorCheck, bool]:
+    """Verify the profile is not locked by this agent or by Chrome itself.
+
+    Both a stale and an active `.job-apply-lock.json` are reported as
+    `ERROR` (the lock is never auto-removed either way; a stale lock just
+    means it is *probably* safe for an operator to remove it manually).
+    Chrome's own `SingletonLock`/`SingletonSocket`/`SingletonCookie` markers
+    are checked too and are also never deleted. Any filesystem error while
+    checking either mechanism becomes a categorized `ERROR`, never a
+    traceback, and never leaks this function's own lock acquisition.
+    """
+    lock = ProfileLock(profile_path)
+    try:
+        await lock.acquire()
+    except ProfileLockedError as exc:
+        return DoctorCheck(DoctorCategory.PROFILE_LOCKED, CheckStatus.ERROR, str(exc)), False
+    except OSError as exc:
+        return (
+            DoctorCheck(
+                DoctorCategory.PROFILE_LOCKED,
+                CheckStatus.ERROR,
+                f"Could not verify the profile lock due to a filesystem error: {exc}",
+            ),
+            False,
+        )
+
+    try:
+        singleton_files = detect_chrome_singleton_locks(profile_path)
+        singleton_error: Exception | None = None
+    except OSError as exc:
+        singleton_files = []
+        singleton_error = exc
+
+    try:
+        await lock.release()
+    except OSError:
+        pass  # best-effort; do not let release-time issues mask the result below
+
+    if singleton_error is not None:
+        return (
+            DoctorCheck(
+                DoctorCategory.PROFILE_LOCKED,
+                CheckStatus.ERROR,
+                "Could not check Chrome's own singleton lock files due to a "
+                f"filesystem error: {singleton_error}",
+            ),
+            False,
+        )
+
+    if singleton_files:
+        return (
+            DoctorCheck(
+                DoctorCategory.PROFILE_LOCKED,
+                CheckStatus.ERROR,
+                "Chrome profile-in-use markers present: "
+                f"{', '.join(singleton_files)}. A Chrome process may already "
+                "have this profile open (or crashed without cleaning up); "
+                "these files are never removed automatically.",
+            ),
+            False,
+        )
+
+    return DoctorCheck(DoctorCategory.PROFILE_LOCKED, CheckStatus.OK, "Profile lock acquired"), True
+
+
 def _extension_check(settings: Settings) -> DoctorCheck:
     try:
         install = find_installed_extension(settings.chrome_profile_path, settings.jobright_extension_id)
     except ExtensionNotFoundError as exc:
         return DoctorCheck(DoctorCategory.EXTENSION_MISSING, CheckStatus.ERROR, str(exc))
+    except OSError as exc:
+        return DoctorCheck(
+            DoctorCategory.EXTENSION_MISSING,
+            CheckStatus.ERROR,
+            f"Could not read profile preferences due to a filesystem error: {exc}",
+        )
+
+    if not install.enabled:
+        return DoctorCheck(
+            DoctorCategory.EXTENSION_MISSING,
+            CheckStatus.ERROR,
+            f"Extension {install.name or install.extension_id} is installed but disabled "
+            f"in {install.source_file}",
+        )
+
     return DoctorCheck(
         DoctorCategory.EXTENSION_MISSING,
         CheckStatus.OK,
-        f"Extension present: {install.name or install.extension_id} "
-        f"({'enabled' if install.enabled else 'disabled'})",
+        f"Extension present: {install.name or install.extension_id} (enabled)",
     )
 
 
@@ -140,26 +213,48 @@ async def _service_worker_check(
     factory: SessionFactory,
     timeout_ms: int,
 ) -> DoctorCheck:
-    session = factory(settings)
     try:
-        context = await session.start()
-    except Exception as exc:  # pragma: no cover - requires a real browser
+        session = factory(settings)
+    except Exception as exc:
         return DoctorCheck(
             DoctorCategory.SERVICE_WORKER_DEAD,
             CheckStatus.ERROR,
-            f"Could not launch browser to verify service worker: {exc}",
+            f"Could not construct a browser session: {exc}",
         )
 
     try:
-        await find_service_worker(context, settings.jobright_extension_id, timeout_ms)
-    except ServiceWorkerNotFoundError as exc:
-        return DoctorCheck(DoctorCategory.SERVICE_WORKER_DEAD, CheckStatus.ERROR, str(exc))
-    else:
-        return DoctorCheck(
-            DoctorCategory.SERVICE_WORKER_DEAD, CheckStatus.OK, "Service worker responsive"
-        )
+        try:
+            context = await session.start()
+        except Exception as exc:
+            return DoctorCheck(
+                DoctorCategory.SERVICE_WORKER_DEAD,
+                CheckStatus.ERROR,
+                f"Could not launch browser to verify service worker: {exc}",
+            )
+
+        try:
+            worker = await find_service_worker(context, settings.jobright_extension_id, timeout_ms)
+            await probe_service_worker(worker, settings.jobright_extension_id, timeout_ms)
+        except ServiceWorkerNotFoundError as exc:
+            return DoctorCheck(DoctorCategory.SERVICE_WORKER_DEAD, CheckStatus.ERROR, str(exc))
+        except Exception as exc:
+            return DoctorCheck(
+                DoctorCategory.SERVICE_WORKER_DEAD,
+                CheckStatus.ERROR,
+                f"Unexpected error verifying the service worker: {exc}",
+            )
+        else:
+            return DoctorCheck(
+                DoctorCategory.SERVICE_WORKER_DEAD, CheckStatus.OK, "Service worker responsive"
+            )
     finally:
-        await session.close()
+        # Attempted unconditionally (even after a failed start()) so a
+        # session that only partially initialized never leaks resources;
+        # teardown issues here must never mask the check result above.
+        try:
+            await session.close()
+        except Exception:
+            pass
 
 
 def _xdotool_check() -> DoctorCheck:

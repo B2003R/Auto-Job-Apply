@@ -55,8 +55,22 @@ def _category_check(report: Any, category: DoctorCategory) -> Any:
 
 
 class FakeWorker:
-    def __init__(self, url: str) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        evaluate_error: Exception | None = None,
+        has_evaluate: bool = True,
+    ) -> None:
         self.url = url
+        self._evaluate_error = evaluate_error
+        if has_evaluate:
+            self.evaluate = self._evaluate  # type: ignore[assignment]
+
+    async def _evaluate(self, expression: str) -> Any:
+        if self._evaluate_error is not None:
+            raise self._evaluate_error
+        return 2
 
 
 class FakeContext:
@@ -81,18 +95,32 @@ class FakeContext:
 
 
 class FakeSession:
-    def __init__(self, settings: Settings, *, context: FakeContext) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        context: FakeContext | None = None,
+        start_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self.settings = settings
         self._context = context
+        self._start_error = start_error
+        self._close_error = close_error
         self.started = False
         self.closed = False
 
     async def start(self) -> FakeContext:
+        if self._start_error is not None:
+            raise self._start_error
         self.started = True
+        assert self._context is not None
         return self._context
 
     async def close(self) -> None:
         self.closed = True
+        if self._close_error is not None:
+            raise self._close_error
 
 
 def _factory_returning(context: FakeContext) -> Any:
@@ -140,7 +168,7 @@ class TestDoctorProfileLocked:
         assert check.status is CheckStatus.ERROR
         assert report.ok is False
 
-    async def test_reports_warning_for_stale_lock(
+    async def test_reports_error_for_stale_lock(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         profile = tmp_path / "profile"
@@ -157,7 +185,26 @@ class TestDoctorProfileLocked:
         report = await run_doctor(settings)
 
         check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
-        assert check.status is CheckStatus.WARNING
+        assert check.status is CheckStatus.ERROR
+        assert report.ok is False
+
+    def test_stale_lock_exits_nonzero_via_main(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        lock_path = profile / browser_session.LOCK_FILENAME
+        lock_path.write_text(
+            json.dumps({"pid": 999999, "hostname": "gone", "acquired_at": "then"}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(browser_session, "_pid_alive", lambda pid: False)
+        settings = _settings(profile)
+
+        exit_code = doctor.main([], settings=settings)
+
+        assert exit_code == 1
 
     async def test_stale_lock_is_never_deleted_by_doctor(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -195,6 +242,98 @@ class TestDoctorProfileLocked:
         assert "lock" in check.message.lower()
 
 
+class TestDoctorProfileLockFilesystemErrors:
+    async def test_lock_filesystem_error_becomes_categorized_error_not_traceback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        settings = _settings(profile)
+
+        async def _raise(self: Any) -> None:
+            raise PermissionError("permission denied creating lock file")
+
+        monkeypatch.setattr(browser_session.ProfileLock, "acquire", _raise)
+
+        report = await run_doctor(settings)
+
+        check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
+        assert check.status is CheckStatus.ERROR
+        assert "permission denied" in check.message.lower()
+        assert report.ok is False
+
+    async def test_singleton_check_filesystem_error_becomes_categorized_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        settings = _settings(profile)
+
+        def _raise(profile_path: Path) -> list[str]:
+            raise PermissionError("cannot stat SingletonLock")
+
+        monkeypatch.setattr(doctor, "detect_chrome_singleton_locks", _raise)
+
+        report = await run_doctor(settings)
+
+        check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
+        assert check.status is CheckStatus.ERROR
+        assert report.ok is False
+        # Our own lock must still be released even though the singleton check failed.
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+
+def _factory_that_must_not_be_called() -> Any:
+    def factory(settings: Settings) -> Any:
+        raise AssertionError("session_factory must not be invoked when profile is in use")
+
+    return factory
+
+
+class TestDoctorProfileInUseSingleton:
+    async def test_reports_error_when_chrome_singleton_lock_present(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        (profile / "SingletonLock").write_text("x", encoding="utf-8")
+        settings = _settings(profile)
+
+        report = await run_doctor(settings, session_factory=_factory_that_must_not_be_called())
+
+        check = _category_check(report, DoctorCategory.PROFILE_LOCKED)
+        assert check.status is CheckStatus.ERROR
+        assert "SingletonLock" in check.message
+        assert report.ok is False
+
+    async def test_never_deletes_singleton_lock_file(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        singleton = profile / "SingletonLock"
+        singleton.write_text("x", encoding="utf-8")
+        settings = _settings(profile)
+
+        await run_doctor(settings, session_factory=_factory_that_must_not_be_called())
+
+        assert singleton.exists()
+
+    async def test_skips_service_worker_check_when_singleton_lock_present(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        _write_extension(profile)
+        (profile / "SingletonLock").write_text("x", encoding="utf-8")
+        settings = _settings(profile)
+
+        report = await run_doctor(settings, session_factory=_factory_that_must_not_be_called())
+
+        check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert check.status is CheckStatus.WARNING
+
+
 class TestDoctorExtension:
     async def test_reports_error_when_extension_missing(self, tmp_path: Path) -> None:
         profile = tmp_path / "profile"
@@ -219,6 +358,20 @@ class TestDoctorExtension:
 
         check = _category_check(report, DoctorCategory.EXTENSION_MISSING)
         assert check.status is CheckStatus.OK
+
+    async def test_reports_error_when_extension_present_but_disabled(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile, enabled=False)
+        settings = _settings(profile)
+        worker = FakeWorker(url=f"chrome-extension://{EXTENSION_ID}/background.js")
+        context = FakeContext(service_workers=[worker])
+
+        report = await run_doctor(settings, session_factory=_factory_returning(context))
+
+        check = _category_check(report, DoctorCategory.EXTENSION_MISSING)
+        assert check.status is CheckStatus.ERROR
+        assert "disabled" in check.message.lower()
+        assert report.ok is False
 
 
 class TestDoctorServiceWorker:
@@ -267,6 +420,111 @@ class TestDoctorServiceWorker:
         await run_doctor(settings, session_factory=factory)
 
         assert session_holder["session"].closed is True
+
+    async def test_unexpected_session_factory_error_becomes_categorized_error(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+
+        def _raising_factory(settings: Settings) -> Any:
+            raise RuntimeError("cannot construct session")
+
+        report = await run_doctor(settings, session_factory=_raising_factory)
+
+        check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert check.status is CheckStatus.ERROR
+        assert report.ok is False
+
+    async def test_unexpected_session_start_error_becomes_categorized_error(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+
+        def factory(settings: Settings) -> FakeSession:
+            return FakeSession(settings, start_error=RuntimeError("chrome crashed"))
+
+        report = await run_doctor(settings, session_factory=factory)
+
+        check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert check.status is CheckStatus.ERROR
+        assert report.ok is False
+
+    async def test_session_close_is_still_attempted_after_start_failure(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+        session_holder: dict[str, FakeSession] = {}
+
+        def factory(settings: Settings) -> FakeSession:
+            session = FakeSession(settings, start_error=RuntimeError("chrome crashed"))
+            session_holder["session"] = session
+            return session
+
+        await run_doctor(settings, session_factory=factory)
+
+        assert session_holder["session"].closed is True
+
+    async def test_unexpected_service_worker_lookup_error_becomes_categorized_error(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+
+        class _BrokenContext:
+            service_workers: list[Any] = []
+
+            def on(self, event: str, handler: Any) -> None:
+                raise RuntimeError("context is not a real BrowserContext")
+
+        report = await run_doctor(
+            settings, session_factory=_factory_returning(_BrokenContext())  # type: ignore[arg-type]
+        )
+
+        check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert check.status is CheckStatus.ERROR
+        assert report.ok is False
+
+    async def test_reports_error_when_worker_found_but_unresponsive(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+        worker = FakeWorker(
+            url=f"chrome-extension://{EXTENSION_ID}/background.js",
+            evaluate_error=RuntimeError("worker terminated"),
+        )
+        context = FakeContext(service_workers=[worker])
+
+        report = await run_doctor(settings, session_factory=_factory_returning(context))
+
+        check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert check.status is CheckStatus.ERROR
+        assert report.ok is False
+
+    async def test_session_close_error_does_not_crash_doctor_or_mask_ok_result(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        _write_extension(profile)
+        settings = _settings(profile)
+        worker = FakeWorker(url=f"chrome-extension://{EXTENSION_ID}/background.js")
+        context = FakeContext(service_workers=[worker])
+
+        def factory(settings: Settings) -> FakeSession:
+            return FakeSession(
+                settings, context=context, close_error=RuntimeError("close boom")
+            )
+
+        report = await run_doctor(settings, session_factory=factory)
+
+        check = _category_check(report, DoctorCategory.SERVICE_WORKER_DEAD)
+        assert check.status is CheckStatus.OK
 
 
 class TestDoctorXdotoolAndCalibration:

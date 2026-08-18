@@ -5,12 +5,18 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from app.agent import browser_session
-from app.agent.browser_session import ProfileLock, build_launch_options
-from app.agent.errors import ProfileLockedError
+from app.agent.browser_session import (
+    BrowserSession,
+    ProfileLock,
+    build_launch_options,
+    detect_chrome_singleton_locks,
+)
+from app.agent.errors import ProfileInUseError, ProfileLockedError, ProfileMissingError
 from app.config import Settings
 
 
@@ -280,3 +286,343 @@ class TestProfileLockReleaseSafety:
 
         # Must not delete a lock file it no longer recognizes as its own.
         assert lock.lock_path.exists()
+
+
+class TestDetectChromeSingletonLocks:
+    def test_returns_empty_when_no_singleton_files_present(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+
+        assert detect_chrome_singleton_locks(profile) == []
+
+    def test_detects_singleton_lock_file(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "SingletonLock").write_text("x", encoding="utf-8")
+
+        found = detect_chrome_singleton_locks(profile)
+
+        assert "SingletonLock" in found
+
+    def test_detects_all_three_singleton_markers(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "SingletonLock").write_text("x", encoding="utf-8")
+        (profile / "SingletonSocket").write_text("x", encoding="utf-8")
+        (profile / "SingletonCookie").write_text("x", encoding="utf-8")
+
+        found = detect_chrome_singleton_locks(profile)
+
+        assert set(found) == {"SingletonLock", "SingletonSocket", "SingletonCookie"}
+
+    def test_detects_dangling_symlink_singleton_lock(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        singleton = profile / "SingletonLock"
+        singleton.symlink_to(profile / "nonexistent-host-1234")
+
+        found = detect_chrome_singleton_locks(profile)
+
+        assert "SingletonLock" in found
+
+    def test_does_not_detect_singleton_files_nested_under_default(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        (profile / "Default").mkdir(parents=True)
+        (profile / "Default" / "SingletonLock").write_text("x", encoding="utf-8")
+
+        assert detect_chrome_singleton_locks(profile) == []
+
+
+# --- Fakes for BrowserSession lifecycle tests -------------------------------
+
+
+class FakeContext:
+    def __init__(self, *, close_error: Exception | None = None) -> None:
+        self.close_calls = 0
+        self._close_error = close_error
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self._close_error is not None:
+            raise self._close_error
+
+
+class FakeChromium:
+    def __init__(
+        self,
+        *,
+        context: FakeContext | None = None,
+        launch_error: Exception | None = None,
+    ) -> None:
+        self.context = context if context is not None else FakeContext()
+        self.launch_error = launch_error
+        self.launch_calls: list[tuple[Any, dict[str, Any]]] = []
+
+    async def launch_persistent_context(self, user_data_dir: Any, **kwargs: Any) -> FakeContext:
+        self.launch_calls.append((user_data_dir, kwargs))
+        if self.launch_error is not None:
+            raise self.launch_error
+        return self.context
+
+
+class FakePlaywright:
+    def __init__(self, chromium: FakeChromium, *, stop_error: Exception | None = None) -> None:
+        self.chromium = chromium
+        self.stop_calls = 0
+        self._stop_error = stop_error
+
+    async def stop(self) -> None:
+        self.stop_calls += 1
+        if self._stop_error is not None:
+            raise self._stop_error
+
+
+def _playwright_factory(playwright: FakePlaywright) -> Any:
+    async def factory() -> FakePlaywright:
+        return playwright
+
+    return factory
+
+
+def _failing_playwright_factory(exc: Exception) -> Any:
+    async def factory() -> Any:
+        raise exc
+
+    return factory
+
+
+class RaisingReleaseLock:
+    """A `ProfileLock`-shaped fake whose `release()` always fails without
+    removing the underlying lock file, simulating a filesystem permission
+    problem during teardown."""
+
+    def __init__(self, path: Path, *, release_error: Exception) -> None:
+        self._inner = ProfileLock(path)
+        self._release_error = release_error
+        self.release_calls = 0
+
+    @property
+    def lock_path(self) -> Path:
+        return self._inner.lock_path
+
+    async def acquire(self) -> None:
+        await self._inner.acquire()
+
+    async def release(self) -> None:
+        self.release_calls += 1
+        raise self._release_error
+
+
+class TestBrowserSessionStart:
+    async def test_raises_profile_missing_and_never_touches_playwright(
+        self, tmp_path: Path
+    ) -> None:
+        settings = _settings(tmp_path / "missing-profile")
+        chromium = FakeChromium()
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        with pytest.raises(ProfileMissingError):
+            await session.start()
+
+        assert chromium.launch_calls == []
+
+    async def test_acquires_lock_and_returns_context(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium()
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        context = await session.start()
+
+        assert context is chromium.context
+        assert (profile / browser_session.LOCK_FILENAME).exists()
+        await session.close()
+
+    async def test_start_is_idempotent_returns_same_context(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium()
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        first = await session.start()
+        second = await session.start()
+
+        assert first is second
+        assert len(chromium.launch_calls) == 1
+        await session.close()
+
+    async def test_launch_failure_releases_lock(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium(launch_error=RuntimeError("boom"))
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await session.start()
+
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+    async def test_launch_failure_stops_playwright(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium(launch_error=RuntimeError("boom"))
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        with pytest.raises(RuntimeError):
+            await session.start()
+
+        assert playwright.stop_calls == 1
+
+    async def test_playwright_factory_failure_releases_lock(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        session = BrowserSession(
+            settings, playwright_factory=_failing_playwright_factory(RuntimeError("no driver"))
+        )
+
+        with pytest.raises(RuntimeError, match="no driver"):
+            await session.start()
+
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+    async def test_launch_failure_preserves_original_error_even_if_stop_raises(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium(launch_error=RuntimeError("original launch failure"))
+        playwright = FakePlaywright(chromium, stop_error=RuntimeError("stop exploded"))
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        with pytest.raises(RuntimeError, match="original launch failure"):
+            await session.start()
+
+        # Lock must still be released even though playwright.stop() raised.
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+    async def test_launch_failure_preserves_original_error_even_if_lock_release_raises(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium(launch_error=RuntimeError("original launch failure"))
+        playwright = FakePlaywright(chromium)
+        release_error = RuntimeError("release exploded")
+        session = BrowserSession(
+            settings,
+            playwright_factory=_playwright_factory(playwright),
+            lock_factory=lambda path: RaisingReleaseLock(path, release_error=release_error),
+        )
+
+        with pytest.raises(RuntimeError, match="original launch failure"):
+            await session.start()
+
+        # Playwright must still be stopped even though lock.release() raised.
+        assert playwright.stop_calls == 1
+
+    async def test_detects_chrome_singleton_lock_before_launching_and_releases_own_lock(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        (profile / "SingletonLock").write_text("x", encoding="utf-8")
+        settings = _settings(tmp_path)
+        chromium = FakeChromium()
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+
+        with pytest.raises(ProfileInUseError) as excinfo:
+            await session.start()
+
+        assert "SingletonLock" in str(excinfo.value)
+        assert chromium.launch_calls == []
+        # Never delete Chrome's own singleton marker.
+        assert (profile / "SingletonLock").exists()
+        # This agent's own lock must not be leaked after the aborted start.
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+
+class TestBrowserSessionClose:
+    async def test_close_before_start_is_a_no_op(self, tmp_path: Path) -> None:
+        settings = _settings(tmp_path / "profile")
+        session = BrowserSession(settings)
+
+        await session.close()  # must not raise
+
+    async def test_close_closes_context_stops_playwright_and_releases_lock(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium()
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+        await session.start()
+
+        await session.close()
+
+        assert chromium.context.close_calls == 1
+        assert playwright.stop_calls == 1
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+    async def test_close_is_idempotent(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium()
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+        await session.start()
+        await session.close()
+
+        await session.close()  # must not raise, and must not double-act
+
+        assert chromium.context.close_calls == 1
+        assert playwright.stop_calls == 1
+
+    async def test_close_still_stops_playwright_and_releases_lock_when_context_close_raises(
+        self, tmp_path: Path
+    ) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium(context=FakeContext(close_error=RuntimeError("close boom")))
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+        await session.start()
+
+        with pytest.raises(RuntimeError, match="close boom"):
+            await session.close()
+
+        assert playwright.stop_calls == 1
+        assert not (profile / browser_session.LOCK_FILENAME).exists()
+
+    async def test_close_is_idempotent_after_a_raising_close(self, tmp_path: Path) -> None:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        settings = _settings(tmp_path)
+        chromium = FakeChromium(context=FakeContext(close_error=RuntimeError("close boom")))
+        playwright = FakePlaywright(chromium)
+        session = BrowserSession(settings, playwright_factory=_playwright_factory(playwright))
+        await session.start()
+
+        with pytest.raises(RuntimeError):
+            await session.close()
+
+        await session.close()  # second call must be a clean no-op
+
+        assert chromium.context.close_calls == 1
+        assert playwright.stop_calls == 1
