@@ -65,6 +65,22 @@ class Settings(BaseSettings):
     escalation_input_price: Decimal = Field(default=Decimal("2.50"), ge=0)
     escalation_output_price: Decimal = Field(default=Decimal("10.00"), ge=0)
 
+    # The control plane binds loopback by default and refuses to bind
+    # anywhere wider without a token: the API can submit job applications in
+    # the operator's name, so "reachable" and "authenticated" must not be
+    # allowed to come apart. See app.main.insecure_binding_reason.
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8765, ge=1, le=65535)
+    #: Shared bearer token. Empty means "loopback callers only, no token".
+    api_token: SecretStr = SecretStr("")
+    #: What an authenticated token holder is recorded as in the approvals
+    #: table. Empty means a fingerprint of the token is used instead, which
+    #: names the credential without ever writing the secret down.
+    api_actor: str = ""
+    #: How long the worker waits before looking for new queue items when
+    #: nothing has woken it. gt=0 because a zero interval is a busy loop.
+    worker_poll_interval_s: float = Field(default=2.0, gt=0)
+
     #: Canonical, human-authored answers consulted before any model.
     answers_path: Path = Path("./answers.yaml")
     # gt=0 for both: a zero timeout or a zero output budget does not mean
