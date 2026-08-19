@@ -10,7 +10,7 @@ Chromium. `AUTO_SUBMIT` is still `false` and no blocker gate changed.
 
 ## Commits
 
-Fourteen commits on `cursor/job-apply-agent-5d83`, on top of `78f346c`.
+Fifteen commits on `cursor/job-apply-agent-5d83`, on top of `78f346c`.
 
 | SHA | Message |
 |-----|---------|
@@ -28,13 +28,14 @@ Fourteen commits on `cursor/job-apply-agent-5d83`, on top of `78f346c`.
 | `2915443` | `fix(browser): refuse a mismatched control before typing into it, not after` |
 | `555e723` | `fix(graph): claim the final press before making it, so a crash cannot repeat it` |
 | `9ae8749` | `test: pin the rules mutation testing found nothing was holding` |
+| `8ce4510` | `fix(scanner): stop waiting on a frame that will never answer a scan` |
 
-Head: **`9ae8749`**. **Not pushed, no PR**, per the task instructions.
+Head: **`8ce4510`**. **Not pushed, no PR**, per the task instructions.
 
 The brief prescribes one commit message (`test: verify offline autofill
 workflow`). It is not used, because the brief's scope was one integration
-test and the task as given also closes the production wiring gap — thirteen
-of these fourteen commits are not that test. The integration suite is
+test and the task as given also closes the production wiring gap — fourteen
+of these fifteen commits are not that test. The integration suite is
 `afee854`.
 
 ## Files changed
@@ -43,7 +44,7 @@ of these fourteen commits are not that test. The integration suite is
 |------|--------|
 | `app/agent/browser_actions.py` | Created — writer, guard, submitter, and the page scripts (1203 lines) |
 | `app/agent/errors.py` | Modified — 10 typed refusals for writing and submitting |
-| `app/agent/form_scanner.py` | Modified — split `PAGE_TRAVERSAL_JS` out of `FIELD_IDENTITY_JS`; public `stable_key` |
+| `app/agent/form_scanner.py` | Modified — split `PAGE_TRAVERSAL_JS` out of `FIELD_IDENTITY_JS`; public `stable_key`; a per-frame deadline |
 | `app/agent/graph.py` | Modified — `FieldWriter` takes a `FormField`, `Submitter` takes a `SubmitAuthorization`, guard before every action, the press is claimed |
 | `app/main.py` | Modified — production wiring; `UnwiredFieldWriter`, `UnwiredSubmitter`, `ComponentNotWired` deleted |
 | `app/storage/db.py` | Modified — `submit_attempts` table, `try_claim_submit`, `get_submit_attempt` |
@@ -68,8 +69,8 @@ of these fourteen commits are not that test. The integration suite is
 ## Verification
 
 ```bash
-python3 -m pytest -q                                  # 1746 passed (1460 before, +286)
-python3 -m pytest tests --ignore=tests/integration -q # 1730 passed, no browser
+python3 -m pytest -q                                  # 1748 passed (1460 before, +288)
+python3 -m pytest tests --ignore=tests/integration -q # 1732 passed, no browser
 python3 -m pytest tests/integration -q                # 16 passed in 29.7s, real Chromium
 env -u DISPLAY python3 -m pytest tests/integration -q # 16 passed — Xvfb started by the suite
 CHROME_EXECUTABLE=/nonexistent python3 -m pytest tests/integration -q -rs
@@ -317,7 +318,7 @@ the only visible control.
 
 ## Self-review notes
 
-Reading the diff back found three defects. All three are fixed, each with a
+Reading the diff back found four defects. All four are fixed, each with a
 test that fails without the fix.
 
 - **A frame that never answers held the guard, a tab, a lease, and the
@@ -326,8 +327,17 @@ test that fails without the fix.
   no execution context, and `frame.evaluate` waits for one; Playwright's
   default timeout did not preempt it as expected. The guard now bounds each
   frame at three seconds and treats a timeout exactly like an unreadable
-  frame, which it already tolerated. Worth stating plainly: **the scanner
-  has the same shape and is not bounded** — see concerns.
+  frame, which it already tolerated.
+- **The scanner had the same defect, in two places.** Found by asking where
+  else this project awaits `frame.evaluate` in a loop over frames.
+  `FormScanner.snapshot` would have stalled *staging* rather than
+  submission, and `_read_mutations` — which runs once per frame on every
+  poll of the settle wait — was worse: an unbounded probe stops that wait
+  inside an await, so the settle timeout that exists to end it can never be
+  reached. Both are bounded now, with the frame reported as unscanned (which
+  is already a coverage gap, and therefore a blocking reason at the gate) or
+  as contributing no mutation count. Fixed rather than only reported because
+  it is the same one-line pattern as the guard's and the defect is real.
 - **A mismatched control was typed into before the mismatch was noticed.**
   The provenance check ran on the write pass's report, which is *after* the
   value has landed. The refusal was honest and the run recorded the answer
@@ -399,7 +409,7 @@ required field.
 ### Why the integration suite starts its own Xvfb
 
 The browser is always headed, project-wide. Wrapping `pytest` in `xvfb-run`
-would affect the 1730 tests that need no display, and a machine without
+would affect the 1732 tests that need no display, and a machine without
 `Xvfb` would produce a browser that fails to launch for reasons nobody can
 read. The suite uses `$DISPLAY` when there is one, starts an `Xvfb` on a
 free display number when there is not, and skips naming `xvfb` when it can
@@ -428,14 +438,15 @@ submitter, no guard — are **closed**. The new list:
    README says to check the ATS. Erring the other way — treating a click as
    a submission — would write false success into the audit log, which is the
    one thing this project is built not to do.
-2. **`FormScanner.snapshot` is not bounded per frame the way the guard now
-   is.** The hang I found in the guard is a property of `frame.evaluate` on
-   a frame with no execution context, and the scanner awaits the same call
-   in a loop over the same frames. A page carrying a permanently pending
-   `about:blank` iframe would stall staging rather than submission. Not
-   fixed here because it is a change to the component this task did not
-   own, and because staging holds a renewing lease so the damage is a stuck
-   worker rather than a lost decision — but it is the same defect.
+2. **A permanently pending frame now costs three seconds per poll rather
+   than a hang.** With the deadlines in place, a page carrying such a frame
+   makes the settle wait's polls three seconds apart instead of a hundred
+   milliseconds, so it reaches its own timeout after a handful of polls
+   rather than a hundred and fifty. Correct and bounded, but a page like
+   that will settle-timeout where it might otherwise have settled. A frame
+   that has missed its deadline once could be dropped from subsequent polls;
+   that is a behaviour change to the settle logic and did not belong in this
+   fix.
 3. **A hard crash between the claim and the press is unrecoverable.**
    Described above. The application is recorded failed and a human has to
    look; the alternative is a duplicate. If this proves common in practice,
