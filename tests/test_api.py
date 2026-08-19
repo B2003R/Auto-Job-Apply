@@ -718,6 +718,55 @@ class TestWorkerLoop:
         assert [result.queue_id for result in results] == [queue_id]
         assert results[0].awaiting_approval
 
+    async def test_a_listing_whose_lease_has_lapsed_is_picked_up_again(
+        self, harness: Harness
+    ) -> None:
+        """The commonest shape of the crash: killed while holding the lease.
+
+        The lease outlives the process by design — that is what stops a
+        successor from barging in on a slow submit — so the sweep has to
+        read the expiry rather than the row's existence. Reading only
+        "is there a lease" would strand exactly the listings this exists
+        to recover, and would do it silently.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        queue_id = harness.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        harness.db.claim_next_pending()
+        harness.db.acquire_lease(
+            thread_id_for(queue_id),
+            "dead-worker",
+            ttl=timedelta(seconds=60),
+            now=datetime.now(timezone.utc) - timedelta(seconds=120),
+        )
+
+        worker = harness.build_worker(run_loop=False)
+        await worker.start()
+        try:
+            results = await worker.drain()
+        finally:
+            await worker.stop()
+
+        assert [result.queue_id for result in results] == [queue_id]
+        assert harness.world.adapter.started == 1
+
+    async def test_a_recovered_listing_says_why_it_came_back(
+        self, harness: Harness
+    ) -> None:
+        """The reason is the only trace the crash leaves on the queue row."""
+        queue_id = harness.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        harness.db.claim_next_pending()
+
+        worker = harness.build_worker(run_loop=False)
+        await worker.start()
+        try:
+            item = harness.db.get_queue_item(queue_id)
+            assert item is not None
+            assert item.state is QueueState.PENDING
+            assert item.error_reason == "worker_abandoned"
+        finally:
+            await worker.stop()
+
     async def test_a_listing_another_worker_is_running_is_left_alone(
         self, harness: Harness
     ) -> None:
