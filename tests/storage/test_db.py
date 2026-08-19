@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -309,6 +310,114 @@ class TestReturningWorkToTheQueue:
         ]
 
         assert outcomes == [True, False]
+
+
+class TestReadingASnapshot:
+    """A reader that wants one answer, not several taken at different times.
+
+    An export walks applications, then each one's queue row, fields, and
+    approval. Each of those was its own connection, so a worker submitting
+    an application half way through produced a file describing an
+    application that never existed in that combination at any instant.
+    """
+
+    def test_every_read_in_a_snapshot_uses_one_connection(
+        self, db: Database, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        queue_id = db.enqueue_job("https://example.test/1", Board.LINKEDIN)
+        db.create_application(
+            queue_id=queue_id,
+            thread_id="thread-1",
+            status=ApplicationStatus.SUBMITTED,
+        )
+        opened: list[int] = []
+        original = sqlite3.connect
+
+        def counting(*args: object, **kwargs: object) -> sqlite3.Connection:
+            opened.append(1)
+            return original(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(sqlite3, "connect", counting)
+
+        with db.read_only_snapshot():
+            db.list_applications()
+            db.get_queue_item(queue_id)
+            db.get_approval(1)
+
+        assert len(opened) == 1
+
+    def test_a_snapshot_cannot_write(self, db: Database) -> None:
+        """Read-only at the connection, not by convention.
+
+        An export has no business changing the log it is reading, and
+        `mode=ro` also means a mistyped path is never turned into a new
+        empty database.
+        """
+        with db.read_only_snapshot():
+            with pytest.raises(sqlite3.OperationalError, match="readonly"):
+                db.enqueue_job("https://example.test/2", Board.LINKEDIN)
+
+    def test_a_snapshot_does_not_see_a_write_that_lands_during_it(
+        self, db: Database, settings: Settings
+    ) -> None:
+        """The point of the transaction, stated as an outcome.
+
+        The competing writer here is given a short busy timeout, so this
+        also pins the cost: while a snapshot is open, a writer's commit
+        waits. Exports are small and the worker retries for five seconds,
+        but a torn export would be a wrong answer rather than a slow one.
+        """
+        db.enqueue_job("https://example.test/1", Board.LINKEDIN)
+
+        with db.read_only_snapshot():
+            before = db.list_queue_items()
+
+            writer = sqlite3.connect(settings.sqlite_path, timeout=0.05)
+            try:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    writer.execute(
+                        "INSERT INTO job_queue (listing_url, board, state, "
+                        "created_at, updated_at) VALUES ('u', 'linkedin', "
+                        "'pending', 'now', 'now')"
+                    )
+                    writer.commit()
+            finally:
+                writer.close()
+
+            assert db.list_queue_items() == before
+
+    def test_the_snapshot_is_released_when_the_block_ends(
+        self, db: Database
+    ) -> None:
+        """A held read lock would block the worker indefinitely."""
+        with db.read_only_snapshot():
+            db.list_queue_items()
+
+        db.enqueue_job("https://example.test/3", Board.LINKEDIN)
+        assert len(db.list_queue_items()) == 1
+
+    def test_the_snapshot_is_released_even_when_the_reader_raises(
+        self, db: Database
+    ) -> None:
+        with pytest.raises(ValueError):
+            with db.read_only_snapshot():
+                db.list_queue_items()
+                raise ValueError("the caller gave up")
+
+        db.enqueue_job("https://example.test/4", Board.LINKEDIN)
+        assert len(db.list_queue_items()) == 1
+
+    def test_a_database_that_is_not_there_is_not_created(
+        self, tmp_path: Path
+    ) -> None:
+        absent = tmp_path / "nowhere" / "jobs.db"
+        database = Database(Settings(sqlite_path=absent, artifacts_path=tmp_path))
+
+        with pytest.raises(sqlite3.OperationalError):
+            with database.read_only_snapshot():
+                pass
+
+        assert not absent.exists()
 
 
 class TestListingRecords:

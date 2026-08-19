@@ -304,6 +304,9 @@ class Database:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        #: Set for the length of a `read_only_snapshot`, during which every
+        #: read borrows this one connection and its one transaction.
+        self._pinned: sqlite3.Connection | None = None
 
     @property
     def settings(self) -> Settings:
@@ -320,6 +323,13 @@ class Database:
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
+        if self._pinned is not None:
+            # Inside a snapshot. Handed out without being closed, because
+            # closing it would end the transaction the snapshot exists to
+            # hold — and every read in the block would then see a
+            # different, later database.
+            yield self._pinned
+            return
         conn = sqlite3.connect(self._settings.sqlite_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
@@ -327,6 +337,53 @@ class Database:
         try:
             yield conn
         finally:
+            conn.close()
+
+    @contextmanager
+    def read_only_snapshot(self) -> Iterator[None]:
+        """Read everything in this block as of one instant, and change nothing.
+
+        An export walks applications, then each one's queue row, fields,
+        and approval. Taken over separate connections those are separate
+        instants, so a worker submitting an application part-way through
+        yields a file describing a combination that never existed. One
+        deferred transaction, entered by reading immediately so the read
+        lock is actually taken, makes the whole walk one answer.
+
+        Opened `mode=ro`, which is what makes it impossible for a reader to
+        alter or migrate the log it is reading, and impossible for a
+        mistyped path to become a new empty database.
+
+        The cost, on a rollback-journal database, is that a writer's commit
+        waits until the block ends. Exports are small and the worker's busy
+        timeout is generous; a torn export would be a wrong answer instead
+        of a slow one.
+        """
+        if self._pinned is not None:
+            raise RuntimeError("a read-only snapshot is already open")
+        uri = f"{self._settings.sqlite_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.isolation_level = None  # explicit transaction control
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            conn.execute("BEGIN DEFERRED")
+            # SQLite defers the read lock to the first read, so the
+            # snapshot would otherwise start at whatever the first caller
+            # happened to ask for rather than here.
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+        except BaseException:
+            conn.close()
+            raise
+        self._pinned = conn
+        try:
+            yield
+        finally:
+            self._pinned = None
+            try:
+                conn.execute("ROLLBACK")  # a read transaction ends by ending
+            except sqlite3.Error:
+                pass
             conn.close()
 
     @contextmanager

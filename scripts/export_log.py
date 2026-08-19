@@ -18,6 +18,7 @@ import argparse
 import csv
 import io
 import json
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,61 @@ FIELD_COLUMNS = (
     "value",
     "label",
 )
+
+
+#: Leading characters a spreadsheet reads as the start of a formula.
+#: A tab or a carriage return counts because both are stripped before the
+#: cell is parsed, so `\t=1+1` is `=1+1` by the time Excel looks at it.
+FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(cell: Any) -> Any:
+    """Neutralise a cell a spreadsheet would otherwise execute.
+
+    Field labels come from the listing's own page and answers come from a
+    model or a human, so both are text this project did not write. Excel
+    and LibreOffice execute a cell beginning with `=`, `+`, `-`, `@`, a
+    tab, or a carriage return when the file is opened — and the person
+    opening their own export is the one whose accounts are worth taking.
+
+    Prefixing with an apostrophe is the spreadsheet convention for "this is
+    text": it survives a round trip through the application that needs it
+    and is visible to anything else. Only strings are touched, so the
+    numeric columns — a model cost of `-0.25`, say — are still numbers.
+    """
+    if isinstance(cell, str) and cell.startswith(FORMULA_LEADERS):
+        return "'" + cell
+    return cell
+
+
+def _unreadable(path: Path, exc: sqlite3.Error) -> str:
+    """Turn a SQLite failure into a sentence with a next step in it.
+
+    The three that actually happen are a path pointing at something that
+    is not a database, a database that belongs to another program, and a
+    file that cannot be opened at all. SQLite words each of them for
+    someone debugging SQLite.
+    """
+    detail = str(exc)
+    if isinstance(exc, sqlite3.DatabaseError) and "not a database" in detail:
+        advice = (
+            f"{path} is not a SQLite database. Check SQLITE_PATH — it may be "
+            "pointing at a backup, an artefact, or a partly written file."
+        )
+    elif "no such table" in detail:
+        advice = (
+            f"{path} is a SQLite database but not this project's: {detail}. "
+            "Check SQLITE_PATH, or run the control plane once against this "
+            "path to create the schema."
+        )
+    elif "unable to open" in detail:
+        advice = (
+            f"{path} could not be opened: {detail}. Check that the file and "
+            "its directory are readable by this user."
+        )
+    else:
+        advice = f"{path} could not be read: {detail}."
+    return f"the export failed. {advice}"
 
 
 def _status(value: str) -> ApplicationStatus:
@@ -176,17 +232,20 @@ def render_csv(records: Sequence[dict[str, Any]], *, include_fields: bool) -> st
     )
     writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
     writer.writeheader()
+
+    def write(row: dict[str, Any]) -> None:
+        # Escaping happens here, at the one place a cell becomes CSV, so
+        # there is no route into the file that bypasses it.
+        writer.writerow({key: csv_safe(value) for key, value in row.items()})
+
     for record in records:
         base = {column: record.get(column) for column in APPLICATION_COLUMNS}
-        if not include_fields:
-            writer.writerow(base)
-            continue
-        fields = record.get("fields") or []
+        fields = record.get("fields") or [] if include_fields else []
         if not fields:
-            writer.writerow(base)
+            write(base)
             continue
         for field in fields:
-            writer.writerow({**base, **{key: field.get(key) for key in FIELD_COLUMNS}})
+            write({**base, **{key: field.get(key) for key in FIELD_COLUMNS}})
     return buffer.getvalue().rstrip("\n")
 
 
@@ -220,13 +279,22 @@ def main(
         return 1
 
     db = Database(resolved)
-    db.initialize()
-    records = collect(
-        db,
-        statuses=args.status,
-        include_fields=args.fields,
-        include_values=include_values,
-    )
+    try:
+        # One read-only snapshot for the whole walk: an export that read
+        # applications, then their fields, then their approvals over
+        # separate connections could describe a combination that never
+        # existed, and one that opened for writing could migrate the log
+        # it was asked only to read.
+        with db.read_only_snapshot():
+            records = collect(
+                db,
+                statuses=args.status,
+                include_fields=args.fields,
+                include_values=include_values,
+            )
+    except sqlite3.Error as exc:
+        out(_unreadable(resolved.sqlite_path, exc))
+        return 1
     rendered = (
         render_json(records, values_included=include_values)
         if args.format == "json"
