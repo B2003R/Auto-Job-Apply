@@ -318,9 +318,37 @@ def _remote(
             _watch(client, item["queue_id"], args.timeout, DEFAULT_POLL_S)
             for item in queued
         ]
-        return _report(out, args.json, watched, _describe_run)
+        _report(out, args.json, watched, _describe_run)
+        waiting = [view for view in watched if not _reached_a_decision_point(view)]
+        if not waiting:
+            return 0
+        # Nonzero, because a script that queued a batch and moved on must
+        # not read "still staging" as "ready for you". The listings are
+        # still being worked on server-side; only the watching stopped.
+        _aside(
+            out,
+            args.json,
+            f"{len(waiting)} run(s) had not reached a decision point after "
+            f"{args.timeout:g}s: "
+            + ", ".join(str(view["queue_id"]) for view in waiting)
+            + ". They are still running; check `status` later.",
+        )
+        return 1
 
     return 2  # pragma: no cover - argparse rejects anything else
+
+
+def _reached_a_decision_point(view: dict[str, Any]) -> bool:
+    """Whether this run is one a human could now act on, or is over."""
+    return bool(view["awaiting_decision"]) or view["state"] in _SETTLED_STATES
+
+
+def _aside(out: Writer, as_json: bool, message: str) -> None:
+    """Say something to the operator without spoiling machine-readable output."""
+    if as_json:
+        print(message, file=sys.stderr)
+    else:
+        out(message)
 
 
 def _watch(
@@ -330,12 +358,13 @@ def _watch(
 
     Returns the last status seen either way, including on timeout: the
     listing is still being worked on server-side, and reporting the truth
-    about a slow run is more useful than raising about it.
+    about a slow run is more useful than raising about it. The caller is
+    what turns "still waiting" into a nonzero exit.
     """
     deadline = time.monotonic() + timeout
     view = client.status(queue_id)
     while time.monotonic() < deadline:
-        if view["awaiting_decision"] or view["state"] in _SETTLED_STATES:
+        if _reached_a_decision_point(view):
             return view
         time.sleep(poll)
         view = client.status(queue_id)
@@ -368,7 +397,21 @@ async def _local_run(
 ) -> int:
     factory = worker_factory or _default_worker_factory
     worker = factory(settings)
-    await worker.start()
+
+    try:
+        await worker.start()
+    except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
+        # `start()` opens the browser before it can fail, so a start that
+        # raises may already own a Chrome and a profile lock. Stopping
+        # first is what keeps that lock from outliving the process and
+        # refusing every later run, local or served.
+        teardown = await _stop_quietly(worker)
+        out(f"the worker could not be started: {exc}")
+        if teardown is not None:
+            out(f"  cleaning up afterwards also failed: {teardown}")
+        return 1
+
+    code = 0
     try:
         for url in args.urls:
             queue_id = worker.db.enqueue_job(url, args.board)
@@ -376,16 +419,28 @@ async def _local_run(
         results = await worker.drain()
         if args.prompt:
             results = await _prompt_each(worker, results, args.actor, out, reader)
-        for result in results:
-            out(_describe_result(result))
+        _report_local(out, args.json, results)
     except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
         out(f"the local batch could not be completed: {exc}")
-        return 1
-    finally:
-        # Always: a worker left running holds the profile lock, and the next
-        # run — local or served — could not start at all.
+        code = 1
+
+    # Always, and never by raising: a worker left running holds the profile
+    # lock, and a teardown failure the operator is not told about is a lock
+    # they will meet later without knowing why.
+    teardown = await _stop_quietly(worker)
+    if teardown is not None:
+        out(f"the worker could not be shut down cleanly: {teardown}")
+        code = code or 1
+    return code
+
+
+async def _stop_quietly(worker: ApplicationWorker) -> BaseException | None:
+    """Stop the worker, handing back whatever went wrong instead of raising."""
+    try:
         await worker.stop()
-    return 0
+    except Exception as exc:  # noqa: BLE001 - reported by the caller
+        return exc
+    return None
 
 
 async def _prompt_each(
@@ -440,6 +495,41 @@ def _default_worker_factory(settings: Settings) -> ApplicationWorker:
     # No loop: a local batch drains explicitly, and a background loop would
     # race it for the same claims.
     return ApplicationWorker(settings, run_loop=False)
+
+
+def _report_local(out: Writer, as_json: bool, results: Sequence[RunResult]) -> None:
+    """Say what a local batch did, in whichever form was asked for.
+
+    `--json` used to be silently ignored here, which meant a script piping
+    the local runner into `jq` got prose and no warning. The payload is a
+    named subset rather than the whole `RunResult`: the gate payload and
+    the gap list belong to `GET /runs/{id}`, which redacts them according
+    to `LOG_FIELD_VALUES`, and a second path to the same data is a second
+    path to get that wrong.
+    """
+    if not as_json:
+        for result in results:
+            out(_describe_result(result))
+        return
+    out(json.dumps([_result_payload(result) for result in results], indent=2))
+
+
+def _result_payload(result: RunResult) -> dict[str, Any]:
+    return {
+        "queue_id": result.queue_id,
+        "thread_id": result.thread_id,
+        "application_id": result.application_id,
+        "status": result.status.value,
+        "reason": result.reason,
+        "detail": result.detail,
+        "blocking_reasons": list(result.blocking_reasons),
+        "awaiting_decision": result.awaiting_approval,
+        "submitted": result.submitted,
+        "decision": result.decision,
+        "actor": result.actor,
+        "note": result.note,
+        "decided_at": result.decided_at,
+    }
 
 
 def _report(

@@ -65,6 +65,11 @@ class Harness:
         self.world = world
         self.sessions: list[FakeSession] = []
         self.workers: list[ApplicationWorker] = []
+        #: Whether the worker the app's lifespan builds drains in the
+        #: background. `False` gives a control plane that accepts work and
+        #: never does it, which is how a test pins what a caller sees while
+        #: a listing is still waiting.
+        self.run_loop = True
         self.settings = Settings(
             _env_file=None,
             sqlite_path=world.settings.sqlite_path,
@@ -98,7 +103,7 @@ class Harness:
         return worker
 
     def worker_factory(self, settings: Settings) -> ApplicationWorker:
-        return self.build_worker()
+        return self.build_worker(run_loop=self.run_loop)
 
     def app(self) -> Any:
         return create_app(self.settings, self.worker_factory)

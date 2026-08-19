@@ -18,6 +18,7 @@ from typing import Any, Iterator
 import httpx
 import pytest
 
+from app.agent.errors import ProfileLockedError
 from app.agent.graph import thread_id_for
 from app.config import Settings
 from app.main import ApplicationWorker
@@ -365,8 +366,107 @@ class TestHttpBatch:
         assert "could not reach" in console.text
 
 
+class TestWatching:
+    """`run` waits for each listing, and says so when it gave up waiting."""
+
+    def test_a_run_that_never_reaches_a_decision_exits_nonzero(
+        self, harness: Harness
+    ) -> None:
+        """Exit 0 means "this went as asked", and a timeout did not.
+
+        The listing is still being worked on server-side, so the report is
+        the truth about a slow run rather than an error — but a script that
+        queued fifty listings and moved on must not read "still staging" as
+        "ready for you".
+        """
+        harness.run_loop = False  # a control plane that accepts and never drains
+        console = Console()
+
+        with harness.client() as client:
+            harness.http = client  # type: ignore[attr-defined]
+            code = run_cli(
+                harness,
+                "run",
+                LISTING_URL,
+                "--board",
+                "linkedin",
+                "--timeout",
+                "0",
+                console=console,
+            )
+
+        assert code == 1
+        assert "had not reached a decision" in console.text
+        assert "run 1" in console.text
+
+    def test_a_run_that_reaches_the_gate_exits_zero(self, served: Harness) -> None:
+        code = run_cli(served, "run", LISTING_URL, "--board", "linkedin")
+        assert code == 0
+
+    def test_json_output_stays_parseable_when_a_run_times_out(
+        self, harness: Harness
+    ) -> None:
+        """The note about the timeout must not land in the JSON document."""
+        harness.run_loop = False
+        console = Console()
+
+        with harness.client() as client:
+            harness.http = client  # type: ignore[attr-defined]
+            code = run_cli(
+                harness,
+                "--json",
+                "run",
+                LISTING_URL,
+                "--board",
+                "linkedin",
+                "--timeout",
+                "0",
+                console=console,
+            )
+
+        assert code == 1
+        assert console.json()[0]["state"] == "pending"
+
+
 class TestLocalBatch:
     """`--local` runs an in-process worker instead of talking to a server."""
+
+    def test_local_json_output_is_machine_readable(self, harness: Harness) -> None:
+        """`--json` was accepted and then ignored, which is the worst of both."""
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "--json", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 0
+        payload = json.loads(console.lines[-1])
+        assert payload[0]["queue_id"] == 1
+        assert payload[0]["status"] == "awaiting_approval"
+        assert payload[0]["awaiting_decision"] is True
+        assert payload[0]["thread_id"] == thread_id_for(1)
+
+    def test_local_json_output_carries_no_answer_text(
+        self, harness: Harness
+    ) -> None:
+        """The gate payload belongs to `GET /runs/{id}`, which redacts it."""
+        console = Console()
+
+        run_batch.main(
+            ["--local", "--json", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        payload = json.loads(console.lines[-1])
+        assert "interrupt" not in payload[0]
+        assert "gaps" not in payload[0]
 
     @pytest.mark.parametrize(
         "argv",
@@ -561,6 +661,135 @@ class TestLocalBatch:
         approval = harness.db.get_approval(record.id)
         assert approval is not None
         assert approval.actor == "ada@example.com"
+
+    def _worker_factory(
+        self, harness: Harness, cls: type[ApplicationWorker]
+    ) -> Any:
+        def factory(settings: Settings) -> ApplicationWorker:
+            worker = cls(
+                settings,
+                db=harness.world.db,
+                session_factory=harness.session_factory,
+                dependencies_factory=lambda _s, _d, _c: harness.world.deps,
+                checkpointer_path=harness.world.checkpoint_path,
+                run_loop=False,
+            )
+            harness.workers.append(worker)
+            return worker
+
+        return factory
+
+    def test_a_startup_that_fails_halfway_still_closes_the_browser(
+        self, harness: Harness
+    ) -> None:
+        """`start()` opens the browser before it can fail.
+
+        A start that raises after the session is up has a real Chrome and a
+        real profile lock behind it. Left there, the lock outlives the
+        process and every later run — served or local — refuses to start at
+        all, with a message about a lock whose owner is gone.
+        """
+
+        class BrokenWorker(ApplicationWorker):
+            async def start(self) -> None:
+                await super().start()
+                raise RuntimeError("the checkpointer could not be opened")
+
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, BrokenWorker),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert harness.sessions[0].starts == 1
+        assert harness.sessions[0].closes == 1
+        assert "could not be started" in console.text
+
+    def test_a_locked_profile_is_reported_rather_than_raised(
+        self, harness: Harness
+    ) -> None:
+        """The commonest startup failure, and the one with a real remedy.
+
+        An operator who left the control plane running, or whose last run
+        was killed, should read the sentence the error was written to say —
+        not a traceback ending in `ProfileLockedError`.
+        """
+        locked = ProfileLockedError(Path("/tmp/profile/.job-apply-lock.json"), None, False)
+
+        class LockedWorker(ApplicationWorker):
+            async def start(self) -> None:
+                raise locked
+
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, LockedWorker),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert ".job-apply-lock.json" in console.text
+        assert "Traceback" not in console.text
+
+    def test_a_teardown_that_also_fails_is_reported_not_raised(
+        self, harness: Harness
+    ) -> None:
+        """Two failures at once must still leave the CLI with something to say."""
+
+        class DoublyBroken(ApplicationWorker):
+            async def start(self) -> None:
+                await super().start()
+                raise RuntimeError("the checkpointer could not be opened")
+
+            async def stop(self) -> None:
+                await super().stop()
+                raise RuntimeError("the profile lock could not be released")
+
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, DoublyBroken),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert "could not be started" in console.text
+        assert "profile lock could not be released" in console.text
+
+    def test_nothing_is_queued_when_the_worker_never_starts(
+        self, harness: Harness
+    ) -> None:
+        """A listing queued against a worker that never ran is a lie.
+
+        The row would sit `pending` with nothing to claim it, and the
+        operator would be told the batch failed while the queue said the
+        opposite.
+        """
+
+        class LockedWorker(ApplicationWorker):
+            async def start(self) -> None:
+                raise ProfileLockedError(Path("/tmp/x/.job-apply-lock.json"), None, True)
+
+        run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, LockedWorker),
+            client_factory=_no_http,
+            writer=lambda line: None,
+        )
+
+        assert harness.db.list_queue_items() == []
 
     def test_the_browser_is_closed_even_when_a_run_fails(
         self, harness: Harness
