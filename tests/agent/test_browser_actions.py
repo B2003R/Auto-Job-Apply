@@ -54,6 +54,7 @@ from app.agent.browser_actions import (
     PlaywrightSubmitter,
     is_confirmation_text,
     is_final_submit_name,
+    is_success_destination,
     normalize_control_name,
     submission_verdict,
 )
@@ -1891,6 +1892,52 @@ class TestNavigationAloneNeverConfirms:
 
         assert not verdict.signal
         assert verdict.refusal
+
+    @pytest.mark.parametrize(
+        "destination",
+        [
+            "https://ats.example.com/apply?submitted=false",
+            "https://ats.example.com/apply?submitted=0",
+            "https://ats.example.com/apply?success=false",
+            "https://ats.example.com/apply?not_submitted=1",
+            "https://ats.example.com/apply?submitted=",
+            "https://ats.example.com/application/not-submitted",
+            "https://ats.example.com/apply?state=unsubmitted",
+        ],
+    )
+    def test_a_url_saying_it_was_not_submitted_confirms_nothing(
+        self, destination: str
+    ) -> None:
+        """The words are there; the page is saying the opposite with them.
+
+        A query string is where an ATS records the *state* of a draft, so
+        matching the word and ignoring the value read `?submitted=false` as
+        the destination only a submitted application arrives at — on the one
+        path where the form disappearing is already half the evidence.
+        """
+        assert is_success_destination(destination) is False
+
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url=destination, marked=False),
+        )
+
+        assert not verdict.signal
+
+    @pytest.mark.parametrize(
+        "destination",
+        [
+            "https://ats.example.com/apply?submitted=true",
+            "https://ats.example.com/apply?submitted=1",
+            "https://ats.example.com/apply?success=yes",
+            "https://ats.example.com/apply?applicationSubmitted=TRUE",
+            "https://ats.example.com/thank-you",
+        ],
+    )
+    def test_a_url_saying_it_was_submitted_is_a_success_destination(
+        self, destination: str
+    ) -> None:
+        assert is_success_destination(destination) is True
 
     def test_a_url_fragment_is_not_a_navigation(self) -> None:
         verdict = submission_verdict(

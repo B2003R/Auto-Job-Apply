@@ -453,7 +453,9 @@ Two things count:
   panel it always was and confirms nothing, however its wording changes, or
 - a navigation to a destination only a submitted application arrives at
   (`/thank-you`, `/confirmation`, `?submitted=true`) **together with** the
-  form the button belonged to having disappeared.
+  form the button belonged to having disappeared. A query string has to say
+  so affirmatively: `?submitted=false`, `?submitted=`, and
+  `/application/not-submitted` are pages reporting a draft, not a success.
 
 **A navigation on its own is not one of them**, and neither is the form
 disappearing on its own. A board that bounces an expired session to a

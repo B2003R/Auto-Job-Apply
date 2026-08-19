@@ -58,7 +58,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from app.agent.errors import (
     CaptchaEncountered,
@@ -237,15 +237,36 @@ def is_confirmation_text(text: str) -> bool:
 # Where a submitted application ends up, and where it does not
 # --------------------------------------------------------------------------
 
-#: URLs that only a completed submission leads to. Matched against the path
-#: and the query, and never on its own: a navigation is the weakest thing a
+#: Paths that only a completed submission leads to. Matched against the
+#: path alone, and never on its own: a navigation is the weakest thing a
 #: page can do in response to a click, so this has to be corroborated by the
 #: form the control belonged to being gone.
-SUCCESS_DESTINATION = re.compile(
-    r"(^|[/?&=_.-])"
+SUCCESS_PATH = re.compile(
+    r"(^|[/_.-])"
     r"(thank[-_]?you|thanks|confirmation|confirmed|submitted|success)"
-    r"([/?&=_.-]|$)",
+    r"([/_.-]|$)",
     re.IGNORECASE,
+)
+
+#: A URL saying the opposite with the same words. `?submitted=false` is how
+#: an ATS records a draft, and `/application/not-submitted` is how one
+#: reports the state of it — both matched a bare word list, on the one path
+#: where a vanished form is already half the evidence.
+NEGATED_SUCCESS = re.compile(
+    r"(^|[/_.-])(not|non|un|no)[-_]?(submitted|confirmed|success|complete[d]?)",
+    re.IGNORECASE,
+)
+
+#: Query keys that can carry a claim about the submission, and the values
+#: that count as making it. Nothing else does: a key whose value is missing,
+#: empty, `false`, `0`, or anything not on this list is a page reporting
+#: state, not a page reporting success.
+SUCCESS_QUERY_KEY = re.compile(
+    r"(^|[_.-])(submitted|confirmed|confirmation|success|complete[d]?)([_.-]|$)",
+    re.IGNORECASE,
+)
+TRUTHY_QUERY_VALUES: frozenset[str] = frozenset(
+    {"1", "t", "y", "true", "yes", "ok", "success", "submitted", "confirmed", "complete", "completed", "done"}
 )
 
 #: URLs a submission is never at the end of. A board that bounces an expired
@@ -295,9 +316,33 @@ SUBMISSION_BLOCKER_SELECTORS: tuple[tuple[str, str], ...] = (
 
 
 def is_success_destination(url: str) -> bool:
-    """Whether this URL is one only a submitted application arrives at."""
+    """Whether this URL is one only a submitted application arrives at.
+
+    The path may say so by itself; a query string only says so when it says
+    so *affirmatively*. Refusing to read `?submitted=false` as a success is
+    the whole reason the query is parsed rather than searched.
+    """
     parts = urlsplit(url)
-    return bool(SUCCESS_DESTINATION.search(f"{parts.path}?{parts.query}"))
+    if NEGATED_SUCCESS.search(parts.path):
+        return False
+    if SUCCESS_PATH.search(parts.path):
+        return True
+    return _query_claims_success(parts.query)
+
+
+def _query_claims_success(query: str) -> bool:
+    for key, value in parse_qsl(query, keep_blank_values=True):
+        folded = _CAMEL_BOUNDARY.sub("_", key).casefold()
+        if NEGATED_SUCCESS.search(folded) or not SUCCESS_QUERY_KEY.search(folded):
+            continue
+        if value.strip().casefold() in TRUTHY_QUERY_VALUES:
+            return True
+    return False
+
+
+#: Where one word ends and the next begins in `applicationSubmitted`, so a
+#: camel-cased query key folds to the same shape as `application_submitted`.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
 
 def is_refused_destination(url: str) -> bool:
