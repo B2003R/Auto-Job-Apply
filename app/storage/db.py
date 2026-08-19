@@ -471,11 +471,18 @@ class Database:
         thread. This says "this row is mine to start"; the execution lease
         says "this thread is mine to run", and the latter is what protects
         an application that is already in flight.
+
+        `error_reason` is cleared here too. A pending row can carry one
+        left by `requeue_running` — the last thing that happened to it was
+        a worker dying, not whatever this claim is about to do — and once a
+        fresh attempt has genuinely started, that reason describes the
+        *previous* attempt, not this one. Leaving it in place would have a
+        successful rerun still reporting the crash that preceded it.
         """
         with self.immediate_transaction() as conn:
             row = conn.execute(
                 """
-                UPDATE job_queue SET state = ?, updated_at = ?
+                UPDATE job_queue SET state = ?, error_reason = NULL, updated_at = ?
                 WHERE id = (
                     SELECT id FROM job_queue WHERE state = ?
                     ORDER BY id LIMIT 1

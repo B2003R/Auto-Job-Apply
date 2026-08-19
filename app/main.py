@@ -690,12 +690,31 @@ class ApplicationWorker:
         get wrong: the loser of that race finds the thread leased and
         returns `IN_PROGRESS` without touching the browser, so the worst
         outcome is a wasted claim rather than a second application.
+
+        An absent lease is not on its own proof of abandonment, though. The
+        approval gate releases its lease *on purpose* the moment an
+        application is durably parked — that is precisely what lets a
+        decision arrive from a different process later — so a `running`
+        row with no lease and an application sitting at
+        `AWAITING_APPROVAL` is healthy, not orphaned. Stamping
+        `worker_abandoned` on it would be a false alarm on every single
+        restart while anything is waiting for a human, and would mislead an
+        operator reading `error_reason` into thinking a decision they never
+        made was lost.
         """
         now = datetime.now(timezone.utc)
         for item in self._db.list_queue_items(states=[QueueState.RUNNING]):
-            lease = self._db.get_lease(thread_id_for(item.id))
+            thread_id = thread_id_for(item.id)
+            lease = self._db.get_lease(thread_id)
             if lease is not None and lease.expires_at > now:
                 continue
+            if lease is None:
+                application = self._db.get_application_by_thread(thread_id)
+                if (
+                    application is not None
+                    and application.status is ApplicationStatus.AWAITING_APPROVAL
+                ):
+                    continue
             if self._db.requeue_running(item.id, "worker_abandoned"):
                 logger.warning(
                     "queue item %s was left running by a worker that is gone; "

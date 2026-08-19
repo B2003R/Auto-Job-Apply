@@ -951,6 +951,51 @@ class TestWorkerLoop:
         assert item.state is QueueState.RUNNING
         assert harness.world.adapter.started == 0
 
+    async def test_a_healthy_application_at_the_gate_survives_a_restart(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Parked-at-the-gate is not abandoned, even though the row stays `running`.
+
+        The gate releases the lease on purpose, the moment an application is
+        parked — that is what lets a decision arrive from a different
+        process. A restart must not read that clean, deliberate release as a
+        dead worker's fingerprint: the row should stay exactly as the gate
+        left it, with no `worker_abandoned` reason stamped on it and no
+        warning logged, and a second drain must not re-stage (and re-click)
+        the listing.
+        """
+        queue_id = harness.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        first_worker = harness.build_worker(run_loop=False)
+        await first_worker.start()
+        try:
+            results = await first_worker.drain()
+        finally:
+            await first_worker.stop()
+
+        assert [result.queue_id for result in results] == [queue_id]
+        assert results[0].awaiting_approval
+        before = harness.db.get_queue_item(queue_id)
+        assert before is not None
+        assert before.state is QueueState.RUNNING
+        assert before.error_reason is None
+        assert harness.world.adapter.started == 1
+
+        second_worker = harness.build_worker(run_loop=False)
+        with caplog.at_level("WARNING", logger="app.main"):
+            await second_worker.start()
+        try:
+            after = harness.db.get_queue_item(queue_id)
+            assert after is not None
+            assert after.state is QueueState.RUNNING
+            assert after.error_reason is None
+            assert "worker_abandoned" not in caplog.text
+
+            assert await second_worker.drain() == []
+        finally:
+            await second_worker.stop()
+
+        assert harness.world.adapter.started == 1
+
     async def test_a_running_worker_exposes_the_shipped_runner_type(
         self, harness: Harness
     ) -> None:

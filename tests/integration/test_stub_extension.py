@@ -69,7 +69,7 @@ from app.boards.base import ApplyResult, ApplyStatus, ListingResult
 from app.config import Settings
 from app.storage.db import Database
 from app.storage.logger import ApplicationLogger
-from app.storage.models import ApprovalDecision, Board, FieldSource
+from app.storage.models import ApprovalDecision, Board, FieldSource, QueueState
 from tests.agent.support import FakeAdapter
 from tests.integration.browser import loopback_only
 
@@ -1027,6 +1027,116 @@ class TestAStagedApplicationThatIsThenApproved:
         assert result.status is RunStatus.FAILED
         assert await page.locator("#application-form").count() == 1
         assert await page.locator("#fixture-submit-confirmation").count() == 0
+
+
+class _FakeBrowserSession:
+    """Satisfies `ApplicationWorker`'s session protocol without a browser.
+
+    The browser here is the one already opened by the `page` fixture; the
+    worker under test must not open a second one, so its session factory
+    hands back a context nobody looks at.
+    """
+
+    async def start(self) -> Any:
+        return object()
+
+    async def close(self) -> None:
+        return None
+
+
+class TestAWorkerRestartAcrossTheGate:
+    """The regression: restarting the worker must not touch a healthy gate.
+
+    `ApplicationWorker._recover_abandoned` runs once, at startup, to return
+    to the queue whatever a *dead* worker was holding. But the approval gate
+    releases its execution lease on the way to parking — deliberately, so a
+    decision can arrive from a different process later — which means a
+    listing sitting at `AWAITING_APPROVAL` looks, from the lease table
+    alone, exactly like one a dead worker abandoned mid-flight. This proves
+    the sweep tells the two apart against a real browser tab, a real
+    LangGraph checkpoint file on disk, and the real `app.main.ApplicationWorker`
+    — not merely against the offline fakes the rest of the suite uses.
+    """
+
+    async def test_a_restart_leaves_a_staged_application_alone(
+        self,
+        dependencies: GraphDependencies,
+        database: Database,
+        fixture_server: str,
+        page: Any,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from app.main import ApplicationWorker
+
+        checkpointer_path = tmp_path / "worker-restart-checkpoints.sqlite"
+
+        def session_factory(_settings: Settings) -> Any:
+            return _FakeBrowserSession()
+
+        def dependencies_factory(
+            _settings: Settings, _db: Database, _context: Any
+        ) -> GraphDependencies:
+            return dependencies
+
+        def build_worker() -> Any:
+            return ApplicationWorker(
+                dependencies.settings,
+                db=database,
+                session_factory=session_factory,
+                dependencies_factory=dependencies_factory,
+                checkpointer_path=checkpointer_path,
+                run_loop=False,
+            )
+
+        queue_id = _queue(database, fixture_server)
+
+        # First worker: stage the application for real, up to the gate.
+        first_worker = build_worker()
+        await first_worker.start()
+        try:
+            staged = await first_worker.drain()
+        finally:
+            await first_worker.stop()
+
+        assert [result.queue_id for result in staged] == [queue_id]
+        assert staged[0].awaiting_approval
+        assert await page.input_value(f"#{REQUIRED_GAP}") == LAST_NAME
+
+        before = database.get_queue_item(queue_id)
+        assert before is not None
+        assert before.state is QueueState.RUNNING
+        assert before.error_reason is None
+
+        # "Stop" and "recreate" the worker: a fresh instance, over the same
+        # database and the same checkpoint file, is what a restarted process
+        # looks like. Its startup sweep is the code under test.
+        second_worker = build_worker()
+        with caplog.at_level("WARNING", logger="app.main"):
+            await second_worker.start()
+        try:
+            after = database.get_queue_item(queue_id)
+            assert after is not None
+            assert after.state is QueueState.RUNNING
+            assert after.error_reason is None
+            assert "worker_abandoned" not in caplog.text
+
+            # A drain must find nothing to do: the row was never put back
+            # in `pending`, so there is nothing left for a second click to
+            # restage — and the form the first worker filled in is still
+            # exactly where it left it, not reopened or re-clicked.
+            resweep = await second_worker.drain()
+        finally:
+            await second_worker.stop()
+
+        assert resweep == []
+        assert await page.locator("#application-form").count() == 1
+        assert await page.input_value(f"#{REQUIRED_GAP}") == LAST_NAME
+
+        after_drain = database.get_queue_item(queue_id)
+        assert after_drain is not None
+        assert after_drain.state is QueueState.RUNNING
+        assert after_drain.error_reason is None
 
 
 def _approval(

@@ -390,6 +390,32 @@ class TestReturningWorkToTheQueue:
         assert stored is not None
         assert stored.state is state
 
+    def test_claiming_a_requeued_row_clears_the_stale_reason(
+        self, db: Database
+    ) -> None:
+        """A reason on a `pending` row must describe why it came back, not
+        why the run *before that* did.
+
+        `error_reason` is read by an operator as "what went wrong last
+        time"; once a fresh claim has genuinely started a new attempt, a
+        stale `worker_abandoned` left over from the requeue would misreport
+        the run that is now actually in flight — and if that new attempt
+        succeeds outright, the row would keep blaming a crash that has
+        nothing to do with its outcome.
+        """
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.claim_next_pending()
+        db.requeue_running(queue_id, "worker_abandoned")
+
+        claimed = db.claim_next_pending()
+
+        assert claimed is not None
+        assert claimed.id == queue_id
+        assert claimed.error_reason is None
+        stored = db.get_queue_item(queue_id)
+        assert stored is not None
+        assert stored.error_reason is None
+
     def test_only_one_of_two_racing_sweeps_wins(self, db: Database) -> None:
         """Two workers starting at once must not both requeue one row."""
         queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
