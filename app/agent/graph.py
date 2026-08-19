@@ -664,6 +664,12 @@ def build_graph(
         return unwritten
 
     async def stage(state: ApplicationState) -> dict[str, Any]:
+        # Nothing after this point reads the baseline or the trigger result,
+        # so they are dropped here rather than at the terminal node. That
+        # makes "no browser artefact crosses the interrupt" structural — an
+        # application left pending for a week holds no snapshot in memory —
+        # instead of merely true of the current node order.
+        staging.pop(state["thread_id"], None)
         blocking = list(state.get("blocking_reasons", ()))
         if deps.settings.auto_submit and not blocking:
             return {"gate": "auto_submit"}
@@ -721,7 +727,10 @@ def build_graph(
             state,
             "reject",
             RunStatus.REJECTED,
-            state.get("note") or "rejected at the approval gate",
+            # A fixed reason, not the reviewer's note: `reason` is the
+            # machine-readable outcome (and reaches logs), while the note is
+            # their own words and already lives in the approvals table.
+            "rejected at the approval gate",
             ApplicationStatus.REJECTED,
             QueueState.COMPLETED,
         )

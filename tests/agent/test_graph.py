@@ -726,6 +726,10 @@ class TestApprovedAndRejectedRuns:
         application = world.db.get_application(result.application_id or 0)
         assert application is not None
         assert application.status is ApplicationStatus.REJECTED
+        # The outcome reason reaches logs; the reviewer's own words belong in
+        # the approvals table, which is where `RunResult.note` reads them from.
+        assert "wrong location" not in result.reason
+        assert result.note == "wrong location"
 
     async def test_a_rejected_run_releases_the_page(self, world: World) -> None:
         queue_id = world.enqueue()
