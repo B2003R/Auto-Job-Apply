@@ -288,8 +288,18 @@ class World:
         return self.db.enqueue_job(listing_url=url, board=board)
 
     @asynccontextmanager
-    async def runner(self) -> AsyncIterator[ApplicationRunner]:
-        async with sqlite_checkpointer(self.checkpoint_path) as checkpointer:
+    async def runner(
+        self, checkpoint_path: Path | None = None
+    ) -> AsyncIterator[ApplicationRunner]:
+        """A runner over this world's database and checkpoint file.
+
+        `checkpoint_path` stands in for a second worker that cannot see the
+        first one's checkpoints — a lost file, or a process pointed at the
+        wrong directory — while still sharing the queue database.
+        """
+        async with sqlite_checkpointer(
+            checkpoint_path or self.checkpoint_path
+        ) as checkpointer:
             runner = ApplicationRunner(self.deps, checkpointer)
             self.built.append(runner)
             yield runner
@@ -309,6 +319,7 @@ def build_world(
     with_router: bool = False,
     adapter: FakeAdapter | None = None,
     trigger_error: BaseException | None = None,
+    trigger_settled: bool = True,
     guard_error: BaseException | None = None,
     broker: FakePageBroker | None = None,
     submit_outcome: SubmitOutcome | None = None,
@@ -346,7 +357,9 @@ def build_world(
     )
     world_adapter = adapter or FakeAdapter()
     world_broker = broker or FakePageBroker()
-    world_trigger = FakeTrigger(baseline, filled, error=trigger_error)
+    world_trigger = FakeTrigger(
+        baseline, filled, error=trigger_error, settled=trigger_settled
+    )
     world_writer = FakeWriter(succeeds=write_succeeds)
     world_submitter = FakeSubmitter(submit_outcome)
     world_guard = FakeGuard(guard_error)

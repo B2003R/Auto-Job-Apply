@@ -821,10 +821,37 @@ class TestResumePayload:
         assert payload == {
             "application_id": application_id,
             "decision": "approved",
-            "actor": "first@example.com",
-            "note": "first",
             "decided_at": clock.now.isoformat(),
         }
+
+    def test_the_payload_leaves_the_reviewer_in_the_approvals_table(
+        self, service: ApprovalService, db: Database
+    ) -> None:
+        """A resume payload is written into a checkpoint file.
+
+        A checkpoint file travels with a working directory — copied to a new
+        machine, kept in a backup, handed to someone debugging a stuck
+        thread. Who authorised a submission made in someone's name, and what
+        they wrote about it, belong in the approvals table and nowhere that
+        gets moved around that casually. The graph does not need either of
+        them to route the run.
+        """
+        application_id = make_application(db)
+        outcome = service.decide(
+            ApprovalRequest(
+                application_id=application_id,
+                decision=ApprovalDecision.APPROVED,
+                actor="reviewer@example.com",
+                note="salary answer checked against the offer letter",
+            )
+        )
+
+        payload = outcome.resume_payload()
+
+        assert "actor" not in payload
+        assert "note" not in payload
+        assert "reviewer@example.com" not in str(payload)
+        assert outcome.record.actor == "reviewer@example.com"
 
     def test_the_payload_is_plain_json_types_so_a_checkpointer_can_store_it(
         self, service: ApprovalService, db: Database

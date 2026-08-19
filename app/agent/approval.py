@@ -365,12 +365,17 @@ class ApprovalOutcome:
         decision the graph acts on is by construction the decision in the
         audit table. Only strings, ints, and `None` appear, so any
         checkpointer can round-trip it.
+
+        Carries the decision and its timestamp, not the reviewer. A resume
+        payload is written into the checkpoint file, and a checkpoint file
+        is a working artefact that gets copied around with a working
+        directory; the approvals table is the access-controlled record of
+        who authorised a submission made in their name, and it stays the
+        only place that answers that question.
         """
         return {
             "application_id": self.record.application_id,
             "decision": self.record.decision.value,
-            "actor": self.record.actor,
-            "note": self.record.note,
             "decided_at": self.record.timestamp.isoformat(),
         }
 

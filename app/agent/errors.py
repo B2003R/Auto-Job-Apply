@@ -353,6 +353,32 @@ class RateLimitExceeded(SafetyError):
         )
 
 
+class StagingArtefactsLost(BrowserError):
+    """Raised when a continuation cannot see what the crashed attempt staged.
+
+    The baseline snapshot and the trigger result are held in memory for the
+    length of one invocation, deliberately: they describe a live page and
+    would be meaningless in a checkpoint. A worker that picks up a thread
+    another process was part-way through therefore has the checkpoint but
+    none of the artefacts, and the attribution and gap-filling steps have
+    nothing to work from.
+
+    Distinct from `PageUnavailable`, which is about the tab. Neither is a
+    malfunction: nothing was submitted, so the listing can simply be staged
+    again from the start.
+    """
+
+    def __init__(self, thread_id: str, needed: str) -> None:
+        self.thread_id = thread_id
+        self.needed = needed
+        super().__init__(
+            f"Thread {thread_id!r} resumed without the {needed} its previous "
+            "attempt held in memory, so staging cannot continue where it left "
+            "off. Nothing was submitted; queue the listing again to stage it "
+            "afresh."
+        )
+
+
 class UnknownAtsLayout(SafetyError):
     """Raised when the page an Apply click landed on is not a known ATS.
 
