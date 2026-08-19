@@ -1,0 +1,7 @@
+# Selectors for joinhandshake.com (and handshake.com) job listing pages.
+#
+# Handshake has no unsupported in-page modal comparable to LinkedIn's Easy
+# Apply or Wellfound's in-app flow, so it needs only the one Apply control.
+board: handshake
+selectors:
+  apply_button: "button[data-hook='job-apply-button']"

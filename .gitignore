@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.env
+*.db
+
+# Everything a run produces: the application log, the LangGraph
+# checkpoints, and the screenshots. `*.db` above covered the default
+# database and nothing else, so a screenshot of a half-filled application
+# form — someone's name, address, and salary history, legibly — was staged
+# by any `git add -A`. This is the whole directory, deliberately: it is the
+# default for SQLITE_PATH, CHECKPOINT_PATH, and ARTIFACTS_PATH, and none of
+# what lands there is ever shareable.
+data/
+
+# Personal answers to application questions. Copy answers.example.yaml
+# instead; this file is yours and never belongs in the repository.
+answers.yaml

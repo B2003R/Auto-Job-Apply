@@ -1,0 +1,2015 @@
+"""The durable per-application state machine.
+
+One queue item becomes one LangGraph thread, checkpointed to SQLite, that
+walks the sequence in the design document — open the listing, click Apply,
+detect the ATS, snapshot the form, trigger Jobright Autofill, attribute what
+changed, fill only the gaps that are safe to fill — and then *stops*. The
+stop is a real `interrupt()` against a persisted checkpoint, not a blocking
+prompt: the process can exit, and the same thread is still resumable
+afterwards by the CLI gate, the API gate, or a different worker reading the
+same file.
+
+Four properties shape everything below.
+
+**Nothing submits without a decision.** `AUTO_SUBMIT` is off by default, and
+even when an operator turns it on the gate still runs whenever a protected
+question is on the form, a gap is unanswered, an answer could not actually
+be typed, the page never settled, or part of the page could not be scanned.
+"Auto-submit" therefore means "submit a form this code fully filled and
+fully saw", never "submit whatever is there".
+
+**One bad listing ends one application.** An unknown ATS, a captcha, a login
+wall, an unavailable extension, a failed trigger, and a reached rate cap are
+typed failures that route to a terminal node, persist a reason (and a
+screenshot where one can be taken), and return normally. `run_application`
+does not raise for any of them, so a batch runner's next item is unaffected.
+Only genuinely unexpected errors reach the `fail` node, and they are
+contained the same way.
+
+**Transient browser objects never enter the checkpoint.** State holds ints,
+strings, and plain dicts only — not even the reviewer's name, which belongs
+to the approvals table. The baseline snapshot and the trigger result live in
+an in-memory cache scoped to one `build_graph` call and are only needed
+*within* one uninterrupted invocation; the staged page itself is held by the
+injected `PageBroker`. Losing either mid-staging ends the application as a
+typed skip, because nothing was submitted and the listing can be staged
+afresh; losing the page after a decision has been taken is a failure, because
+somebody is waiting on a submission that will not happen.
+
+**Nothing here runs only once.** A crash, a retry, or a replayed checkpoint
+re-executes a node body against a database that already holds the previous
+attempt's writes, so provenance is upserted rather than appended, model spend
+is added rather than assigned and recorded before the fallible part of the
+node, and every terminal write is refused by storage once the record has
+finished.
+
+**One worker owns a thread at a time.** Staging and resuming ask the same
+question — is another process driving this graph? — so they take the same
+per-thread lease, held in the database and renewed while the work runs, on
+top of an in-process lock. Nothing invokes the graph without it, which is
+what makes one queue item mean one Apply click and one approval mean at most
+one submission across as many workers as you care to start. The lease
+expires, so a worker killed outright releases its thread by the clock rather
+than holding it forever.
+
+**Every dependency is injected.** The browser, the adapter registry, the
+trigger, the gap filler, the field writer, the submitter, the page guard,
+and the screenshotter are all protocols, which is what lets a full
+staged-then-approved run and a full staged-then-rejected run be proven with
+no browser and no network at all.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import operator
+import os
+import socket
+import uuid
+from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from enum import Enum
+from pathlib import Path
+from typing import (
+    Annotated,
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    Protocol,
+    Sequence,
+    TypedDict,
+)
+
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphBubbleUp
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+from app.agent.approval import (
+    ApplicationThreadMismatch,
+    ApprovalConflict,
+    ApprovalError,
+    ApprovalRequest,
+    ApprovalService,
+    InvalidApprovalRequest,
+    parse_decision,
+)
+from app.agent.ats_detector import AtsKind, detect_ats as default_detect_ats
+from app.agent.errors import (
+    CaptchaEncountered,
+    ExtensionNotFoundError,
+    LoginWallEncountered,
+    PageUnavailable,
+    RateLimitExceeded,
+    ServiceWorkerNotFoundError,
+    ServiceWorkerUnresponsiveError,
+    StagingArtefactsLost,
+    SubmitAlreadyAttempted,
+    SubmitPermitAlreadyUsed,
+    SubmitPermitNotClaimed,
+    TriggerFailed,
+    UnknownAtsLayout,
+)
+from app.agent.form_scanner import FormField, FormSnapshot
+from app.agent.gap_filler import GapFillPlan
+from app.agent.jobright_trigger import TIER_ORDER, TriggerResult
+from app.agent.rate_limiter import RateLimiter
+from app.boards.base import (
+    ApplyResult,
+    ApplyStatus,
+    BoardAdapter,
+    UntrustedListingUrlError,
+)
+from app.boards.registry import adapter_for as registry_adapter_for
+from app.config import Settings
+from app.storage.db import Database
+from app.storage.logger import ApplicationLogger
+from app.storage.models import (
+    TERMINAL_APPLICATION_STATUSES,
+    TERMINAL_QUEUE_STATES,
+    ApplicationRecord,
+    ApplicationStatus,
+    ApprovalDecision,
+    ApprovalRecord,
+    Board,
+    ExecutionLease,
+    FieldSource,
+    QueueItem,
+    QueueState,
+)
+
+#: The staging path, in the order the design document specifies. Exported so
+#: a test can assert the order rather than infer it from the wiring, and so
+#: the wiring below is built from the same tuple that is asserted.
+STAGING_NODES: tuple[str, ...] = (
+    "admit",
+    "open_listing",
+    "start_application",
+    "detect_ats",
+    "snapshot_fields",
+    "trigger_autofill",
+    "attribute_fields",
+    "fill_gaps",
+    "stage",
+)
+
+TERMINAL_NODES: tuple[str, ...] = ("submit", "reject", "skip", "fail")
+
+#: The `gate` value that means "no human was asked". Only ever set when
+#: `AUTO_SUBMIT` is enabled *and* nothing is blocking; see
+#: `_auto_submittable`.
+AUTO_SUBMIT_GATE = "auto_submit"
+
+#: Checkpoints are written before the next node starts, not concurrently
+#: with it. The whole point of this graph is that a process can die at any
+#: moment and the application is still recoverable; a checkpoint that was
+#: merely scheduled is exactly the one a crash loses, and losing it here
+#: means an application whose real state is a filled form in a browser and
+#: whose recorded state is "still staging".
+CHECKPOINT_DURABILITY = "sync"
+
+#: How long a worker owns a thread before a successor may assume it is dead.
+#: Conservative on purpose: the cost of waiting too long is a delayed
+#: recovery, and the cost of waiting too little is two workers running one
+#: application. A live holder is never at risk of it, because it renews.
+DEFAULT_LEASE_TTL = timedelta(seconds=120)
+
+#: How often the holder renews. Well inside the term, so half a dozen
+#: heartbeats have to be missed — not one slow submit — before a successor
+#: is entitled to take over.
+DEFAULT_HEARTBEAT_INTERVAL = timedelta(seconds=20)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def thread_id_for(queue_id: int) -> str:
+    """The graph thread one queue item always uses.
+
+    Deterministic on purpose: a worker restarted mid-application must land
+    on the same thread and resume it, rather than opening a second one and
+    clicking Apply on the same listing twice.
+    """
+    return f"application-{queue_id}"
+
+
+class RunStatus(str, Enum):
+    """Where one application ended up."""
+
+    AWAITING_APPROVAL = "awaiting_approval"
+    SUBMITTED = "submitted"
+    REJECTED = "rejected"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    #: Not an outcome: another worker owns this thread, and this caller did
+    #: nothing. Reported rather than raised so a queue runner moves to its
+    #: next item instead of having to catch something.
+    IN_PROGRESS = "in_progress"
+
+
+class SkipKind(str, Enum):
+    """Typed reasons an application is abandoned without being failed.
+
+    Each one is a condition where continuing would be unsafe or pointless
+    rather than broken: the run ends, the reason is persisted on the queue
+    row, and the next queue item is unaffected.
+    """
+
+    UNKNOWN_ATS = "unknown_ats"
+    CAPTCHA = "captcha_required"
+    LOGIN_WALL = "login_required"
+    EXTENSION_UNAVAILABLE = "extension_unavailable"
+    TRIGGER_FAILED = "trigger_failed"
+    RATE_CAP_REACHED = "rate_cap_reached"
+    UNTRUSTED_LISTING_URL = "untrusted_listing_url"
+    BOARD_FLOW_UNSUPPORTED = "board_flow_unsupported"
+    #: The tab an application was being staged in is gone.
+    STAGED_PAGE_LOST = "staged_page_lost"
+    #: The thread was picked up by a worker that does not hold the in-memory
+    #: artefacts the previous attempt staged.
+    STAGING_LOST = "staging_artefacts_lost"
+    #: A decision was recorded but its thread can no longer be resumed, so
+    #: the decision can never be applied to the form it was made about.
+    STALE_APPROVAL = "stale_approval"
+
+
+class BlockingReason(str, Enum):
+    """Why the approval gate must run even when `AUTO_SUBMIT` is enabled."""
+
+    PROTECTED_QUESTION = "protected_question"
+    UNANSWERED_GAP = "unanswered_gap"
+    HUMAN_REQUIRED = "human_required"
+    COVERAGE_INCOMPLETE = "coverage_incomplete"
+    UNWRITTEN_ANSWER = "unwritten_answer"
+    PAGE_NEVER_SETTLED = "page_never_settled"
+
+
+#: Typed failures that end one application without failing it, in the order
+#: they are matched. Order matters: several of these share a base class, and
+#: the first match wins.
+_SKIP_KINDS: tuple[tuple[type[BaseException], SkipKind], ...] = (
+    (RateLimitExceeded, SkipKind.RATE_CAP_REACHED),
+    (UnknownAtsLayout, SkipKind.UNKNOWN_ATS),
+    (CaptchaEncountered, SkipKind.CAPTCHA),
+    (LoginWallEncountered, SkipKind.LOGIN_WALL),
+    (ExtensionNotFoundError, SkipKind.EXTENSION_UNAVAILABLE),
+    (ServiceWorkerNotFoundError, SkipKind.EXTENSION_UNAVAILABLE),
+    (ServiceWorkerUnresponsiveError, SkipKind.EXTENSION_UNAVAILABLE),
+    (TriggerFailed, SkipKind.TRIGGER_FAILED),
+    (UntrustedListingUrlError, SkipKind.UNTRUSTED_LISTING_URL),
+    # Losing the tab or the in-memory staging artefacts part-way through is
+    # not a malfunction: nothing has been submitted, and the listing can be
+    # staged again from the beginning. Failing here instead would fill the
+    # operator's failure log with entries whose only remedy is "run it
+    # again", and bury the ones that mean something is actually broken.
+    (StagingArtefactsLost, SkipKind.STAGING_LOST),
+    (PageUnavailable, SkipKind.STAGED_PAGE_LOST),
+)
+
+
+class UnknownQueueItem(Exception):
+    """Raised when `run_application` is given an id no queue row has."""
+
+    def __init__(self, queue_id: int) -> None:
+        self.queue_id = queue_id
+        super().__init__(f"No queue item with id {queue_id}")
+
+
+class ThreadNotAwaitingApproval(ApprovalError):
+    """Raised when a thread has no pending interrupt to resume.
+
+    Subclasses `ApprovalError` so an API layer can map every refusal from
+    the gate through one branch. Distinct from
+    `ApplicationNotAwaitingApproval`, which is about the *database* row:
+    this one is about the checkpoint, and it is the authoritative one, since
+    the checkpoint is what a resume would actually act on.
+    """
+
+    def __init__(self, thread_id: str, application_id: int | None = None) -> None:
+        self.thread_id = thread_id
+        self.application_id = application_id
+        super().__init__(
+            f"Thread {thread_id!r} is not paused at the approval gate; there "
+            "is nothing to resume. The application either has not reached the "
+            "gate yet or has already been decided."
+        )
+
+
+class ExecutionInProgress(Exception):
+    """Another worker holds this thread's execution lease.
+
+    Only reachable across processes: within one runner every entry point
+    for a thread is serialised, so the second caller waits and then reads
+    whatever the first produced. Two workers on one database cannot wait
+    for each other — a submit takes as long as it takes — so the loser is
+    told to come back rather than being allowed anywhere near the graph.
+    """
+
+    def __init__(
+        self,
+        thread_id: str,
+        lease: ExecutionLease | None = None,
+        *,
+        subject: str | None = None,
+    ) -> None:
+        self.thread_id = thread_id
+        self.lease = lease
+        where = _in_progress_detail(thread_id, lease)
+        super().__init__(f"{subject}: {where}" if subject else where)
+
+
+class ResumeInProgress(ExecutionInProgress, ApprovalError):
+    """The same refusal, reached through the approval gate.
+
+    Subclasses `ApprovalError` too, so an API layer that maps every refusal
+    from the gate through one branch keeps working, and a batch runner that
+    only cares about ownership can catch `ExecutionInProgress`.
+    """
+
+    def __init__(
+        self,
+        thread_id: str,
+        application_id: int,
+        lease: ExecutionLease | None = None,
+    ) -> None:
+        self.application_id = application_id
+        super().__init__(thread_id, lease, subject=f"Application {application_id}")
+
+
+def _in_progress_detail(thread_id: str, lease: ExecutionLease | None) -> str:
+    if lease is None:  # pragma: no cover - the storage layer always returns one
+        return f"thread {thread_id!r} is being run by another worker"
+    return (
+        f"thread {thread_id!r} is being run by {lease.owner!r}, whose lease "
+        f"runs until {lease.expires_at.isoformat()}. The work is happening "
+        "there; retry afterwards to read the outcome."
+    )
+
+
+class ApplicationState(TypedDict, total=False):
+    """Everything checkpointed about one application.
+
+    Deliberately plain data: ints, strings, bools, and lists/dicts of them.
+    A `FormSnapshot`, a page handle, or a `Decimal` in here would either
+    fail to round-trip through the checkpointer or quietly pin the on-disk
+    format to this project's class shapes. The model cost is carried as its
+    exact decimal *string* for that reason.
+    """
+
+    queue_id: int
+    thread_id: str
+    application_id: int
+    listing_url: str
+    board: str
+    #: Nodes that actually ran, in order. Appended to, never replaced, so
+    #: the finished value is the real path through the graph.
+    visited: Annotated[list[str], operator.add]
+    ats: str
+    trigger_tier: int
+    trigger_tier_name: str
+    settled: bool
+    attributed_fields: list[str]
+    gap_summary: list[dict[str, Any]]
+    blocking_reasons: list[str]
+    model_cost: str
+    gate: str
+    #: The decision only. Who made it and what they wrote about it are
+    #: deliberately absent: the approvals table is the audit record, and a
+    #: checkpoint file travels with a working directory in a way that an
+    #: access-controlled table does not.
+    decision: str
+    decided_at: str
+    outcome: str
+    #: The stable, machine-readable outcome — a `SkipKind` or a short
+    #: phrase — that a caller may branch on.
+    reason: str
+    #: The sentence underneath it, naming the particular page, thread, or
+    #: control involved. Separate from `reason` so that stability and
+    #: informativeness do not have to be traded against each other.
+    detail: str
+    screenshot_path: str
+    #: Set by any node that could not continue. Its `terminal` key names the
+    #: node the router sends the run to.
+    failure: dict[str, str]
+
+
+@dataclass(frozen=True)
+class SubmitOutcome:
+    """What a submitter did. `submitted` is never inferred from the absence
+    of an exception: a submit control that never appeared is a failure, not
+    a quiet success."""
+
+    submitted: bool
+    reason: str = ""
+    screenshot_path: str | None = None
+
+
+@dataclass(frozen=True)
+class SubmitAuthorization:
+    """Why this graph believes this form may be submitted.
+
+    Built from the checkpointed state at the submit node and handed to the
+    submitter, so "only a released application is submitted" is a
+    precondition the submitter can check for itself rather than a property
+    of the wiring above it. There are exactly two ways to be released — a
+    human approved it, or an operator enabled `AUTO_SUBMIT` for a form with
+    nothing blocking it — and both are visible here.
+
+    Deliberately plain data, and deliberately without the reviewer's name or
+    note: what the submitter needs to know is whether it may act, and the
+    approvals table is the audit record for who said so.
+    """
+
+    application_id: int
+    thread_id: str
+    decision: str
+    decided_at: str
+    gate: str
+    blocking_reasons: tuple[str, ...] = ()
+
+    @property
+    def approved(self) -> bool:
+        if self.decision == ApprovalDecision.APPROVED.value:
+            return True
+        return self.gate == AUTO_SUBMIT_GATE and not self.blocking_reasons
+
+    def refusal(self) -> str:
+        """Why this authorization does not permit a submission."""
+        if self.gate == AUTO_SUBMIT_GATE:
+            return (
+                "auto-submit was chosen for this application, but it has "
+                f"blocking reasons ({', '.join(self.blocking_reasons)}) that "
+                "require a human decision"
+            )
+        if not self.decision:
+            return "no decision has been recorded for it"
+        return f"the recorded decision is {self.decision!r}, not approved"
+
+
+class SubmitPermit:
+    """The one press this application is allowed, not yet taken.
+
+    The claim behind it is durable and never expires, so spending it spends
+    the application's only attempt. It used to be taken as the submit node
+    started, which meant every refusal that came afterwards — no
+    recognisable submit control, two of them, a control something had
+    animated in over — spent it. Those refusals click nothing, so the form
+    was still perfectly submittable, and the operator who fixed the page
+    found an application that could never be sent.
+
+    So the graph hands this down instead of claiming for itself, and the
+    submitter claims it once it has resolved the control, checked the
+    accessible-name rules against it, and satisfied the driver that it can
+    actually be clicked — immediately before the click, with nothing left
+    between the two that could refuse.
+
+    Claiming is strictly one-shot, and a claim the database refuses spends
+    the permit just the same: a second try would be a second press with the
+    first one's outcome still unknown. `claimed` is what the graph checks
+    afterwards, and it only becomes true when the durable record was really
+    written.
+    """
+
+    def __init__(self, application_id: int, claim: Callable[[], None]) -> None:
+        self.application_id = application_id
+        self._claim = claim
+        self._offered = False
+        self._claimed = False
+
+    @property
+    def claimed(self) -> bool:
+        """Whether the durable record of this press was actually written."""
+        return self._claimed
+
+    def claim(self) -> None:
+        """Record the press durably, or refuse to allow it.
+
+        Raises whatever the underlying claim raises — `SubmitAlreadyAttempted`
+        when a previous attempt already pressed — and `SubmitPermitAlreadyUsed`
+        if asked twice. Returning normally is the only thing that means "press
+        it now".
+        """
+        if self._offered:
+            raise SubmitPermitAlreadyUsed(self.application_id)
+        self._offered = True
+        self._claim()
+        self._claimed = True
+
+
+@dataclass(frozen=True)
+class RunResult:
+    """The outcome of one `run_application` or `resume_application` call."""
+
+    thread_id: str
+    queue_id: int
+    application_id: int | None
+    status: RunStatus
+    #: Stable enough to branch on: a `SkipKind` value, or a short phrase.
+    reason: str = ""
+    #: The specifics behind `reason`, when there are any.
+    detail: str | None = None
+    interrupt: dict[str, Any] | None = None
+    ats: str | None = None
+    trigger_tier: int | None = None
+    model_cost: Decimal = Decimal("0")
+    blocking_reasons: tuple[str, ...] = ()
+    visited: tuple[str, ...] = ()
+    gaps: tuple[dict[str, Any], ...] = ()
+    decision: str | None = None
+    actor: str | None = None
+    note: str | None = None
+    decided_at: str | None = None
+
+    @property
+    def awaiting_approval(self) -> bool:
+        return self.status is RunStatus.AWAITING_APPROVAL
+
+    @property
+    def submitted(self) -> bool:
+        return self.status is RunStatus.SUBMITTED
+
+    @property
+    def in_progress(self) -> bool:
+        """Nothing happened here: another worker owns this thread.
+
+        Worth branching on separately from every other status, because a
+        caller that treats it as an outcome would record a conclusion about
+        an application it never touched.
+        """
+        return self.status is RunStatus.IN_PROGRESS
+
+
+@dataclass(frozen=True)
+class ThreadStatus:
+    """What is true of one thread right now, for anything that displays it.
+
+    The interrupt and the lease have to be read together. A checkpoint
+    paused at the gate says a decision is wanted; a live lease says a
+    worker is running the graph and may be about to resolve that pause
+    itself. Reporting the first without the second invites a reviewer into
+    a race they cannot see, and their decision would be refused as
+    in-progress at best.
+    """
+
+    thread_id: str
+    interrupt: dict[str, Any] | None
+    lease: ExecutionLease | None
+    checked_at: datetime
+
+    @property
+    def executing(self) -> bool:
+        """A worker holds this thread and has renewed recently enough."""
+        return self.lease is not None and self.lease.active_at(self.checked_at)
+
+    @property
+    def stale(self) -> bool:
+        """A lease nobody renewed: its holder is presumed gone."""
+        return self.lease is not None and not self.lease.active_at(self.checked_at)
+
+    @property
+    def awaiting_decision(self) -> bool:
+        """A human decision would actually do something, right now."""
+        return self.interrupt is not None and not self.executing
+
+
+class PageBroker(Protocol):
+    """Owns the tabs. One live page per thread, for as long as it lives."""
+
+    async def open(self, thread_id: str) -> Any: ...
+
+    async def get(self, thread_id: str) -> Any | None: ...
+
+    async def release(self, thread_id: str) -> None: ...
+
+
+class AutofillTrigger(Protocol):
+    """The slice of `JobrightTrigger` the graph uses."""
+
+    async def baseline(self, page: Any) -> FormSnapshot: ...
+
+    async def trigger(self, page: Any, before: FormSnapshot) -> TriggerResult: ...
+
+
+class GapFillerLike(Protocol):
+    """The slice of `GapFiller` the graph uses."""
+
+    async def fill(
+        self, fields: Any, *, skipped_frames: Sequence[str] = ()
+    ) -> GapFillPlan: ...
+
+    def log_payload(self, plan: GapFillPlan) -> tuple[dict[str, Any], ...]: ...
+
+
+class FieldWriter(Protocol):
+    """Types one decided answer into one control.
+
+    Given the whole `FormField` rather than only its key, because an opaque
+    digest cannot be used to find a control again: an implementation needs
+    the frame, the form, the id, the name, the type, and the shadow path
+    that the key was *derived* from. The key travels along on the field, and
+    it stays the provenance the answer is recorded against.
+
+    Returns whether the value actually landed. A `False` here keeps the
+    approval gate in play even under `AUTO_SUBMIT`, because a form with an
+    answer that was decided but never typed is not a filled form.
+    """
+
+    async def write(self, page: Any, field: FormField, value: str) -> bool: ...
+
+
+class Submitter(Protocol):
+    """Performs the last click, given the graph's reason for allowing it.
+
+    The authorization is passed rather than assumed so that an
+    implementation can refuse an unreleased application itself instead of
+    trusting whichever code path called it.
+
+    The permit is the press itself. An implementation must claim it
+    immediately before clicking and after every check that could still
+    refuse, and must not return an outcome without having claimed it: a
+    returned `SubmitOutcome` is a report that the control was pressed, and
+    the graph reads an unclaimed permit alongside one as the contradiction
+    it is. Refusing (by raising `SubmitRefused`) before any click leaves the
+    permit unspent, which is what keeps a fixable page submittable.
+    """
+
+    async def submit(
+        self, page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+    ) -> SubmitOutcome: ...
+
+
+class PageGuard(Protocol):
+    """Refuses to continue on a challenged or gated page.
+
+    Implementations raise `CaptchaEncountered` or `LoginWallEncountered`;
+    returning normally means the page is safe to keep working on.
+    """
+
+    async def inspect(self, page: Any) -> None: ...
+
+
+class Screenshotter(Protocol):
+    async def capture(self, page: Any, name: str) -> str | None: ...
+
+
+@dataclass(frozen=True)
+class GraphDependencies:
+    """Everything the nodes touch, injected rather than constructed.
+
+    The callables use `default_factory` rather than a plain default because
+    a bare function stored as a dataclass *class* attribute is a descriptor
+    and would bind as a method on attribute access, silently passing the
+    dependencies object as the first argument.
+    """
+
+    db: Database
+    settings: Settings
+    logger: ApplicationLogger
+    rate_limiter: RateLimiter
+    pages: PageBroker
+    trigger: AutofillTrigger
+    gap_filler: GapFillerLike
+    writer: FieldWriter
+    submitter: Submitter
+    guard: PageGuard | None = None
+    screenshots: Screenshotter | None = None
+    adapter_for: Callable[[Board], BoardAdapter] = dataclass_field(
+        default_factory=lambda: registry_adapter_for
+    )
+    detect_ats: Callable[[str, str | None], AtsKind] = dataclass_field(
+        default_factory=lambda: default_detect_ats
+    )
+    clock: Callable[[], datetime] = dataclass_field(default_factory=lambda: _utc_now)
+
+
+@dataclass
+class _Staging:
+    """Browser artefacts for one in-flight invocation. Never checkpointed."""
+
+    baseline: FormSnapshot | None = None
+    result: TriggerResult | None = None
+
+
+def _failure(kind: str, reason: str, terminal: str) -> dict[str, str]:
+    return {"kind": kind, "reason": reason, "terminal": terminal}
+
+
+def _classify(error: BaseException) -> dict[str, str]:
+    """Turn an exception into a terminal route.
+
+    Anything in `_SKIP_KINDS` ends the application without failing it;
+    everything else is unexpected and fails the queue item so an operator
+    sees it. Either way the exception stops here rather than propagating out
+    of `run_application` and taking the rest of the batch with it.
+    """
+    for error_type, kind in _SKIP_KINDS:
+        if isinstance(error, error_type):
+            return _failure(kind.value, str(error), "skip")
+    return _failure(type(error).__name__, str(error), "fail")
+
+
+def _page_url(page: Any, fallback: str) -> str:
+    """A page's URL, whether it exposes one as a property or not."""
+    url = getattr(page, "url", None)
+    if callable(url):  # pragma: no cover - Playwright's is a property
+        url = url()
+    return str(url) if url else fallback
+
+
+async def _page_html(page: Any) -> str | None:
+    content = getattr(page, "content", None)
+    if content is None:
+        return None
+    return str(await content())
+
+
+def build_graph(
+    dependencies: GraphDependencies, checkpointer: BaseCheckpointSaver[Any]
+) -> Any:
+    """Compile the application graph against a checkpointer.
+
+    The returned graph is stateless between threads; per-thread browser
+    artefacts live in the `staging` cache closed over here, which is scoped
+    to this graph and holds nothing that needs to survive an interrupt.
+    """
+    deps = dependencies
+    staging: dict[str, _Staging] = {}
+
+    def staged(thread_id: str) -> _Staging:
+        return staging.setdefault(thread_id, _Staging())
+
+    async def require_page(state: ApplicationState) -> Any:
+        thread_id = state["thread_id"]
+        page = await deps.pages.get(thread_id)
+        if page is None:
+            raise PageUnavailable(thread_id)
+        return page
+
+    async def guard(page: Any) -> None:
+        if deps.guard is not None:
+            await deps.guard.inspect(page)
+
+    async def capture(state: ApplicationState, name: str) -> str | None:
+        """Best-effort screenshot. A failed screenshot never masks a failure."""
+        if deps.screenshots is None:
+            return None
+        page = await deps.pages.get(state["thread_id"])
+        if page is None:
+            return None
+        try:
+            return await deps.screenshots.capture(page, f"{state['thread_id']}-{name}")
+        except Exception:  # noqa: BLE001 - diagnostics must not replace the cause
+            return None
+
+    def contained(
+        name: str, body: Callable[[ApplicationState], Awaitable[dict[str, Any]]]
+    ) -> Any:
+        """Run one node, recording that it ran and containing its failures."""
+
+        async def node(state: ApplicationState) -> dict[str, Any]:
+            try:
+                update = await body(state)
+            except GraphBubbleUp:
+                # LangGraph's own control flow — an interrupt, a parent
+                # command — travels as an exception. Classifying one as a
+                # node failure would turn a request for a human decision
+                # into a permanently failed application.
+                raise
+            except Exception as exc:  # noqa: BLE001 - classified, never swallowed
+                return {"visited": [name], "failure": _classify(exc)}
+            return {"visited": [name], **update}
+
+        node.__name__ = name
+        return node
+
+    async def admit(state: ApplicationState) -> dict[str, Any]:
+        queue_id = state["queue_id"]
+        thread_id = state["thread_id"]
+        item = deps.db.get_queue_item(queue_id)
+        if item is None:  # pragma: no cover - the runner checks this first
+            raise UnknownQueueItem(queue_id)
+
+        existing = deps.db.get_application_by_thread(thread_id)
+        if existing is None:
+            application_id = deps.db.create_application(
+                queue_id=queue_id,
+                thread_id=thread_id,
+                status=ApplicationStatus.STAGING,
+            )
+        else:
+            application_id = existing.id
+            deps.db.update_application(
+                application_id, status=ApplicationStatus.STAGING
+            )
+        deps.db.update_queue_state(queue_id, QueueState.RUNNING)
+
+        update: dict[str, Any] = {
+            "application_id": application_id,
+            "listing_url": item.listing_url,
+            "board": item.board.value,
+        }
+        try:
+            deps.rate_limiter.check_and_record(item.board, "apply")
+        except RateLimitExceeded as exc:
+            # Returned rather than raised so the application id above still
+            # reaches the terminal node; without it the skip would be
+            # recorded against the queue row only.
+            update["failure"] = _failure(
+                SkipKind.RATE_CAP_REACHED.value, str(exc), "skip"
+            )
+        return update
+
+    async def open_listing(state: ApplicationState) -> dict[str, Any]:
+        page = await deps.pages.open(state["thread_id"])
+        adapter = deps.adapter_for(Board(state["board"]))
+        await adapter.open_listing(page, state["listing_url"])
+        await guard(page)
+        return {}
+
+    async def start_application(state: ApplicationState) -> dict[str, Any]:
+        page = await require_page(state)
+        adapter = deps.adapter_for(Board(state["board"]))
+        result: ApplyResult = await adapter.start_application(page)
+        if result.status is ApplyStatus.SKIPPED:
+            return {
+                "failure": _failure(
+                    result.reason or SkipKind.BOARD_FLOW_UNSUPPORTED.value,
+                    result.reason,
+                    "skip",
+                )
+            }
+        if result.status is not ApplyStatus.STARTED:
+            return {"failure": _failure("apply_failed", result.reason, "fail")}
+        # An Apply click is the most common place to land on a login wall.
+        await guard(page)
+        return {}
+
+    async def detect_ats(state: ApplicationState) -> dict[str, Any]:
+        page = await require_page(state)
+        url = _page_url(page, state["listing_url"])
+        kind = deps.detect_ats(url, await _page_html(page))
+        if kind is AtsKind.UNKNOWN:
+            raise UnknownAtsLayout(url)
+        deps.db.update_application(state["application_id"], ats=kind.value)
+        return {"ats": kind.value}
+
+    async def snapshot_fields(state: ApplicationState) -> dict[str, Any]:
+        page = await require_page(state)
+        staged(state["thread_id"]).baseline = await deps.trigger.baseline(page)
+        return {}
+
+    async def trigger_autofill(state: ApplicationState) -> dict[str, Any]:
+        page = await require_page(state)
+        # Between the Apply click and here the page has had time to put a
+        # challenge or a sign-in in front of the form, and the tiers below
+        # are about to click things on it.
+        await guard(page)
+        cache = staged(state["thread_id"])
+        baseline = cache.baseline
+        if baseline is None:  # pragma: no cover - snapshot_fields always sets it
+            baseline = await deps.trigger.baseline(page)
+        result = await deps.trigger.trigger(page, baseline)
+        cache.result = result
+        tier = TIER_ORDER.index(result.tier) + 1
+        deps.db.update_application(state["application_id"], trigger_tier=tier)
+        return {
+            "trigger_tier": tier,
+            "trigger_tier_name": result.tier.value,
+            "settled": result.settled,
+        }
+
+    async def attribute_fields(state: ApplicationState) -> dict[str, Any]:
+        result = staged(state["thread_id"]).result
+        if result is None:
+            raise StagingArtefactsLost(state["thread_id"], "trigger result")
+        attributed: list[str] = []
+        for change in result.diff.changed:
+            after = change.after
+            deps.logger.log_field(
+                application_id=state["application_id"],
+                stable_key=after.key,
+                source=FieldSource.JOBRIGHT,
+                required=after.required,
+                filled=after.filled,
+                value=after.value,
+                metadata={
+                    "label": after.label,
+                    "name": after.name,
+                    "field_type": after.field_type,
+                    "frame_url": after.frame_url,
+                    "trigger_tier": result.tier.value,
+                    "became_filled": change.became_filled,
+                },
+            )
+            attributed.append(after.key)
+        return {"attributed_fields": attributed}
+
+    async def fill_gaps(state: ApplicationState) -> dict[str, Any]:
+        page = await require_page(state)
+        result = staged(state["thread_id"]).result
+        if result is None:
+            raise StagingArtefactsLost(state["thread_id"], "trigger result")
+
+        # Checked once more before anything is typed: an answer belongs in
+        # the application form, not in whatever a challenge or a sign-in
+        # interstitial has put in its place.
+        await guard(page)
+        gaps = _open_gaps(result)
+        plan = await deps.gap_filler.fill(
+            gaps,
+            skipped_frames=[skip.frame_url for skip in result.diff.skipped_frames],
+        )
+        # Charged before a single answer is typed. The provider billed for
+        # those completions the moment it produced them, and the writing
+        # below is the fallible part: a crash in the middle of it re-runs
+        # this whole node, model calls included. Recording the spend last
+        # would lose every crashed attempt's bill, and recording it as an
+        # assignment rather than an addition would lose all but the last.
+        total = deps.db.add_model_cost(state["application_id"], plan.model_cost)
+        unwritten = await _apply(
+            plan, page, state["application_id"], {gap.key: gap for gap in gaps}
+        )
+
+        return {
+            "model_cost": str(total),
+            "gap_summary": [dict(entry) for entry in deps.gap_filler.log_payload(plan)],
+            # No default for `settled`: a state that never recorded whether
+            # the page stopped changing is a state that cannot say the form
+            # was stable when it was read.
+            "blocking_reasons": _blocking(plan, unwritten, state.get("settled", False)),
+        }
+
+    async def _apply(
+        plan: GapFillPlan,
+        page: Any,
+        application_id: int,
+        fields: Mapping[str, FormField],
+    ) -> list[str]:
+        """Type each decided answer, then record what every gap ended up as.
+
+        `fields` is the scanned control each plan item came from, looked up
+        by the same key the answer is recorded against. A decided answer
+        whose control is not in it is *not* typed: the writer would have no
+        frame, form, or id to find the control by, and an answer typed by
+        guesswork is worse than one left for the applicant.
+        """
+        unwritten: list[str] = []
+        for item in plan.items:
+            applied = False
+            if item.answer is not None:
+                target = fields.get(item.key)
+                applied = target is not None and bool(
+                    await deps.writer.write(page, target, item.answer)
+                )
+                if not applied:
+                    unwritten.append(item.key)
+            deps.logger.log_field(
+                application_id=application_id,
+                stable_key=item.key,
+                # An unanswered gap is recorded against the applicant: they
+                # are who still has to supply it.
+                source=item.source or FieldSource.USER,
+                required=item.required,
+                filled=applied,
+                value=item.answer,
+                metadata={
+                    "label": item.label,
+                    "name": item.name,
+                    "field_type": item.field_type,
+                    "resolution": item.resolution.value,
+                    "category": item.category.value if item.category else None,
+                    "reason": item.reason,
+                    "cost": str(item.cost),
+                },
+            )
+        return unwritten
+
+    async def stage(state: ApplicationState) -> dict[str, Any]:
+        # Nothing after this point reads the baseline or the trigger result,
+        # so they are dropped here rather than at the terminal node. That
+        # makes "no browser artefact crosses the interrupt" structural — an
+        # application left pending for a week holds no snapshot in memory —
+        # instead of merely true of the current node order.
+        staging.pop(state["thread_id"], None)
+        if _auto_submittable(state, deps.settings.auto_submit):
+            return {"gate": AUTO_SUBMIT_GATE}
+        deps.db.update_application(
+            state["application_id"], status=ApplicationStatus.AWAITING_APPROVAL
+        )
+        return {"gate": "approval"}
+
+    async def approval_gate(state: ApplicationState) -> dict[str, Any]:
+        """Pause durably until a decision arrives.
+
+        Deliberately side-effect free before `interrupt()`: LangGraph
+        re-executes this node from the top when the thread resumes, so
+        anything written here would be written twice. Persisting
+        `awaiting_approval` is `stage`'s job for exactly that reason.
+        """
+        resumed = interrupt(_gate_payload(state))
+        return {"visited": ["approval_gate"], **_decision_from(resumed, state)}
+
+    def claim_the_press(state: ApplicationState) -> None:
+        """Take the one press this application is allowed, or refuse.
+
+        Durable and never expiring, because the danger is a *replay* of this
+        node: the submitter is a fresh object with no memory of the attempt
+        the last process made, and a thread whose presser was killed
+        mid-submit looks exactly like one that never pressed. The claim is
+        recorded by the worker holding the thread's lease — which is by
+        definition whoever is about to press — and outlives it.
+        """
+        application_id = state["application_id"]
+        lease = deps.db.get_lease(state["thread_id"])
+        claimed, held = deps.db.try_claim_submit(
+            application_id,
+            owner=lease.owner if lease is not None else "a caller holding no lease",
+        )
+        if not claimed:
+            raise SubmitAlreadyAttempted(application_id, held.owner, held.attempted_at)
+
+    async def submit(state: ApplicationState) -> dict[str, Any]:
+        # Handed down rather than claimed here: everything between this node
+        # starting and the pointer going down can still refuse, and a
+        # refusal that clicked nothing must leave the application
+        # submittable. See `SubmitPermit`.
+        permit = SubmitPermit(state["application_id"], lambda: claim_the_press(state))
+        try:
+            page = await require_page(state)
+            # The last look at the page before the last click. A challenge
+            # that appeared while the application sat at the gate is not
+            # something to click Submit underneath.
+            await guard(page)
+            outcome = await deps.submitter.submit(page, _authorization(state), permit)
+            if not permit.claimed:
+                # An outcome means "I pressed it". Without the claim behind
+                # it, a replay of this node would press again.
+                raise SubmitPermitNotClaimed(
+                    state["application_id"],
+                    outcome.reason or f"submitted={outcome.submitted}",
+                )
+        except GraphBubbleUp:
+            raise
+        except Exception as exc:  # noqa: BLE001 - contained like any other node
+            # A submission that could not even be attempted is a failure
+            # rather than a skip: the application was *approved*, so someone
+            # is waiting on it and needs to be told it did not happen. The
+            # classified kind goes on the queue row, because an operator
+            # reading `error_reason` should not find it empty.
+            classified = _classify(exc)
+            return await _terminal(
+                state,
+                "submit",
+                RunStatus.FAILED,
+                classified["kind"],
+                ApplicationStatus.FAILED,
+                QueueState.FAILED,
+                queue_reason=classified["kind"],
+                detail=classified["reason"] or str(exc),
+            )
+        if not outcome.submitted:
+            reason = outcome.reason or "the submission did not complete"
+            return await _terminal(
+                state,
+                "submit",
+                RunStatus.FAILED,
+                reason,
+                ApplicationStatus.FAILED,
+                QueueState.FAILED,
+                queue_reason=reason,
+                screenshot=outcome.screenshot_path,
+            )
+        return await _terminal(
+            state,
+            "submit",
+            RunStatus.SUBMITTED,
+            outcome.reason or "submitted",
+            ApplicationStatus.SUBMITTED,
+            QueueState.COMPLETED,
+            screenshot=outcome.screenshot_path,
+        )
+
+    async def reject(state: ApplicationState) -> dict[str, Any]:
+        return await _terminal(
+            state,
+            "reject",
+            RunStatus.REJECTED,
+            # A fixed reason, not the reviewer's note: `reason` is the
+            # machine-readable outcome (and reaches logs), while the note is
+            # their own words and already lives in the approvals table.
+            "rejected at the approval gate",
+            ApplicationStatus.REJECTED,
+            QueueState.COMPLETED,
+        )
+
+    async def skip(state: ApplicationState) -> dict[str, Any]:
+        failure = state.get("failure", {})
+        kind = failure.get("kind", SkipKind.BOARD_FLOW_UNSUPPORTED.value)
+        return await _terminal(
+            state,
+            "skip",
+            RunStatus.SKIPPED,
+            kind,
+            ApplicationStatus.SKIPPED,
+            QueueState.SKIPPED,
+            queue_reason=kind,
+            # Which page, which thread, which control. Every skip of a kind
+            # reads the same without it.
+            detail=failure.get("reason", ""),
+            screenshot=await capture(state, kind),
+        )
+
+    async def fail(state: ApplicationState) -> dict[str, Any]:
+        failure = state.get("failure", {})
+        kind = failure.get("kind", "unknown_error")
+        detail = failure.get("reason", "") or kind
+        return await _terminal(
+            state,
+            "fail",
+            RunStatus.FAILED,
+            detail,
+            ApplicationStatus.FAILED,
+            QueueState.FAILED,
+            queue_reason=kind,
+            detail=detail,
+            screenshot=await capture(state, kind),
+        )
+
+    async def _terminal(
+        state: ApplicationState,
+        name: str,
+        outcome: RunStatus,
+        reason: str,
+        application_status: ApplicationStatus,
+        queue_state: QueueState,
+        *,
+        queue_reason: str | None = None,
+        detail: str = "",
+        screenshot: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one final outcome and let go of the page.
+
+        Releasing the page here rather than in the runner means it happens
+        on every path out of the graph, including the contained-failure
+        ones, so a skipped application never leaves a tab behind.
+
+        Both writes are refused by storage if the record has already
+        finished, so a node re-executed after a crash restates the outcome
+        rather than replacing one that was reached in the meantime.
+        """
+        application_id = state.get("application_id")
+        if application_id is not None:
+            deps.db.update_application(
+                application_id,
+                status=application_status,
+                screenshot_path=screenshot,
+            )
+        deps.db.update_queue_state(state["queue_id"], queue_state, queue_reason)
+        try:
+            await deps.pages.release(state["thread_id"])
+        except Exception:  # noqa: BLE001 - a tab that will not close is not an outcome
+            # The outcome above is already persisted. Letting a failed tab
+            # close raise here would turn a recorded submission into an
+            # exception out of `run_application` and stop the batch.
+            pass
+        staging.pop(state["thread_id"], None)
+        update: dict[str, Any] = {
+            "visited": [name],
+            "outcome": outcome.value,
+            "reason": reason,
+            "detail": detail,
+        }
+        if screenshot is not None:
+            update["screenshot_path"] = screenshot
+        return update
+
+    graph: StateGraph[ApplicationState, None, ApplicationState, ApplicationState] = (
+        StateGraph(ApplicationState)
+    )
+    bodies = {
+        "admit": admit,
+        "open_listing": open_listing,
+        "start_application": start_application,
+        "detect_ats": detect_ats,
+        "snapshot_fields": snapshot_fields,
+        "trigger_autofill": trigger_autofill,
+        "attribute_fields": attribute_fields,
+        "fill_gaps": fill_gaps,
+        "stage": stage,
+    }
+    for name in STAGING_NODES:
+        graph.add_node(name, contained(name, bodies[name]))
+    graph.add_node("approval_gate", approval_gate)
+    graph.add_node("submit", submit)
+    graph.add_node("reject", reject)
+    graph.add_node("skip", skip)
+    graph.add_node("fail", fail)
+
+    graph.add_edge(START, STAGING_NODES[0])
+    for name, following in zip(STAGING_NODES, STAGING_NODES[1:]):
+        graph.add_conditional_edges(
+            name, _continue_to(following), [following, "skip", "fail"]
+        )
+    graph.add_conditional_edges(
+        "stage", _after_stage, ["approval_gate", "submit", "skip", "fail"]
+    )
+    graph.add_conditional_edges(
+        "approval_gate", _after_gate, ["submit", "reject", "fail"]
+    )
+    for name in TERMINAL_NODES:
+        graph.add_edge(name, END)
+
+    return graph.compile(checkpointer=checkpointer)
+
+
+def _authorization(state: ApplicationState) -> SubmitAuthorization:
+    """The graph's reason for allowing this submission, as typed data.
+
+    Read straight off the checkpointed state, so it says what this thread
+    actually recorded rather than what the caller believes: a state with no
+    decision and no auto-submit gate produces an authorization that refuses
+    itself.
+    """
+    return SubmitAuthorization(
+        application_id=state["application_id"],
+        thread_id=state["thread_id"],
+        decision=str(state.get("decision", "")),
+        decided_at=str(state.get("decided_at", "")),
+        gate=str(state.get("gate", "")),
+        blocking_reasons=tuple(state.get("blocking_reasons", ())),
+    )
+
+
+def _open_gaps(result: TriggerResult) -> list[FormField]:
+    """Every control still needing an answer, each listed once."""
+    gaps: dict[str, FormField] = {}
+    for field in (*result.diff.still_empty_required, *result.diff.unanswered_free_text):
+        gaps.setdefault(field.key, field)
+    return list(gaps.values())
+
+
+def _blocking(plan: GapFillPlan, unwritten: Sequence[str], settled: bool) -> list[str]:
+    """Every reason the gate must run, even under `AUTO_SUBMIT`.
+
+    Returned as a list rather than a boolean so the interrupt payload can
+    tell a reviewer *why* they are being asked.
+    """
+    reasons: list[str] = []
+    if plan.protected:
+        reasons.append(BlockingReason.PROTECTED_QUESTION.value)
+    if plan.unanswered:
+        reasons.append(BlockingReason.UNANSWERED_GAP.value)
+    if plan.requires_human:
+        reasons.append(BlockingReason.HUMAN_REQUIRED.value)
+    if not plan.coverage_complete:
+        reasons.append(BlockingReason.COVERAGE_INCOMPLETE.value)
+    if unwritten:
+        reasons.append(BlockingReason.UNWRITTEN_ANSWER.value)
+    if not settled:
+        reasons.append(BlockingReason.PAGE_NEVER_SETTLED.value)
+    return reasons
+
+
+def _auto_submittable(state: ApplicationState, auto_submit: bool) -> bool:
+    """Whether this state may bypass the approval gate.
+
+    An absent `blocking_reasons` key is not an empty one. A state that never
+    reached `fill_gaps` — because an older version wrote it, or because the
+    key was lost in a schema change — has never been checked for protected
+    questions, unanswered gaps, or unwritten answers, and reading its
+    silence as consent is exactly the failure this gate exists to prevent.
+    """
+    if not auto_submit:
+        return False
+    if "blocking_reasons" not in state:
+        return False
+    return not state["blocking_reasons"]
+
+
+def _gate_payload(state: ApplicationState) -> dict[str, Any]:
+    """What a reviewer is shown, and what the checkpoint stores.
+
+    `gap_summary` comes from `GapFiller.log_payload`, which honours
+    `LOG_FIELD_VALUES`, so answer text does not reach the checkpoint file
+    unless field-value logging was explicitly enabled.
+    """
+    return {
+        "application_id": state["application_id"],
+        "thread_id": state["thread_id"],
+        "queue_id": state["queue_id"],
+        "listing_url": state.get("listing_url", ""),
+        "board": state.get("board", ""),
+        "ats": state.get("ats", AtsKind.UNKNOWN.value),
+        "trigger_tier": state.get("trigger_tier"),
+        "model_cost": state.get("model_cost", "0"),
+        "blocking_reasons": list(state.get("blocking_reasons", ())),
+        "gaps": [dict(entry) for entry in state.get("gap_summary", ())],
+    }
+
+
+def _decision_from(resumed: Any, state: ApplicationState) -> dict[str, Any]:
+    """Read a resume payload, refusing one that is not this application's.
+
+    The runner already validates the decision against storage; this is the
+    graph's own last check, so a `Command(resume=...)` sent straight at a
+    compiled graph still cannot approve an application it does not name.
+    """
+    if not isinstance(resumed, Mapping):
+        return {
+            "failure": _failure(
+                "malformed_resume",
+                f"a resume payload must be a mapping, not {type(resumed).__name__}",
+                "fail",
+            )
+        }
+    if resumed.get("application_id") != state["application_id"]:
+        return {
+            "failure": _failure(
+                "forged_resume",
+                f"the resume payload names application "
+                f"{resumed.get('application_id')!r}, but this thread is "
+                f"application {state['application_id']}",
+                "fail",
+            )
+        }
+    try:
+        decision = parse_decision(resumed.get("decision"))
+    except InvalidApprovalRequest as exc:
+        return {"failure": _failure("malformed_resume", str(exc), "fail")}
+    # The decision and when it was taken, and nothing else. Who took it and
+    # what they wrote stay in the approvals table, which is the audit
+    # record; the checkpoint is a resumption artefact and does not need
+    # them to route the run.
+    return {
+        "decision": decision.value,
+        "decided_at": str(resumed.get("decided_at", "")),
+    }
+
+
+def _continue_to(following: str) -> Callable[[ApplicationState], str]:
+    def route(state: ApplicationState) -> str:
+        failure = state.get("failure")
+        if failure:
+            return failure.get("terminal", "fail")
+        return following
+
+    return route
+
+
+def _after_stage(state: ApplicationState) -> str:
+    failure = state.get("failure")
+    if failure:
+        return failure.get("terminal", "fail")
+    return "submit" if state.get("gate") == AUTO_SUBMIT_GATE else "approval_gate"
+
+
+def _after_gate(state: ApplicationState) -> str:
+    failure = state.get("failure")
+    if failure:
+        return failure.get("terminal", "fail")
+    if state.get("decision") == ApprovalDecision.APPROVED.value:
+        return "submit"
+    return "reject"
+
+
+#: How a finished record maps back to a run outcome, for the paths that read
+#: storage instead of a checkpoint.
+_RECORDED_STATUSES: Mapping[ApplicationStatus, RunStatus] = {
+    ApplicationStatus.SUBMITTED: RunStatus.SUBMITTED,
+    ApplicationStatus.REJECTED: RunStatus.REJECTED,
+    ApplicationStatus.SKIPPED: RunStatus.SKIPPED,
+    ApplicationStatus.FAILED: RunStatus.FAILED,
+}
+
+_RECORDED_QUEUE_STATES: Mapping[QueueState, RunStatus] = {
+    QueueState.SKIPPED: RunStatus.SKIPPED,
+    QueueState.FAILED: RunStatus.FAILED,
+}
+
+
+def _owner_token() -> str:
+    """A name for this runner that no other runner will pick.
+
+    Host and process make it legible in a lease row someone is trying to
+    understand; the random part keeps two runners inside one process
+    distinct, which is what makes a second runner behave like a second
+    worker rather than accidentally inheriting the first one's lease.
+    """
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def _in_progress_result(
+    thread_id: str,
+    queue_id: int,
+    application: ApplicationRecord | None,
+    lease: ExecutionLease,
+) -> RunResult:
+    """The answer to "somebody else is doing this one".
+
+    Not an outcome and not an error: the caller did nothing, and the
+    honest report is who is doing it instead. A queue runner reads this
+    and moves on to its next item.
+    """
+    return RunResult(
+        thread_id=thread_id,
+        queue_id=queue_id,
+        application_id=application.id if application is not None else None,
+        status=RunStatus.IN_PROGRESS,
+        reason="another worker is running this application",
+        detail=_in_progress_detail(thread_id, lease),
+    )
+
+
+def _recorded_result(
+    thread_id: str,
+    item: QueueItem | None,
+    application: ApplicationRecord | None,
+    approval: ApprovalRecord | None,
+) -> RunResult | None:
+    """The outcome as storage remembers it, or `None` if it remembers none.
+
+    Built from the queue and application rows rather than the checkpoint, so
+    it is still available to a worker whose checkpoint file is gone — which
+    is exactly the situation in which reporting "no outcome" would be
+    dangerous, because the caller's next move is to stage the listing again.
+    """
+    status: RunStatus | None = None
+    if application is not None:
+        status = _RECORDED_STATUSES.get(application.status)
+    if status is None and item is not None:
+        status = _RECORDED_QUEUE_STATES.get(item.state)
+    if status is None:
+        return None
+
+    return RunResult(
+        thread_id=thread_id,
+        queue_id=item.id if item is not None else 0,
+        application_id=application.id if application is not None else None,
+        status=status,
+        reason=(item.error_reason if item is not None else None) or status.value,
+        detail="recovered from the recorded outcome, not from a checkpoint",
+        ats=application.ats if application is not None else None,
+        trigger_tier=application.trigger_tier if application is not None else None,
+        model_cost=Decimal(
+            str(application.model_cost or "0") if application is not None else "0"
+        ),
+        decision=approval.decision.value if approval is not None else None,
+        actor=approval.actor if approval is not None else None,
+        note=approval.note if approval is not None else None,
+        decided_at=approval.timestamp.isoformat() if approval is not None else None,
+    )
+
+
+def _interrupt_payload(interrupts: Sequence[Any]) -> dict[str, Any] | None:
+    """The value a paused thread is waiting on, as a mapping.
+
+    This graph's own gate always interrupts with one, but an `interrupt()`
+    raised from somewhere below a node need not, and coercing that blindly
+    would turn a paused application into a `ValueError` out of the runner —
+    taking the rest of the batch with it. An unrecognised value is wrapped
+    rather than dropped, because whatever asked for it is still waiting.
+    """
+    if not interrupts:
+        return None
+    value = interrupts[0].value
+    return dict(value) if isinstance(value, Mapping) else {"value": value}
+
+
+def _finished_result(
+    thread_id: str,
+    item: QueueItem,
+    application: ApplicationRecord | None,
+    service: ApprovalService,
+) -> RunResult | None:
+    """The recorded outcome of a queue item that is already over.
+
+    A completed queue item whose application is still mid-flight is not
+    over — that combination means a terminal node wrote the queue row and
+    then the process died — so the application row has the final say
+    wherever there is one.
+    """
+    if application is not None:
+        if application.status not in TERMINAL_APPLICATION_STATUSES:
+            return None
+    elif item.state not in TERMINAL_QUEUE_STATES:
+        return None
+
+    approval = service.recorded(application.id) if application is not None else None
+    return _recorded_result(thread_id, item, application, approval)
+
+
+@asynccontextmanager
+async def sqlite_checkpointer(
+    path: Path | str,
+) -> AsyncIterator[AsyncSqliteSaver]:
+    """Open the SQLite checkpointer the durable interrupt depends on.
+
+    The schema is created on entry rather than lazily, so a caller that only
+    inspects a thread (a status endpoint, say) works against a brand-new
+    file just as well as one that runs an application through it.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    async with AsyncSqliteSaver.from_conn_string(str(target)) as saver:
+        await saver.setup()
+        yield saver
+
+
+def checkpointer_for(settings: Settings) -> Any:
+    """The checkpointer path this project uses, alongside the queue database."""
+    return sqlite_checkpointer(settings.sqlite_path.parent / "checkpoints.sqlite")
+
+
+class ApplicationRunner:
+    """Runs and resumes application threads.
+
+    Satisfies `app.agent.approval.ThreadResumer`, so both approval gates
+    drive the same object and therefore the same validation.
+    """
+
+    def __init__(
+        self,
+        dependencies: GraphDependencies,
+        checkpointer: BaseCheckpointSaver[Any],
+        *,
+        owner: str | None = None,
+        lease_ttl: timedelta = DEFAULT_LEASE_TTL,
+        heartbeat: timedelta = DEFAULT_HEARTBEAT_INTERVAL,
+    ) -> None:
+        self._deps = dependencies
+        self._graph = build_graph(dependencies, checkpointer)
+        self._service = ApprovalService(dependencies.db, clock=dependencies.clock)
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._owner = owner or _owner_token()
+        self._ttl = lease_ttl
+        self._heartbeat = heartbeat
+
+    def _lock_for(self, thread_id: str) -> asyncio.Lock:
+        """One lock per thread, so two callers queue instead of racing.
+
+        The in-process half of the guarantee. Two coroutines that both read
+        "this thread is at the gate" and then both act would submit the same
+        form twice, and no amount of validation before the read prevents it.
+        The database lease is the other half, for workers that cannot share
+        a lock.
+        """
+        return self._locks.setdefault(thread_id, asyncio.Lock())
+
+    @property
+    def graph(self) -> Any:
+        return self._graph
+
+    @property
+    def approvals(self) -> ApprovalService:
+        return self._service
+
+    @property
+    def owner(self) -> str:
+        """This runner's lease identity, unique to it even within a process."""
+        return self._owner
+
+    async def run_application(self, queue_id: int) -> RunResult:
+        """Stage one queue item, stopping at the approval gate.
+
+        Safe to call again for the same queue item: a thread already paused
+        at the gate is reported as-is rather than restaged, a finished one
+        reports its outcome, and one another worker owns is reported as in
+        progress. Re-staging would mean a second Apply click on the same
+        listing.
+        """
+        item = self._deps.db.get_queue_item(queue_id)
+        if item is None:
+            raise UnknownQueueItem(queue_id)
+
+        thread_id = thread_id_for(queue_id)
+        async with self._lock_for(thread_id):
+            return await self._run_locked(thread_id, item)
+
+    async def _run_locked(self, thread_id: str, item: QueueItem) -> RunResult:
+        application = self._deps.db.get_application_by_thread(thread_id)
+        # Storage is consulted before the checkpoint, because it is the
+        # record that survives losing the checkpoint file. Without this the
+        # queue runner rediscovers a submitted application as an unstarted
+        # one, opens the listing, and clicks Apply for a second time in
+        # someone's name.
+        finished = _finished_result(thread_id, item, application, self._service)
+        if finished is not None:
+            return finished
+
+        attempt = self._deps.db.acquire_lease(
+            thread_id, self._owner, ttl=self._ttl, now=self._now()
+        )
+        if not attempt.acquired:
+            return _in_progress_result(thread_id, item.id, application, attempt.lease)
+
+        async with self._holding(thread_id):
+            config = _config(thread_id)
+            state = await self._graph.aget_state(config)
+            if state.created_at is None and application is not None:
+                recorded = self._service.recorded(application.id)
+                if recorded is not None:
+                    return self._abandon_stale_approval(
+                        thread_id, item, application, recorded
+                    )
+            if state.created_at is not None:
+                if state.interrupts or not state.next:
+                    return self._from_state(thread_id, item.id, state)
+                # A checkpoint that is neither finished nor paused belongs
+                # to a run that died mid-flight; continue it rather than
+                # restarting. Only ever under the lease: continuing means
+                # running whichever node it stopped at, and for an approved
+                # application that node is `submit`.
+                values = await self._graph.ainvoke(
+                    None, config, durability=CHECKPOINT_DURABILITY
+                )
+                return self._from_values(thread_id, item.id, values)
+
+            values = await self._graph.ainvoke(
+                ApplicationState(
+                    queue_id=item.id,
+                    thread_id=thread_id,
+                    listing_url=item.listing_url,
+                    board=item.board.value,
+                    visited=[],
+                ),
+                config,
+                durability=CHECKPOINT_DURABILITY,
+            )
+            return self._from_values(thread_id, item.id, values)
+
+    async def thread_status(self, thread_id: str) -> ThreadStatus:
+        """What is true of a thread right now, without touching it.
+
+        Lock-free and lease-free: this is the read a status endpoint makes,
+        and it must not queue behind the worker it is reporting on.
+        """
+        state = await self._graph.aget_state(_config(thread_id))
+        return ThreadStatus(
+            thread_id=thread_id,
+            interrupt=_interrupt_payload(state.interrupts),
+            lease=self._deps.db.get_lease(thread_id),
+            checked_at=self._now(),
+        )
+
+    async def pending_approval(self, thread_id: str) -> dict[str, Any] | None:
+        """The decision a thread is actually waiting on a human for.
+
+        `None` while a worker is running the thread, even though the
+        checkpoint may hold an interrupt: that worker may be a moment from
+        resolving it, and a decision offered in the meantime would be
+        refused. Once the lease lapses the interrupt is offered again, which
+        is how a decision survives the death of the worker that asked for
+        it. `thread_status` reports both halves for a caller that needs to
+        tell "being worked on" from "nothing to do".
+        """
+        status = await self.thread_status(thread_id)
+        return status.interrupt if status.awaiting_decision else None
+
+    def _now(self) -> datetime:
+        return self._deps.clock()
+
+    @asynccontextmanager
+    async def _holding(self, thread_id: str) -> AsyncIterator[None]:
+        """Keep a lease alive for the length of one piece of work.
+
+        The heartbeat is what separates "this worker is slow" from "this
+        worker is gone". Without it the lease term would have to exceed the
+        slowest imaginable submit, and a killed worker would own its thread
+        for that long.
+
+        Released on every exit, including a raised exception, because a
+        retry has to be possible at once rather than after an expiry. Only
+        a process that dies outright leaves a lease behind, and that is
+        precisely the case expiry exists for.
+        """
+        beat = asyncio.create_task(self._beat(thread_id))
+        try:
+            yield
+        finally:
+            beat.cancel()
+            with suppress(asyncio.CancelledError):
+                await beat
+            self._deps.db.release_lease(thread_id, self._owner)
+
+    async def _beat(self, thread_id: str) -> None:
+        interval = max(self._heartbeat.total_seconds(), 0.001)
+        while True:
+            await asyncio.sleep(interval)
+            renewed = self._deps.db.renew_lease(
+                thread_id, self._owner, ttl=self._ttl, now=self._now()
+            )
+            if renewed is None:
+                # Somebody reclaimed the thread. Stop renewing so this
+                # worker's stale row cannot come back to life; the terminal
+                # write guards in storage are what keep the outcome honest
+                # from here.
+                return
+
+    async def resume_application(
+        self, thread_id: str, decision: ApprovalRequest
+    ) -> RunResult:
+        """Apply one decision to one thread.
+
+        Held under this thread's lock from the first read to the last write,
+        so two decisions arriving together are applied one after the other
+        rather than both against the same "still interrupted" snapshot. Every
+        read that matters — the application row, the recorded approval, the
+        checkpoint — happens inside it, because a value read before the lock
+        is a value the other caller may already have changed.
+        """
+        async with self._lock_for(thread_id):
+            return await self._resume_locked(thread_id, decision)
+
+    async def _resume_locked(
+        self, thread_id: str, decision: ApprovalRequest
+    ) -> RunResult:
+        """Apply one decision, with this thread's lock already held.
+
+        Validation order is deliberate. The application the decision names
+        is checked against the thread being resumed *before* any approval
+        record is read or written, so a forged application id never reads
+        another application's audit row, let alone releases it. Then storage
+        is checked for a finished application, then the checkpoint for a
+        pending interrupt, and only then is the decision recorded and the
+        thread leased.
+        """
+        application = self._service.application_for_thread(thread_id)
+        named = self._service.application_for(decision.application_id)
+        if named.thread_id != thread_id:
+            raise ApplicationThreadMismatch(
+                decision.application_id, thread_id, named.thread_id
+            )
+
+        config = _config(thread_id)
+        if application.status in TERMINAL_APPLICATION_STATUSES:
+            # The application is over, whatever the checkpoint says — and it
+            # may say nothing at all, if the file was lost. An identical
+            # decision reads the outcome it already caused; a different one
+            # is still a conflict, because arriving late does not make it
+            # agree with what was decided.
+            return self._finished_resume(thread_id, application, decision)
+
+        state = await self._graph.aget_state(config)
+        if not state.interrupts:
+            return await self._resume_uninterrupted(
+                thread_id, application, decision, state
+            )
+
+        outcome = self._service.decide(decision, thread_id=thread_id)
+        attempt = self._deps.db.acquire_lease(
+            thread_id, self._owner, ttl=self._ttl, now=self._now()
+        )
+        if not attempt.acquired:
+            raise ResumeInProgress(thread_id, application.id, attempt.lease)
+
+        async with self._holding(thread_id):
+            # Read again now that nobody else can be running the graph. The
+            # snapshot above was taken while another worker may have been
+            # part-way through this very interrupt.
+            fresh = await self._graph.aget_state(config)
+            if not fresh.interrupts:
+                return await self._continue_or_report(
+                    thread_id, application, config, fresh
+                )
+            values = await self._graph.ainvoke(
+                Command(resume=outcome.resume_payload()),
+                config,
+                durability=CHECKPOINT_DURABILITY,
+            )
+            return self._from_values(thread_id, application.queue_id, values)
+
+    async def _resume_uninterrupted(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        decision: ApprovalRequest,
+        state: Any,
+    ) -> RunResult:
+        """A live application whose checkpoint is not paused at the gate.
+
+        Three different situations wear the same shape here, and the
+        difference matters. No checkpoint at all means the decision can
+        never be applied and the application has to be abandoned. Nodes
+        still to run means a worker died between the decision and the
+        outcome, and the work must be finished rather than reported as
+        done. Nothing left to run means the graph completed and this is a
+        retry reading its result.
+
+        The recorded decision is checked first in every case: a request that
+        does not match what was decided is a conflict whoever owns the
+        thread, and a thread that never reached the gate cannot be approved
+        at all.
+
+        Telling the three apart is a judgement about a *checkpoint*, and a
+        checkpoint is a per-worker view: a worker whose file is missing sees
+        an application it is entitled to abandon where another worker, at
+        that same moment, is inside `submit`. So the lease is taken before
+        the judgement is acted on, and the checkpoint is read again once it
+        is held. Reading first and writing after is what let a blind worker
+        stamp `skipped` on an application that was being filed.
+        """
+        existing = self._require_matching_approval(thread_id, application, decision)
+        attempt = self._deps.db.acquire_lease(
+            thread_id, self._owner, ttl=self._ttl, now=self._now()
+        )
+        if not attempt.acquired:
+            raise ResumeInProgress(thread_id, application.id, attempt.lease)
+
+        async with self._holding(thread_id):
+            config = _config(thread_id)
+            fresh = await self._graph.aget_state(config)
+            if fresh.created_at is None:
+                return self._abandon_stale_approval(
+                    thread_id,
+                    self._deps.db.get_queue_item(application.queue_id),
+                    application,
+                    existing,
+                )
+            if not fresh.next:
+                return self._from_state(thread_id, application.queue_id, fresh)
+            return await self._continue(thread_id, application, config)
+
+    async def _continue_or_report(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        config: dict[str, Any],
+        state: Any,
+    ) -> RunResult:
+        """The interrupt went away between the first read and the lease.
+
+        The worker that resolved it has since let the thread go, so this
+        caller now owns whatever it left behind: either a finished graph to
+        read, or nodes it never got to run.
+        """
+        if not state.next:
+            return self._from_state(thread_id, application.queue_id, state)
+        return await self._continue(thread_id, application, config)
+
+    async def _continue(
+        self, thread_id: str, application: ApplicationRecord, config: dict[str, Any]
+    ) -> RunResult:
+        values = await self._graph.ainvoke(
+            None, config, durability=CHECKPOINT_DURABILITY
+        )
+        return self._from_values(thread_id, application.queue_id, values)
+
+    def _abandon_stale_approval(
+        self,
+        thread_id: str,
+        item: QueueItem | None,
+        application: ApplicationRecord,
+        approval: ApprovalRecord,
+    ) -> RunResult:
+        """End an application whose decision can no longer be applied.
+
+        A recorded decision with no checkpoint left to resume is the one
+        state where doing nothing is worse than giving up. Staging the
+        listing again would produce a freshly scanned form, and the recorded
+        approval would then release *that* form — answers the reviewer never
+        saw, submitted in their name. Leaving it alone instead parks the
+        application at a gate no decision can ever get through.
+
+        So it is abandoned, with a reason on the queue row. The listing can
+        be queued again, which opens a new thread and asks for a decision of
+        its own.
+
+        Writes, so callers hold the lease. The decision is a parameter
+        rather than something looked up here, because "is there a recorded
+        approval at all" is the question that decides whether this is the
+        right thing to do, and the caller has to have answered it already.
+        """
+        reason = SkipKind.STALE_APPROVAL.value
+        self._deps.db.update_application(
+            application.id, status=ApplicationStatus.SKIPPED
+        )
+        self._deps.db.update_queue_state(
+            application.queue_id, QueueState.SKIPPED, reason
+        )
+        # Re-read rather than assume: if storage refused the writes above,
+        # this application was already finished by somebody else and their
+        # outcome is the one to report, not the abandonment.
+        outcome = _recorded_result(
+            thread_id,
+            self._deps.db.get_queue_item(application.queue_id) or item,
+            self._deps.db.get_application(application.id),
+            approval,
+        )
+        if outcome is None:  # pragma: no cover - both rows were just written
+            raise RuntimeError(
+                f"application {application.id} was abandoned but storage "
+                "reports it as neither skipped nor otherwise finished"
+            )
+        return outcome
+
+    def _require_matching_approval(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        decision: ApprovalRequest,
+    ) -> ApprovalRecord:
+        """The recorded decision, if this request is the same one.
+
+        A thread with nothing left to resume and no recorded decision was
+        never at the gate. One with a *different* recorded decision is a
+        conflict rather than a replay: a second reviewer's answer does not
+        become the first one's by arriving after it.
+        """
+        existing = self._service.recorded(application.id)
+        if existing is None:
+            raise ThreadNotAwaitingApproval(thread_id, application.id)
+        if not decision.matches(existing):
+            raise ApprovalConflict(
+                application.id, existing, decision.differing_field(existing)
+            )
+        return existing
+
+
+    def _finished_resume(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        decision: ApprovalRequest,
+    ) -> RunResult:
+        """The recorded outcome of an application that is already over.
+
+        Read from storage rather than the checkpoint, so it is still the
+        right answer when the checkpoint file is missing — which is the case
+        where getting it wrong would restage a submitted application.
+        """
+        existing = self._require_matching_approval(thread_id, application, decision)
+        recorded = _recorded_result(
+            thread_id,
+            self._deps.db.get_queue_item(application.queue_id),
+            application,
+            existing,
+        )
+        if recorded is None:  # pragma: no cover - callers check the status first
+            raise ThreadNotAwaitingApproval(thread_id, application.id)
+        return recorded
+
+    def _from_state(self, thread_id: str, queue_id: int, state: Any) -> RunResult:
+        payload = _interrupt_payload(state.interrupts)
+        return self._result(thread_id, queue_id, dict(state.values), payload)
+
+    def _from_values(
+        self, thread_id: str, queue_id: int, values: Mapping[str, Any]
+    ) -> RunResult:
+        payload = _interrupt_payload(values.get("__interrupt__") or ())
+        return self._result(thread_id, queue_id, values, payload)
+
+    def _result(
+        self,
+        thread_id: str,
+        queue_id: int,
+        values: Mapping[str, Any],
+        interrupt_payload: dict[str, Any] | None,
+    ) -> RunResult:
+        if interrupt_payload is not None:
+            status = RunStatus.AWAITING_APPROVAL
+            reason = "awaiting a human decision"
+        else:
+            raw = values.get("outcome")
+            status = RunStatus(raw) if raw else RunStatus.FAILED
+            reason = str(
+                values.get("reason", "" if raw else "the run produced no outcome")
+            )
+        # Who decided, and what they said about it, are read back from the
+        # approvals table rather than from the graph's state, because that
+        # is where they are kept: the checkpoint carries only the decision.
+        approval = self._approval_for(values.get("application_id"))
+        return RunResult(
+            thread_id=thread_id,
+            queue_id=queue_id,
+            application_id=values.get("application_id"),
+            status=status,
+            reason=reason,
+            detail=values.get("detail") or None,
+            interrupt=interrupt_payload,
+            ats=values.get("ats"),
+            trigger_tier=values.get("trigger_tier"),
+            model_cost=Decimal(str(values.get("model_cost", "0"))),
+            blocking_reasons=tuple(values.get("blocking_reasons", ())),
+            visited=tuple(values.get("visited", ())),
+            gaps=tuple(dict(entry) for entry in values.get("gap_summary", ())),
+            decision=values.get("decision"),
+            actor=approval.actor if approval is not None else None,
+            note=approval.note if approval is not None else None,
+            decided_at=values.get("decided_at")
+            or (approval.timestamp.isoformat() if approval is not None else None),
+        )
+
+    def _approval_for(self, application_id: Any) -> ApprovalRecord | None:
+        if not isinstance(application_id, int):
+            return None
+        return self._service.recorded(application_id)
+
+
+def _config(thread_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": thread_id}}

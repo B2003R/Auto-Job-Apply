@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<!--
+  A form whose last-name control and whose final submit control are both
+  inside open shadow roots — the shape a component-framework ATS ships, and
+  the one no `document.querySelector` reaches.
+
+  The light DOM holds the form and the pre-filled fields; `shadow_form.js`
+  attaches the two shadow roots and answers the press.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Application form</title>
+</head>
+<body>
+  <form id="application-form" data-source="greenhouse" class="application-form">
+    <label for="first_name">First name *</label>
+    <input id="first_name" name="first_name" type="text" value="Alex" required>
+
+    <label for="email">Email *</label>
+    <input id="email" name="email" type="email" value="alex.rivera@example.com" required>
+
+    <div id="last-name-host"></div>
+    <div id="submit-host"></div>
+  </form>
+  <script src="shadow_form.js"></script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!--
+  A page whose application form is in a same-origin child frame — the shape
+  Greenhouse, Lever, and Workday all ship, where the careers page is the
+  employer's and the form inside it is the ATS's.
+
+  The standing banner is the point of this fixture. It reads exactly like a
+  confirmation and it is on the page *before* anything is clicked, which is
+  what a "you have applied to N roles" panel looks like to a machine. A
+  submitter that judged a child frame's press by looking at the top page
+  would read it as this application being confirmed.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Careers — Senior Engineer</title>
+</head>
+<body>
+  <h1>Senior Engineer</h1>
+  <div id="saved-applications" role="status">
+    Thank you for applying to two other roles this month.
+  </div>
+  <iframe
+    id="application-frame"
+    title="Application form"
+    src="iframe_form.html"
+    width="900"
+    height="700"
+    style="border: 0"
+  ></iframe>
+</body>
+</html>

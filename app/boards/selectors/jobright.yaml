@@ -1,0 +1,14 @@
+# Selectors for jobright.ai job listing pages.
+#
+# `autofill_apply_button` is Jobright's own direct "Apply with Autofill"
+# control, which starts the extension's autofill flow immediately from the
+# listing page. It is optional: if it is ever removed from this file, or a
+# listing simply does not render it (or renders it more than once — see
+# app/boards/jobright.py), the adapter falls back to `apply_button` rather
+# than guessing.
+#
+# `apply_button` is the normal Apply control, always required.
+board: jobright
+selectors:
+  apply_button: "button[data-test='jobright-apply']"
+  autofill_apply_button: "button[data-test='jobright-apply-autofill']"
