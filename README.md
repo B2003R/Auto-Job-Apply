@@ -443,19 +443,30 @@ same-origin frames. Some consequences worth knowing before you meet them:
 it has to be something that was not already true. Every frame that will be
 asked — the one the button was in, and the top document — is read *before*
 the click, and each is only ever compared against its own earlier reading.
-Two things count:
 
-- a confirmation in a status, alert, or heading region ("application
-  submitted", "thank you for applying", and similar) that the page **was
-  not already showing** — a *region* that was not shaped like a confirmation
-  before the click and now is, so a standing "you have applied to 4 roles
-  this month" panel that counts, cycles, or rebuilds itself is the same
-  panel it always was and confirms nothing, however its wording changes, or
-- a navigation to a destination only a submitted application arrives at
-  (`/thank-you`, `/confirmation`, `?submitted=true`) **together with** the
-  form the button belonged to having disappeared. A query string has to say
-  so affirmatively: `?submitted=false`, `?submitted=`, and
-  `/application/not-submitted` are pages reporting a draft, not a success.
+**Nothing is confirmed on words alone.** Every submission needs one of two
+*structural* facts:
+
+- the form the button belonged to is **gone from that frame, or no longer
+  visible in it**, or
+- the frame **navigated to a destination only a submitted application
+  arrives at** (`/thank-you`, `/confirmation`, `?submitted=true`). A query
+  string outranks the path in both directions: `?submitted=false`,
+  `?submitted=`, `/application/not-submitted`, and even
+  `/thank-you?submitted=false` are pages reporting a draft, not a success.
+
+and then either of those two facts *together*, or one of them beside a
+confirmation the page **was not already showing** — text in a status, alert,
+or heading region ("application submitted", "thank you for applying", and
+similar) belonging to a *region* that was not shaped like a confirmation
+before the click and now is.
+
+That last clause is doing real work. A standing "you have applied to 4 roles
+this month" panel is the same panel it always was, however its wording changes
+and however the page rebuilds it. And even a genuinely new banner is
+not a submission while the form it is about is still sitting there filled in,
+because a page that had taken an application would not go on showing the form
+it took.
 
 **A navigation on its own is not one of them**, and neither is the form
 disappearing on its own. A board that bounces an expired session to a
@@ -774,8 +785,10 @@ The offline test system has four pieces:
   press (including refusing one whose field was never filled). A fourth,
   `live_status.html`, is the page that never holds still: a standing "thank
   you for applying to N roles this month" panel that counts on a timer,
-  rebuilds itself rather than editing its text, or bumps the moment the
-  button is pressed.
+  rebuilds itself rather than editing its text (with an id, or with nothing
+  at all to recognise it by), or bumps the moment the button is pressed. It
+  also answers a press with a confirmation and *no* other change, which is
+  not a submission, and with a confirmation and the form hidden, which is.
 
 **No test submits a real application.** One suite does launch a browser:
 
@@ -810,11 +823,14 @@ against a control it never went into.
 The page whose thank-you panel keeps changing is driven there too, because
 this is the one thing no double can imitate: the identity that makes a
 region *one* region has to survive its text being rewritten, its node being
-thrown away and rebuilt, and its having no id for anything to hold on to.
-Each of those confirmed a submission under the old rule. The ordinary case
-is checked on the same restless page: one neutral `role="status"` region
-that the click fills in still confirms, while the panel beside it counts
-throughout and is still not what confirmed anything.
+thrown away and rebuilt, and its having no id for anything to hold on to —
+including all three at once. Each of those confirmed a submission under the
+old rule. So did a confirmation appearing beside a form that never went
+anywhere, which is checked there as a refusal. The ordinary case is on the
+same restless page: one neutral `role="status"` region that the click fills
+in, with the form it was about hidden along with it, still confirms — while
+the panel beside it counts throughout and is still not what confirmed
+anything.
 
 Only the board adapter and the listing URL are faked there, and both in the
 direction of safety: the adapter never navigates a real board, and the

@@ -1162,7 +1162,11 @@ def submitting_frame(
                 baseline if baseline is not None else state(url=url),
                 after
                 if after is not None
-                else (state(url=url, confirmations=[CONFIRMED]),),
+                # What a page that took an application looks like: it says
+                # so, and the form it took is not there any more. Words on
+                # their own confirm nothing, so a default of words alone
+                # would make every test below a test of a refusal.
+                else (state(url=url, confirmations=[CONFIRMED], marked=False),),
             ),
         },
         parent=parent,
@@ -1555,7 +1559,9 @@ class TestReportingASubmission:
     """`submitted` is a claim about the page, never about the click."""
 
     async def test_a_confirmation_that_appears_after_the_click_is_enough(self) -> None:
-        frame = submitting_frame(after=(state(confirmations=[CONFIRMED]),))
+        frame = submitting_frame(
+            after=(state(confirmations=[CONFIRMED], marked=False),)
+        )
 
         outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
 
@@ -1576,7 +1582,11 @@ class TestReportingASubmission:
 
     async def test_a_signal_that_arrives_late_is_still_waited_for(self) -> None:
         frame = submitting_frame(
-            after=(state(), state(), state(confirmations=[CONFIRMED])),
+            after=(
+                state(),
+                state(),
+                state(confirmations=[CONFIRMED], marked=False),
+            ),
         )
 
         assert (await submitter().submit(FakePage(frame), APPROVED, permit())).submitted
@@ -1709,7 +1719,10 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
         frame = submitting_frame(
             baseline=standing,
             after=(
-                state(confirmations=["Thank you for applying to our team", CONFIRMED]),
+                state(
+                    marked=False,
+                    confirmations=["Thank you for applying to our team", CONFIRMED],
+                ),
             ),
         )
 
@@ -1799,7 +1812,12 @@ class TestWhatMakesAConfirmationANewOne:
         """
         frame = submitting_frame(
             baseline=state(confirmations=[]),
-            after=(state(confirmations=[region(CONFIRMED, "#form-status")]),),
+            after=(
+                state(
+                    marked=False,
+                    confirmations=[region(CONFIRMED, "#form-status")],
+                ),
+            ),
         )
 
         outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
@@ -1815,10 +1833,11 @@ class TestWhatMakesAConfirmationANewOne:
             ),
             after=(
                 state(
+                    marked=False,
                     confirmations=[
                         region(TICKING.format(count=4), "#applied-count"),
                         region(CONFIRMED, "#form-status"),
-                    ]
+                    ],
                 ),
             ),
         )
@@ -1852,6 +1871,104 @@ class TestWhatMakesAConfirmationANewOne:
         )
 
         assert not verdict.signal
+
+    def test_a_confirmation_with_the_form_still_sitting_there_confirms_nothing(
+        self,
+    ) -> None:
+        """Words are the weakest evidence a page can offer.
+
+        Every rule about *which* region said it is a rule about text in the
+        end, and a page that has genuinely taken an application does not go
+        on showing the form it took. So a new confirmation has to be
+        corroborated by something structural: the form the button belonged to
+        gone or hidden, or a destination only a submission arrives at.
+        """
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(
+                url=MAIN_URL,
+                marked=True,
+                confirmations=(ConfirmationRegion("#form-status", CONFIRMED),),
+            ),
+        )
+
+        assert not verdict.signal
+        assert not verdict.refusal
+
+    def test_a_confirmation_and_the_form_gone_together_confirm(self) -> None:
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(
+                url=MAIN_URL,
+                marked=False,
+                confirmations=(ConfirmationRegion("#form-status", CONFIRMED),),
+            ),
+        )
+
+        assert verdict.signal
+        assert CONFIRMED in verdict.signal
+
+    def test_a_confirmation_at_a_success_destination_confirms(self) -> None:
+        """The case where there is no marked form left to watch.
+
+        A control in a shadow root with no enclosing form, or a board that
+        replaces the whole document, leaves nothing marked. An affirmative
+        destination is the other corroboration, and this is what it is for.
+        """
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=False),
+            PageState(
+                url="https://ats.example.com/thank-you",
+                marked=False,
+                confirmations=(ConfirmationRegion("#banner", CONFIRMED),),
+            ),
+        )
+
+        assert verdict.signal
+
+    def test_a_confirmation_a_denied_destination_carries_confirms_nothing(self) -> None:
+        """`/thank-you?submitted=false` is the page denying it in the URL."""
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=False),
+            PageState(
+                url="https://ats.example.com/thank-you?submitted=false",
+                marked=False,
+                confirmations=(ConfirmationRegion("#banner", CONFIRMED),),
+            ),
+        )
+
+        assert not verdict.signal
+
+    async def test_a_panel_that_ticks_beside_a_form_that_stays_never_confirms(
+        self,
+    ) -> None:
+        """Both rules at once, which is the shape of the real page.
+
+        The panel is one region however it repaints, *and* the form it is
+        sitting next to never went anywhere. Either rule alone refuses this;
+        both are here because the panel is the case where a text comparison
+        found something new every fifth of a second.
+        """
+        frame = submitting_frame(
+            baseline=state(
+                confirmations=[region(TICKING.format(count=1), "#applied-count")]
+            ),
+            after=tuple(
+                state(
+                    marked=True,
+                    confirmations=[
+                        region(TICKING.format(count=n), "#applied-count"),
+                    ],
+                )
+                for n in range(2, 10)
+            ),
+        )
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(
+            FakePage(frame), APPROVED, permit()
+        )
+
+        assert outcome.submitted is False
 
     def test_a_region_that_cannot_be_identified_confirms_nothing(self) -> None:
         """Silence from the reading, not a submission on an unjudgeable one."""
@@ -2056,7 +2173,9 @@ class TestThePageSayingItRefusedTheSubmission:
         blockers = ['a validation message: "All fields are required"']
         frame = submitting_frame(
             baseline=state(blockers=blockers),
-            after=(state(blockers=blockers, confirmations=[CONFIRMED]),),
+            after=(
+                state(blockers=blockers, confirmations=[CONFIRMED], marked=False),
+            ),
         )
 
         assert (await submitter().submit(FakePage(frame), APPROVED, permit())).submitted
@@ -2490,3 +2609,14 @@ class TestTheSubmitterScripts:
     def test_the_target_script_marks_the_form_it_is_watching(self) -> None:
         """"That form disappeared" needs a way to say *which* form."""
         assert "setAttribute" in SUBMIT_TARGET_SCRIPT
+
+    def test_the_form_is_looked_for_outside_the_shadow_root_too(self) -> None:
+        """A control in a shadow root is not associated with its host's form.
+
+        `closest` stops at the boundary, so the form a component-framework
+        ATS's submit button sits inside was never marked — and since the form
+        going is what corroborates a confirmation, that whole shape had no
+        way to be confirmed at all.
+        """
+        assert "getRootNode" in SUBMIT_TARGET_SCRIPT
+        assert ".host" in SUBMIT_TARGET_SCRIPT

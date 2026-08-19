@@ -195,6 +195,9 @@ class TestTheWarnings:
         # The freshness rule an operator can act on: a panel that keeps
         # changing its own wording is not a stream of confirmations.
         assert "however its wording changes" in section
+        # And the rule that makes the wording secondary in the first place.
+        assert "Nothing is confirmed on words alone" in section
+        assert "no longer\n  visible" in section or "no longer visible" in section
 
     def test_a_refusal_before_the_press_is_documented_as_costing_nothing(
         self,

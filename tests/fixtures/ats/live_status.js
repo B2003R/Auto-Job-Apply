@@ -18,9 +18,12 @@
 //               in the document it is.
 //   optimistic  the panel counts this application the instant the button is
 //               pressed, before anybody has accepted it. Still swallowed.
-//   confirms    the panel ticks, and the press fills the neutral status
-//               region with a real confirmation — the ordinary case, which
-//               has to keep working.
+//   announces   the press fills the neutral status region with a real
+//               confirmation and leaves the form sitting there, filled in.
+//               A page that had taken an application would not.
+//   confirms    the panel ticks, the press fills the neutral status region
+//               with a real confirmation, and the form it took is hidden —
+//               the ordinary case, which has to keep working.
 (() => {
   const CONFIRMATION_TEXT = "Your application was submitted. Thank you for applying.";
   const TICK_MS = 60;
@@ -81,11 +84,17 @@
       bump();
       return;
     }
-    if (mode === "confirms") {
+    if (mode === "announces" || mode === "confirms") {
       // A tick later, so the submitter observes the region changing rather
       // than having changed.
       setTimeout(() => {
         status.textContent = CONFIRMATION_TEXT;
+        if (mode === "confirms") {
+          // Hidden rather than removed: "the form is no longer visible" is
+          // the same fact, and a fixture that only ever removed it would
+          // leave that half of the rule undriven.
+          form.hidden = true;
+        }
       }, 30);
     }
   });

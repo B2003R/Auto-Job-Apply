@@ -496,9 +496,17 @@ def _fresh_confirmations(
 def submission_verdict(before: PageState, after: PageState) -> SubmitVerdict:
     """Judge one target against its own pre-click state.
 
-    Only two things are accepted as a submission. A confirmation the page
-    was *not* already showing, or a destination only a submission arrives
-    at *together with* the form the control belonged to being gone.
+    Nothing is accepted on words alone. Every submission needs one of the
+    two *structural* facts — the form the control belonged to gone from this
+    target or no longer visible in it, or a navigation to a destination only
+    a submission arrives at — and then either a new confirmation beside it,
+    or both facts together.
+
+    Text is the weakest evidence a page can offer, and every rule about
+    which region said it is still a rule about text: a page that has
+    genuinely taken an application does not go on showing the form it took.
+    So a standing panel that repaints itself next to a form still sitting
+    there cannot confirm anything, whatever it says and however it changes.
 
     A confirmation is new when a *region* that was not already shaped like
     one now is, and it says something the target was not already saying.
@@ -535,16 +543,26 @@ def submission_verdict(before: PageState, after: PageState) -> SubmitVerdict:
             )
         )
 
+    # The two structural facts. Either one corroborates a confirmation, and
+    # together they are a submission on their own.
+    form_gone = before.marked and not after.marked
+    arrived = moved and is_success_destination(after.url)
+
     fresh = _fresh_confirmations(before, after)
-    if fresh:
+    if fresh and (form_gone or arrived):
         return SubmitVerdict(
             signal=(
                 "the page showed a confirmation it was not showing before the "
-                f"click: {fresh[0].text!r}"
+                f"click: {fresh[0].text!r}, and "
+                + (
+                    "the form the submit control belonged to is gone"
+                    if form_gone
+                    else f"it is at {after.url}, which only a submission arrives at"
+                )
             )
         )
 
-    if moved and not after.marked and before.marked and is_success_destination(after.url):
+    if form_gone and arrived:
         return SubmitVerdict(
             signal=(
                 f"the page navigated to {after.url}, which only a submission "
@@ -1065,6 +1083,13 @@ SUBMIT_RESOLVE_SCRIPT = (
 
 #: Marks the form the submit control belongs to, so "that form disappeared"
 #: can name *which* form rather than "some form is missing".
+#:
+#: The search crosses shadow boundaries outwards. A control inside a shadow
+#: root is not form-associated with the form around its *host*, and
+#: `closest` stops at the boundary — so a component-framework ATS, whose
+#: submit button is exactly that, had no form to watch at all. Since the
+#: form going is what corroborates a confirmation, that left the whole of
+#: that shape unconfirmable.
 SUBMIT_TARGET_SCRIPT = (
     """
 (() => {
@@ -1072,12 +1097,30 @@ SUBMIT_TARGET_SCRIPT = (
     + PAGE_TRAVERSAL_JS
     + SUBMIT_CANDIDATES_JS
     + """
+  const MAX_HOST_HOPS = 8;
+
+  const enclosingForm = (el) => {
+    let node = el;
+    for (let hop = 0; hop < MAX_HOST_HOPS; hop += 1) {
+      const found = node.form || (node.closest ? node.closest('form') : null);
+      if (found) {
+        return found;
+      }
+      const root = node.getRootNode ? node.getRootNode() : null;
+      const host = root && root.host ? root.host : null;
+      if (!host) {
+        return null;
+      }
+      node = host;
+    }
+    return null;
+  };
+
   const { accepted } = collectSubmitCandidates();
   if (accepted.length !== 1) {
     return { ok: false, marked: false };
   }
-  const el = accepted[0].el;
-  const form = el.form || (el.closest ? el.closest('form') : null);
+  const form = enclosingForm(accepted[0].el);
   if (form) {
     form.setAttribute('data-jobright-submit-target', '1');
   }

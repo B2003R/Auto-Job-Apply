@@ -564,6 +564,24 @@ class TestAConfirmationShapedPanelThatWillNotHoldStill:
         assert await self._panel(page) != before
         assert outcome.submitted is False
 
+    async def test_a_confirmation_beside_a_form_that_stayed_confirms_nothing(
+        self, live_status_pages: Any
+    ) -> None:
+        """The words arrive; the form they are about does not go anywhere.
+
+        This is the case where every rule about *which* region spoke is
+        still a rule about text. A page that had taken an application would
+        not go on showing the form it took, so the confirmation needs
+        something structural beside it before it is one.
+        """
+        page = await live_status_pages("announces")
+
+        outcome = await self._press(page, wait_ms=2_000)
+
+        assert await page.locator("#form-status").inner_text() != "Ready to submit."
+        assert outcome.submitted is False
+        assert await page.locator("#application-form").is_visible()
+
     async def test_a_neutral_status_region_becoming_a_confirmation_confirms(
         self, live_status_pages: Any
     ) -> None:
@@ -571,8 +589,11 @@ class TestAConfirmationShapedPanelThatWillNotHoldStill:
 
         One empty `role="status"` region that the click fills in is how most
         of the web confirms anything, and it is not in the confirmation
-        baseline because it was not shaped like one. The panel beside it
-        keeps counting throughout, and is still not what confirms.
+        baseline because it was not shaped like one. Here the form it was
+        about is hidden with it — not removed, so that the "no longer
+        visible" half of the corroboration is the half being driven. The
+        panel beside it keeps counting throughout, and is still not what
+        confirms.
         """
         page = await live_status_pages("confirms")
         before = await self._panel(page)
@@ -583,6 +604,7 @@ class TestAConfirmationShapedPanelThatWillNotHoldStill:
         assert "Your application was submitted" in outcome.reason
         assert "this month" not in outcome.reason
         assert await self._panel(page) != before
+        assert await page.locator("#application-form").is_visible() is False
 
 
 async def _shadow_value(page: Any) -> str:
