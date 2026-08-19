@@ -523,6 +523,71 @@ class TestMidFlightThreads:
             ApplicationStatus.AWAITING_APPROVAL
         )
 
+    async def test_a_worker_that_cannot_see_the_checkpoint_abandons_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """The worst shape this failure takes: two workers, one blind.
+
+        The second worker's checkpoint file is empty — a lost volume, a
+        process pointed at the wrong directory — so the thread looks to it
+        like a decision with nothing left to apply, which is a state it is
+        entitled to abandon. Meanwhile the first worker is inside `submit`,
+        filing the application for real.
+
+        Abandoning writes `skipped` to the application and the queue, and
+        `skipped` is terminal. The winner's `submitted` write arrives second
+        and storage refuses it, so the record ends up saying the applicant
+        withdrew from a job they applied for. The lease has to be taken
+        before that judgement is acted on, not after.
+        """
+        world = build_world(tmp_path)
+        queue_id = world.enqueue()
+        submitting = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def slow(page: Any) -> SubmitOutcome:
+            submitting.set()
+            await finish.wait()
+            return SubmitOutcome(submitted=True, reason="filed after a long pause")
+
+        async with world.runner(owner="the-real-worker") as winner:
+            staged = await winner.run_application(queue_id)
+            world.submitter.submit = slow  # type: ignore[method-assign]
+            resuming = asyncio.create_task(
+                winner.resume_application(
+                    staged.thread_id, approve(staged.application_id)
+                )
+            )
+            await asyncio.wait_for(submitting.wait(), timeout=5)
+
+            elsewhere = tmp_path / "fresh" / "checkpoints.sqlite"
+            async with world.runner(elsewhere, owner="the-blind-worker") as loser:
+                with pytest.raises(ResumeInProgress):
+                    await asyncio.wait_for(
+                        loser.resume_application(
+                            staged.thread_id, approve(staged.application_id)
+                        ),
+                        timeout=2,
+                    )
+
+            mid_flight = world.db.get_application(staged.application_id or 0)
+            assert mid_flight is not None
+            assert mid_flight.status is ApplicationStatus.AWAITING_APPROVAL
+
+            finish.set()
+            result = await asyncio.wait_for(resuming, timeout=5)
+
+        assert result.status is RunStatus.SUBMITTED
+
+        application = world.db.get_application(staged.application_id or 0)
+        assert application is not None
+        assert application.status is ApplicationStatus.SUBMITTED
+
+        item = world.db.get_queue_item(queue_id)
+        assert item is not None
+        assert item.state is QueueState.COMPLETED
+        assert item.error_reason != SkipKind.STALE_APPROVAL.value
+
     async def test_a_run_refuses_to_continue_it_while_another_owner_holds_it(
         self, tmp_path: Path
     ) -> None:
@@ -797,6 +862,9 @@ class TestFinishedRecordsAreNotRestaged:
         application = world.db.get_application_by_thread(staged.thread_id)
         assert application is not None
         assert application.status is ApplicationStatus.SKIPPED
+        # Abandoning writes, so it runs under the lease; the lease still has
+        # to be handed back on the way out.
+        assert world.db.get_lease(staged.thread_id) is None
 
     async def test_an_undecided_application_with_no_checkpoint_starts_again(
         self, world: World

@@ -1412,9 +1412,11 @@ class ApplicationRunner:
             config = _config(thread_id)
             state = await self._graph.aget_state(config)
             if state.created_at is None and application is not None:
-                stale = self._abandon_stale_approval(thread_id, item, application)
-                if stale is not None:
-                    return stale
+                recorded = self._service.recorded(application.id)
+                if recorded is not None:
+                    return self._abandon_stale_approval(
+                        thread_id, item, application, recorded
+                    )
             if state.created_at is not None:
                 if state.interrupts or not state.next:
                     return self._from_state(thread_id, item.id, state)
@@ -1603,29 +1605,35 @@ class ApplicationRunner:
         does not match what was decided is a conflict whoever owns the
         thread, and a thread that never reached the gate cannot be approved
         at all.
+
+        Telling the three apart is a judgement about a *checkpoint*, and a
+        checkpoint is a per-worker view: a worker whose file is missing sees
+        an application it is entitled to abandon where another worker, at
+        that same moment, is inside `submit`. So the lease is taken before
+        the judgement is acted on, and the checkpoint is read again once it
+        is held. Reading first and writing after is what let a blind worker
+        stamp `skipped` on an application that was being filed.
         """
         existing = self._require_matching_approval(thread_id, application, decision)
-        if state.created_at is None:
-            stale = self._abandon_stale_approval(
-                thread_id,
-                self._deps.db.get_queue_item(application.queue_id),
-                application,
-                approval=existing,
-            )
-            if stale is not None:
-                return stale
-            return self._from_state(thread_id, application.queue_id, state)
-
-        if not state.next:
-            return self._from_state(thread_id, application.queue_id, state)
-
         attempt = self._deps.db.acquire_lease(
             thread_id, self._owner, ttl=self._ttl, now=self._now()
         )
         if not attempt.acquired:
             raise ResumeInProgress(thread_id, application.id, attempt.lease)
+
         async with self._holding(thread_id):
-            return await self._continue(thread_id, application, _config(thread_id))
+            config = _config(thread_id)
+            fresh = await self._graph.aget_state(config)
+            if fresh.created_at is None:
+                return self._abandon_stale_approval(
+                    thread_id,
+                    self._deps.db.get_queue_item(application.queue_id),
+                    application,
+                    existing,
+                )
+            if not fresh.next:
+                return self._from_state(thread_id, application.queue_id, fresh)
+            return await self._continue(thread_id, application, config)
 
     async def _continue_or_report(
         self,
@@ -1657,8 +1665,8 @@ class ApplicationRunner:
         thread_id: str,
         item: QueueItem | None,
         application: ApplicationRecord,
-        approval: ApprovalRecord | None = None,
-    ) -> RunResult | None:
+        approval: ApprovalRecord,
+    ) -> RunResult:
         """End an application whose decision can no longer be applied.
 
         A recorded decision with no checkpoint left to resume is the one
@@ -1671,11 +1679,12 @@ class ApplicationRunner:
         So it is abandoned, with a reason on the queue row. The listing can
         be queued again, which opens a new thread and asks for a decision of
         its own.
-        """
-        recorded = approval or self._service.recorded(application.id)
-        if recorded is None:
-            return None
 
+        Writes, so callers hold the lease. The decision is a parameter
+        rather than something looked up here, because "is there a recorded
+        approval at all" is the question that decides whether this is the
+        right thing to do, and the caller has to have answered it already.
+        """
         reason = SkipKind.STALE_APPROVAL.value
         self._deps.db.update_application(
             application.id, status=ApplicationStatus.SKIPPED
@@ -1683,12 +1692,21 @@ class ApplicationRunner:
         self._deps.db.update_queue_state(
             application.queue_id, QueueState.SKIPPED, reason
         )
-        return _recorded_result(
+        # Re-read rather than assume: if storage refused the writes above,
+        # this application was already finished by somebody else and their
+        # outcome is the one to report, not the abandonment.
+        outcome = _recorded_result(
             thread_id,
             self._deps.db.get_queue_item(application.queue_id) or item,
             self._deps.db.get_application(application.id),
-            recorded,
+            approval,
         )
+        if outcome is None:  # pragma: no cover - both rows were just written
+            raise RuntimeError(
+                f"application {application.id} was abandoned but storage "
+                "reports it as neither skipped nor otherwise finished"
+            )
+        return outcome
 
     def _require_matching_approval(
         self,
