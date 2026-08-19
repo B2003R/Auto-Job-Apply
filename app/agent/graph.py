@@ -303,10 +303,17 @@ class ExecutionInProgress(Exception):
     told to come back rather than being allowed anywhere near the graph.
     """
 
-    def __init__(self, thread_id: str, lease: ExecutionLease | None = None) -> None:
+    def __init__(
+        self,
+        thread_id: str,
+        lease: ExecutionLease | None = None,
+        *,
+        subject: str | None = None,
+    ) -> None:
         self.thread_id = thread_id
         self.lease = lease
-        super().__init__(_in_progress_detail(thread_id, lease))
+        where = _in_progress_detail(thread_id, lease)
+        super().__init__(f"{subject}: {where}" if subject else where)
 
 
 class ResumeInProgress(ExecutionInProgress, ApprovalError):
@@ -324,11 +331,7 @@ class ResumeInProgress(ExecutionInProgress, ApprovalError):
         lease: ExecutionLease | None = None,
     ) -> None:
         self.application_id = application_id
-        super().__init__(thread_id, lease)
-        self.args = (
-            f"Application {application_id}: "
-            + _in_progress_detail(thread_id, lease),
-        )
+        super().__init__(thread_id, lease, subject=f"Application {application_id}")
 
 
 def _in_progress_detail(thread_id: str, lease: ExecutionLease | None) -> str:
@@ -430,6 +433,16 @@ class RunResult:
     @property
     def submitted(self) -> bool:
         return self.status is RunStatus.SUBMITTED
+
+    @property
+    def in_progress(self) -> bool:
+        """Nothing happened here: another worker owns this thread.
+
+        Worth branching on separately from every other status, because a
+        caller that treats it as an outcome would record a conclusion about
+        an application it never touched.
+        """
+        return self.status is RunStatus.IN_PROGRESS
 
 
 @dataclass(frozen=True)

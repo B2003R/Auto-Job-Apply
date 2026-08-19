@@ -312,7 +312,9 @@ class TestExecutionOwnership:
         async with world.runner() as runner:
             result = await runner.run_application(queue_id)
 
+        assert result.in_progress is True
         assert result.status is RunStatus.IN_PROGRESS
+        assert result.awaiting_approval is False
         assert "worker-elsewhere" in (result.detail or "")
         assert world.adapter.started == 0
         assert world.adapter.opened == []
