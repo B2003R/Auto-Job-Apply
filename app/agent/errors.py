@@ -298,6 +298,25 @@ class TeardownError(BrowserError):
         )
 
 
+class PageUnavailable(BrowserError):
+    """Raised when the page an application was staged on is no longer held.
+
+    A staged application lives in a specific tab: the form is filled, the
+    approval gate is what stands between it and the submit button. The
+    checkpoint survives a restart but the tab does not, so a resume that
+    finds no page must fail loudly rather than "submit" against nothing.
+    """
+
+    def __init__(self, thread_id: str) -> None:
+        self.thread_id = thread_id
+        super().__init__(
+            f"No staged page is still held for thread {thread_id!r}. The "
+            "application was staged in a browser tab that is gone (most "
+            "likely the worker restarted), so there is nothing left to submit; "
+            "queue the listing again to stage it afresh."
+        )
+
+
 class SafetyError(Exception):
     """Base class for refusals that protect the account or the applicant.
 
@@ -331,6 +350,56 @@ class RateLimitExceeded(SafetyError):
             f"recorded for this UTC day. The count resets at "
             f"{next_reset_at.isoformat()}; there is no runtime override, so either "
             "wait for the reset or raise the configured cap."
+        )
+
+
+class UnknownAtsLayout(SafetyError):
+    """Raised when the page an Apply click landed on is not a known ATS.
+
+    Every filling, attribution, and submission decision this project makes
+    assumes a recognised applicant tracking system. On an unrecognised page
+    the same code would be typing into and clicking controls it has never
+    been calibrated against, in someone's name, so the application is
+    abandoned instead.
+    """
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        super().__init__(
+            f"No supported applicant tracking system was recognised at {url}. "
+            "Refusing to fill or submit a form whose layout has never been "
+            "verified."
+        )
+
+
+class CaptchaEncountered(SafetyError):
+    """Raised when a page presents a human-verification challenge.
+
+    Solving one automatically is exactly the behaviour the challenge exists
+    to stop, so the application is abandoned and left for the applicant.
+    """
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        super().__init__(
+            f"A human-verification challenge is present ({marker}). This "
+            "application is abandoned rather than answered automatically."
+        )
+
+
+class LoginWallEncountered(SafetyError):
+    """Raised when a page asks for credentials before showing the form.
+
+    Nothing here types a password into a page: credentials belong to the
+    applicant and to the browser profile they already signed in with.
+    """
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+        super().__init__(
+            f"The page is asking for a sign-in before the application form "
+            f"({marker}). Sign in yourself in the dedicated profile and queue "
+            "the listing again; no credentials are ever entered from here."
         )
 
 

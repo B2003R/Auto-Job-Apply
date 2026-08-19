@@ -28,6 +28,10 @@ class ApplicationStatus(str, Enum):
     AWAITING_APPROVAL = "awaiting_approval"
     SUBMITTED = "submitted"
     REJECTED = "rejected"
+    # Distinct from FAILED: the application was abandoned on purpose (an
+    # unrecognised ATS, a captcha, a login wall, a reached cap), not broken.
+    # Conflating the two would make a log of genuine malfunctions unreadable.
+    SKIPPED = "skipped"
     FAILED = "failed"
 
 

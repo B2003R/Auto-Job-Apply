@@ -248,6 +248,7 @@ class TestDecisionValidation:
             ApplicationStatus.STAGING,
             ApplicationStatus.SUBMITTED,
             ApplicationStatus.REJECTED,
+            ApplicationStatus.SKIPPED,
             ApplicationStatus.FAILED,
         ],
     )
