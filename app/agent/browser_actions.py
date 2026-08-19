@@ -435,35 +435,155 @@ WRITE_SCRIPT = (
 ).strip()
 
 
+# --------------------------------------------------------------------------
+# What counts as a challenge, shared between the guard and the submitter
+# --------------------------------------------------------------------------
+
+#: The markup a challenge *frame* or an enforcement interstitial puts on a
+#: page. Each of these only exists while somebody is being asked to prove
+#: they are human: `bframe` is reCAPTCHA's challenge popup (as opposed to
+#: `anchor`, which is the checkbox or the invisible hook), and the rest are
+#: products that take over the page rather than sit in a corner of it.
+CAPTCHA_CHALLENGE_SELECTORS: tuple[str, ...] = (
+    'iframe[src*="recaptcha/api2/bframe"]',
+    'iframe[src*="recaptcha/enterprise/bframe"]',
+    'iframe[title*="recaptcha challenge" i]',
+    'iframe[src*="hcaptcha.com"][src*="challenge"]',
+    "#hcaptcha-challenge",
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="arkoselabs.com"]',
+    'iframe[src*="funcaptcha"]',
+    "#arkose-enforcement",
+    'iframe[src*="geo.captcha-delivery.com"]',
+    "#px-captcha",
+    "#captcha-challenge",
+)
+
+#: Widget containers, which count only once the page has actually rendered
+#: one at a size a person could use. The same container is what an invisible
+#: or score-based widget is mounted in, and that one renders at 0x0.
+CAPTCHA_WIDGET_SELECTORS: tuple[str, ...] = (
+    "div.g-recaptcha",
+    "div.h-captcha",
+    "div.cf-turnstile",
+)
+
+#: Markup that is present whether or not anybody was ever challenged, and
+#: is therefore never evidence of one. `.grecaptcha-badge` is the v3 corner
+#: badge, `data-size="invisible"` is the widget declaring that it will not
+#: show itself, and `anchor` is the checkbox/hook iframe — reCAPTCHA v3
+#: creates one on every page it scores.
+PASSIVE_CAPTCHA_SELECTORS: tuple[str, ...] = (
+    ".grecaptcha-badge",
+    '[data-size="invisible"]',
+    'iframe[src*="recaptcha/api2/anchor"]',
+    'iframe[src*="recaptcha/enterprise/anchor"]',
+)
+
+#: Answers "is somebody being asked to prove they are human *right now*",
+#: as the selector that says so, or an empty string. Spliced into the guard
+#: and into the submitter's post-click signal script, so a challenge that
+#: appears in response to the click is read by the same rule.
+#:
+#: Not a callable expression: a sequence of `const` declarations meant to be
+#: pasted inside a script body that has already spliced `PAGE_TRAVERSAL_JS`.
+_ACTIVE_CAPTCHA_JS = """
+  const CAPTCHA_CHALLENGE_SELECTORS = __CAPTCHA_CHALLENGE_SELECTORS__;
+  const CAPTCHA_WIDGET_SELECTORS = __CAPTCHA_WIDGET_SELECTORS__;
+  const PASSIVE_CAPTCHA_SELECTOR = __PASSIVE_CAPTCHA_SELECTORS__.join(', ');
+  const CAPTCHA_DIALOG_SELECTOR = '[role="dialog"], [aria-modal="true"], dialog[open]';
+  const CAPTCHA_HINT_SELECTOR = [
+    'iframe[src*="captcha" i]',
+    'div.g-recaptcha',
+    'div.h-captcha',
+    'div.cf-turnstile',
+  ].join(', ');
+
+  // A rendered reCAPTCHA checkbox is 304x78 and an hCaptcha one is 300x74.
+  // An invisible widget, and a v3 one, render at 0x0 in a container that is
+  // otherwise identical markup, which is why size is part of the rule.
+  const MIN_CAPTCHA_WIDGET_WIDTH = 100;
+  const MIN_CAPTCHA_WIDGET_HEIGHT = 40;
+
+  const queryAll = (root, selector) => {
+    try {
+      return Array.from(root.querySelectorAll(selector));
+    } catch (error) {
+      return [];
+    }
+  };
+
+  const isPassiveCaptcha = (el) => {
+    try {
+      if (el.matches && el.matches(PASSIVE_CAPTCHA_SELECTOR)) {
+        return true;
+      }
+      return Boolean(el.closest && el.closest('.grecaptcha-badge'));
+    } catch (error) {
+      return false;
+    }
+  };
+
+  const isInteractiveSize = (el) => {
+    const rect = el.getBoundingClientRect();
+    return rect.width >= MIN_CAPTCHA_WIDGET_WIDTH
+      && rect.height >= MIN_CAPTCHA_WIDGET_HEIGHT;
+  };
+
+  const activeCaptcha = (root) => {
+    for (const selector of CAPTCHA_CHALLENGE_SELECTORS) {
+      for (const el of queryAll(root, selector)) {
+        if (isVisible(el) && !isDisabled(el) && !isPassiveCaptcha(el)) {
+          return selector;
+        }
+      }
+    }
+    for (const selector of CAPTCHA_WIDGET_SELECTORS) {
+      for (const el of queryAll(root, selector)) {
+        if (isVisible(el) && !isPassiveCaptcha(el) && isInteractiveSize(el)) {
+          return selector;
+        }
+      }
+    }
+    for (const dialog of queryAll(root, CAPTCHA_DIALOG_SELECTOR)) {
+      if (!isVisible(dialog)) {
+        continue;
+      }
+      for (const el of queryAll(dialog, CAPTCHA_HINT_SELECTOR)) {
+        if (isVisible(el) && !isPassiveCaptcha(el)) {
+          return 'a captcha inside ' + CAPTCHA_DIALOG_SELECTOR;
+        }
+      }
+    }
+    return '';
+  };
+"""
+
+
+ACTIVE_CAPTCHA_JS = (
+    _ACTIVE_CAPTCHA_JS.replace(
+        "__CAPTCHA_CHALLENGE_SELECTORS__", json.dumps(list(CAPTCHA_CHALLENGE_SELECTORS))
+    )
+    .replace("__CAPTCHA_WIDGET_SELECTORS__", json.dumps(list(CAPTCHA_WIDGET_SELECTORS)))
+    .replace(
+        "__PASSIVE_CAPTCHA_SELECTORS__", json.dumps(list(PASSIVE_CAPTCHA_SELECTORS))
+    )
+)
+
+
 #: Reports whether this frame is presenting a human-verification challenge
 #: or asking for credentials, as the selector that matched.
 #:
-#: Structural only, and visible only. An invisible reCAPTCHA v3 badge sits
-#: on an enormous number of ordinary pages and challenges nobody; a hidden
-#: `g-recaptcha-response` textarea is present whether or not a challenge was
-#: ever shown. Neither is a reason to abandon somebody's application, so
-#: neither is a marker here.
+#: Structural only, and active only: see `ACTIVE_CAPTCHA_JS` for why a
+#: reCAPTCHA badge or anchor widget is not a reason to abandon somebody's
+#: application.
 GUARD_SCRIPT = (
     """
 (() => {
 """
     + PAGE_TRAVERSAL_JS
+    + ACTIVE_CAPTCHA_JS
     + """
-  const CAPTCHA_SELECTORS = [
-    'iframe[src*="recaptcha/"]',
-    'iframe[src*="hcaptcha.com"]',
-    'iframe[src*="challenges.cloudflare.com"]',
-    'iframe[src*="arkoselabs.com"]',
-    'iframe[src*="funcaptcha"]',
-    'iframe[src*="geo.captcha-delivery.com"]',
-    'div.g-recaptcha',
-    'div.h-captcha',
-    'div.cf-turnstile',
-    'div[data-sitekey]',
-    '#px-captcha',
-    '#captcha-challenge',
-  ];
-
   // A visible password field is the whole rule. A sign-in link in a header,
   // a form whose action merely contains "login", or a footer "Log in" is on
   // pages whose application form is perfectly fillable, and abandoning
@@ -494,7 +614,7 @@ GUARD_SCRIPT = (
   let captcha = '';
   let login = '';
   for (const entry of collectRoots(document, 0, '', [])) {
-    captcha = captcha || firstVisible(entry.root, CAPTCHA_SELECTORS);
+    captcha = captcha || activeCaptcha(entry.root);
     login = login || firstVisible(entry.root, LOGIN_SELECTORS);
   }
   return { captcha, login };

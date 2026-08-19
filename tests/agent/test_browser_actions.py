@@ -21,15 +21,20 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import json
 from typing import Any, Iterable, Mapping, Sequence
 
 import pytest
 
 from app.agent.browser_actions import (
+    ACTIVE_CAPTCHA_JS,
+    CAPTCHA_CHALLENGE_SELECTORS,
+    CAPTCHA_WIDGET_SELECTORS,
     CONFIRMATION_TEXT,
     FINAL_SUBMIT_PHRASES,
     NEVER_SUBMIT_NAME,
     GUARD_SCRIPT,
+    PASSIVE_CAPTCHA_SELECTORS,
     HUMAN_ONLY_FIELD_TYPES,
     SUBMIT_CANDIDATES_JS,
     SUBMIT_COUNT_SCRIPT,
@@ -842,7 +847,6 @@ class TestTheGuardScript:
             "arkoselabs",
             "g-recaptcha",
             "cf-turnstile",
-            "data-sitekey",
         ],
     )
     def test_it_knows_the_common_challenge_widgets(self, marker: str) -> None:
@@ -851,6 +855,98 @@ class TestTheGuardScript:
     def test_it_requires_a_challenge_to_be_visible(self) -> None:
         """An invisible reCAPTCHA v3 badge challenges nobody."""
         assert "isVisible(" in GUARD_SCRIPT
+
+
+class TestWhichCaptchaMarkupIsActuallyAChallenge:
+    """A widget on the page is not the same thing as a challenge on it.
+
+    reCAPTCHA v3 runs on an enormous number of ordinary pages, scoring
+    every visitor and challenging almost none of them. It leaves behind a
+    badge in the corner and an anchor iframe, both of which are present
+    whether or not anybody was ever asked anything. Treating either as a
+    challenge abandons applications that were perfectly fillable, and the
+    operator sees `captcha_required` with no way to know it was wrong.
+
+    The direction of the trade is deliberate. A missed challenge costs a
+    click that ends unconfirmed and an application somebody checks by hand;
+    a false one costs an application nobody ever finds out was fillable.
+    """
+
+    @pytest.mark.parametrize(
+        "passive",
+        [
+            ".grecaptcha-badge",
+            '[data-size="invisible"]',
+            'iframe[src*="recaptcha/api2/anchor"]',
+            'iframe[src*="recaptcha/enterprise/anchor"]',
+        ],
+    )
+    def test_the_passive_markup_v3_leaves_behind_is_named_as_passive(
+        self, passive: str
+    ) -> None:
+        assert passive in PASSIVE_CAPTCHA_SELECTORS
+
+    @pytest.mark.parametrize(
+        "selectors",
+        [
+            CAPTCHA_CHALLENGE_SELECTORS,
+            CAPTCHA_WIDGET_SELECTORS,
+            PASSIVE_CAPTCHA_SELECTORS,
+        ],
+    )
+    def test_each_list_is_the_one_the_page_applies(
+        self, selectors: tuple[str, ...]
+    ) -> None:
+        """Spliced in verbatim, so these tests are about the browser's rule."""
+        assert json.dumps(list(selectors)) in ACTIVE_CAPTCHA_JS
+
+    @pytest.mark.parametrize(
+        "passive", [".grecaptcha-badge", 'iframe[src*="recaptcha/api2/anchor"]']
+    )
+    def test_no_passive_marker_is_also_an_active_one(self, passive: str) -> None:
+        assert passive not in CAPTCHA_CHALLENGE_SELECTORS
+        assert passive not in CAPTCHA_WIDGET_SELECTORS
+
+    @pytest.mark.parametrize(
+        "active",
+        [
+            'iframe[src*="recaptcha/api2/bframe"]',
+            'iframe[src*="recaptcha/enterprise/bframe"]',
+            "#hcaptcha-challenge",
+            "#px-captcha",
+        ],
+    )
+    def test_the_challenge_frame_is_what_it_looks_for(self, active: str) -> None:
+        assert active in CAPTCHA_CHALLENGE_SELECTORS
+
+    def test_a_bare_site_key_is_no_longer_a_challenge_on_its_own(self) -> None:
+        """`data-sitekey` is the mount point, not the challenge.
+
+        It is on the anchor container of every invisible and v3 widget, so
+        matching it made the guard fire on pages that challenged nobody.
+        """
+        assert "div[data-sitekey]" not in ACTIVE_CAPTCHA_JS
+        assert "div[data-sitekey]" not in GUARD_SCRIPT
+
+    def test_a_widget_only_counts_when_a_person_could_use_it(self) -> None:
+        """An invisible widget renders at 0x0; a real checkbox is 304x78."""
+        assert "getBoundingClientRect" in ACTIVE_CAPTCHA_JS
+        assert "MIN_CAPTCHA_WIDGET_WIDTH" in ACTIVE_CAPTCHA_JS
+        assert "MIN_CAPTCHA_WIDGET_HEIGHT" in ACTIVE_CAPTCHA_JS
+
+    def test_a_challenge_held_in_a_modal_dialog_counts(self) -> None:
+        assert '[role="dialog"]' in ACTIVE_CAPTCHA_JS
+        assert '[aria-modal="true"]' in ACTIVE_CAPTCHA_JS
+
+    def test_the_guard_asks_this_one_question(self) -> None:
+        """One rule, spliced in, rather than two that could drift apart.
+
+        The submitter needs the same answer after its click — a challenge
+        that appears then is a submission that did not happen — so the rule
+        is a shared constant rather than a second selector list.
+        """
+        assert ACTIVE_CAPTCHA_JS in GUARD_SCRIPT
+        assert "activeCaptcha(" in GUARD_SCRIPT
 
     def test_a_password_field_is_the_login_marker(self) -> None:
         assert 'input[type="password"]' in GUARD_SCRIPT

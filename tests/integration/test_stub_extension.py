@@ -301,13 +301,14 @@ class TestTheStubExtensionInARealBrowser:
     async def test_the_guard_refuses_a_page_showing_a_challenge(
         self, page: Any
     ) -> None:
-        """The container Google's own snippet asks a site to put on the page.
+        """A widget the page has actually rendered at a usable size.
 
-        A `div.g-recaptcha` carrying a site key is what an operator writes;
-        the widget iframe appears inside it afterwards. Matching the
-        container means the challenge is recognised whether or not the
-        third-party script ever loaded — which, on a machine with no network,
-        it will not.
+        A `div.g-recaptcha` is what an operator writes and the widget
+        iframe appears inside it afterwards; matching the container means
+        the challenge is recognised whether or not the third-party script
+        ever loaded — which, on a machine with no network, it will not. The
+        rendered size is what separates this from the identical container an
+        invisible widget is mounted in.
         """
         await page.evaluate(
             """
@@ -324,6 +325,75 @@ class TestTheStubExtensionInARealBrowser:
 
         with pytest.raises(CaptchaEncountered):
             await PlaywrightPageGuard().inspect(page)
+
+    async def test_the_guard_ignores_the_markup_recaptcha_v3_leaves_everywhere(
+        self, page: Any, fixture_server: str
+    ) -> None:
+        """The false positive that would lose applications silently.
+
+        This is the exact markup a v3 or invisible-v2 site key produces on
+        a page that challenges nobody: a badge in the corner, an anchor
+        iframe inside it, and a widget container that declares itself
+        invisible — in a box the page has reserved for it anyway, which
+        plenty of layouts do. A guard that matched any of those would
+        abandon a perfectly fillable application and report
+        `captcha_required`, which nobody can tell was wrong.
+        """
+        await page.evaluate(
+            """
+            (base) => {
+              const badge = document.createElement('div');
+              badge.className = 'grecaptcha-badge';
+              badge.style.width = '256px';
+              badge.style.height = '60px';
+              const anchor = document.createElement('iframe');
+              anchor.src = base + '/ats/recaptcha/api2/anchor';
+              anchor.title = 'reCAPTCHA';
+              badge.appendChild(anchor);
+              document.body.appendChild(badge);
+
+              const invisible = document.createElement('div');
+              invisible.className = 'g-recaptcha';
+              invisible.setAttribute('data-sitekey', 'fixture-key');
+              invisible.setAttribute('data-size', 'invisible');
+              invisible.style.width = '304px';
+              invisible.style.height = '78px';
+              document.body.appendChild(invisible);
+            }
+            """,
+            loopback_only(fixture_server),
+        )
+
+        await PlaywrightPageGuard().inspect(page)
+
+    async def test_the_guard_refuses_the_challenge_frame_itself(
+        self, page: Any, fixture_server: str
+    ) -> None:
+        """The false negative that must not happen.
+
+        `bframe` is the popup reCAPTCHA opens when it has decided to
+        actually ask, as opposed to `anchor`, which it creates either way.
+        Served from the loopback fixture server so the frame is a real
+        same-origin document rather than one that never loads.
+        """
+        await page.evaluate(
+            """
+            (base) => {
+              const frame = document.createElement('iframe');
+              frame.src = base + '/ats/recaptcha/api2/bframe';
+              frame.title = 'recaptcha challenge expires in two minutes';
+              frame.style.width = '400px';
+              frame.style.height = '580px';
+              document.body.appendChild(frame);
+            }
+            """,
+            loopback_only(fixture_server),
+        )
+
+        with pytest.raises(CaptchaEncountered) as raised:
+            await PlaywrightPageGuard().inspect(page)
+
+        assert "bframe" in raised.value.marker
 
     async def test_a_frame_that_never_answers_does_not_hold_the_guard(
         self, page: Any
