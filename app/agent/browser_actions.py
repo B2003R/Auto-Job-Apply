@@ -759,6 +759,17 @@ class PlaywrightFieldWriter:
     def __init__(self, *, scanner: FormScanner | None = None) -> None:
         self._scanner = scanner
 
+    @property
+    def scanner(self) -> FormScanner | None:
+        """The scanner whose key derivation this writer checks against.
+
+        Readable so the wiring can be asserted on: a writer holding a
+        different scanner from the one that produced the fields would refuse
+        every write, and that is a property of `build_dependencies` worth a
+        test rather than a comment.
+        """
+        return self._scanner
+
     async def write(self, page: Any, field: FormField, value: str) -> bool:
         """Type `value` into `field`, reporting whether it landed.
 
@@ -964,6 +975,15 @@ class PlaywrightSubmitter:
         self._humanizer = Humanizer(sleep=sleep, rng=self._rng)
         self._max_area_fraction = max_area_fraction
         self._min_container_area = min_container_area
+
+    @property
+    def screenshots(self) -> Screenshotter | None:
+        """Where an unconfirmed submission's evidence goes, if anywhere.
+
+        An outcome nobody can check is the worst one this class produces, so
+        whether it can save an image is part of the wiring under test.
+        """
+        return self._screenshots
 
     async def submit(
         self, page: Any, authorization: SubmitAuthorization

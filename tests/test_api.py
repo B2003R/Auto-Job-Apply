@@ -18,12 +18,22 @@ from typing import Any, Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from app.agent.graph import ApplicationRunner, RunStatus, thread_id_for
+from app.agent.browser_actions import (
+    PlaywrightFieldWriter,
+    PlaywrightPageGuard,
+    PlaywrightSubmitter,
+)
+from app.agent.errors import SubmitNotAuthorized
+from app.agent.form_scanner import FormField
+from app.agent.graph import (
+    ApplicationRunner,
+    RunStatus,
+    SubmitAuthorization,
+    thread_id_for,
+)
 from app.config import Settings
-from app.agent.errors import BrowserError
 from app.main import (
     ApplicationWorker,
-    ComponentNotWired,
     WorkerNotReady,
     build_dependencies,
     create_app,
@@ -954,51 +964,100 @@ class TestTheShippedWiring:
     """What `build_dependencies` actually hands the graph in production.
 
     Every other test in this file replaces the browser-facing components
-    with fakes, which is what makes them fast and safe — and also means
-    none of them ever look at the wiring a real run would get. This one
-    does, without a browser: `build_dependencies` takes the context as an
-    opaque object, so a stand-in is enough to inspect what comes back.
+    with fakes, which is what makes them fast and safe — and also means none
+    of them ever look at the wiring a real run would get. This one does,
+    without a browser: `build_dependencies` takes the context as an opaque
+    object, so a stand-in is enough to inspect what comes back.
 
-    The two deliberate holes are the field writer and the submitter. If
-    someone wires a real submitter, or replaces these with something that
-    returns a value instead of raising, this build starts submitting
-    applications in someone's name — and it must not be possible to do
-    that without editing this test.
+    The writer and the submitter used to be refusing stubs. They are real
+    now, which moves the burden of this test: instead of proving the
+    dangerous part is absent, it proves the safety that makes shipping it
+    defensible. `AUTO_SUBMIT` is off, the writer shares the trigger's
+    scanner so the control it types into is the control the key was derived
+    from, and the submitter refuses an application nobody released — checked
+    against a page that raises if it is touched at all, so the refusal
+    cannot be coming from somewhere further in.
     """
 
-    def _dependencies(self, tmp_path: Path) -> Any:
+    def _dependencies(self, tmp_path: Path, **overrides: Any) -> Any:
         settings = Settings(
             _env_file=None,
             sqlite_path=tmp_path / "jobs.db",
             artifacts_path=tmp_path / "artifacts",
+            **overrides,
         )
         db = Database(settings)
         db.initialize()
         return build_dependencies(settings, db, object())
 
-    async def test_the_submitter_refuses_rather_than_reporting_a_submission(
+    def test_the_field_writer_is_the_production_one(self, tmp_path: Path) -> None:
+        assert isinstance(self._dependencies(tmp_path).writer, PlaywrightFieldWriter)
+
+    def test_the_writer_types_into_the_control_the_scanner_found(
+        self, tmp_path: Path
+    ) -> None:
+        """One scanner, so one derivation of a control's stable key.
+
+        A writer with a scanner of its own would hold a different HMAC key
+        and re-derive a different key for the same control, so its
+        provenance check would refuse every write. Sharing the trigger's
+        scanner is what makes the check meaningful rather than fatal.
+        """
+        deps = self._dependencies(tmp_path)
+
+        assert deps.writer.scanner is deps.trigger.scanner
+
+    def test_the_page_guard_is_the_production_one(self, tmp_path: Path) -> None:
+        assert isinstance(self._dependencies(tmp_path).guard, PlaywrightPageGuard)
+
+    def test_the_submitter_is_the_production_one(self, tmp_path: Path) -> None:
+        assert isinstance(self._dependencies(tmp_path).submitter, PlaywrightSubmitter)
+
+    async def test_the_submitter_refuses_an_application_nobody_released(
         self, tmp_path: Path
     ) -> None:
         deps = self._dependencies(tmp_path)
+        unreleased = SubmitAuthorization(
+            application_id=1,
+            thread_id="application-1",
+            decision="",
+            decided_at="",
+            gate="",
+        )
 
-        with pytest.raises(ComponentNotWired) as raised:
-            await deps.submitter.submit(object())
+        with pytest.raises(SubmitNotAuthorized):
+            await deps.submitter.submit(_UntouchablePage(), unreleased)
 
-        assert raised.value.component == "submitter"
-        assert "Nothing was typed and nothing was submitted" in str(raised.value)
-
-    async def test_the_field_writer_refuses_rather_than_reporting_a_failure(
+    async def test_the_submitter_refuses_a_rejected_application(
         self, tmp_path: Path
     ) -> None:
-        """`False` would read as "the value did not land", which is not this."""
+        deps = self._dependencies(tmp_path)
+        rejected = SubmitAuthorization(
+            application_id=1,
+            thread_id="application-1",
+            decision=ApprovalDecision.REJECTED.value,
+            decided_at="2026-08-19T00:00:00+00:00",
+            gate="api",
+        )
+
+        with pytest.raises(SubmitNotAuthorized):
+            await deps.submitter.submit(_UntouchablePage(), rejected)
+
+    async def test_the_writer_refuses_a_control_the_applicant_must_operate(
+        self, tmp_path: Path
+    ) -> None:
+        """A file input, refused before the page is looked at at all."""
         deps = self._dependencies(tmp_path)
 
-        with pytest.raises(ComponentNotWired):
-            await deps.writer.write(object(), "frame|input|email", "Ada")
+        assert await deps.writer.write(_UntouchablePage(), _resume_upload(), "cv.pdf") is False
 
-    def test_the_unwired_components_are_the_only_ones_missing(
+    def test_auto_submit_is_still_off_in_the_shipped_settings(
         self, tmp_path: Path
     ) -> None:
+        """Wiring a submitter did not turn on submitting without a human."""
+        assert self._dependencies(tmp_path).settings.auto_submit is False
+
+    def test_every_component_the_graph_touches_is_wired(self, tmp_path: Path) -> None:
         """Otherwise this test would pass on a build that does nothing at all."""
         deps = self._dependencies(tmp_path)
 
@@ -1007,22 +1066,55 @@ class TestTheShippedWiring:
         assert deps.pages is not None
         assert deps.trigger is not None
         assert deps.gap_filler is not None
+        assert deps.writer is not None
+        assert deps.guard is not None
+        assert deps.submitter is not None
         assert deps.screenshots is not None
+
+    def test_the_submitter_can_save_the_screenshot_it_promises(
+        self, tmp_path: Path
+    ) -> None:
+        """An unconfirmed submission is only checkable if it left an image."""
+        deps = self._dependencies(tmp_path)
+
+        assert deps.submitter.screenshots is deps.screenshots
 
     def test_the_wiring_needs_no_browser_to_be_inspected(self, tmp_path: Path) -> None:
         """Guards the tests above: they would be vacuous if this raised."""
         assert self._dependencies(tmp_path) is not None
 
-    def test_a_refusal_to_submit_is_contained_as_a_failed_application(
-        self,
-    ) -> None:
-        """The refusal must not escape as an unhandled error.
 
-        `ComponentNotWired` is a `BrowserError`, which is what the graph's
-        classifier routes into a recorded failure naming the component
-        rather than a crashed worker.
-        """
-        assert issubclass(ComponentNotWired, BrowserError)
+class _UntouchablePage:
+    """A page that fails the test if anything is asked of it.
+
+    Both refusals above happen before any page work, and a page that
+    answered questions would let a future change move the refusal later
+    without this test noticing.
+    """
+
+    def __getattr__(self, attribute: str) -> Any:
+        raise AssertionError(
+            f"the page was asked for {attribute!r}, so the refusal came too late"
+        )
+
+
+def _resume_upload() -> FormField:
+    return FormField(
+        key="resume",
+        frame_url="https://boards.greenhouse.io/acme/jobs/1",
+        form="form#application",
+        control_id="resume",
+        name="resume",
+        field_type="file",
+        label="Resume",
+        tag="input",
+        required=True,
+        disabled=False,
+        visible=True,
+        filled=False,
+        free_text=False,
+        value_digest="digest:resume:empty",
+    )
 
 
 class TestUnexpectedFailures:

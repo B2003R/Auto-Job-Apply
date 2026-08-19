@@ -63,7 +63,11 @@ from app.agent.approval import (
     UnknownApplicationError,
     UnknownThreadError,
 )
-from app.agent.errors import BrowserError
+from app.agent.browser_actions import (
+    PlaywrightFieldWriter,
+    PlaywrightPageGuard,
+    PlaywrightSubmitter,
+)
 from app.agent.gap_filler import GapFiller
 from app.agent.graph import (
     ApplicationRunner,
@@ -71,7 +75,6 @@ from app.agent.graph import (
     GraphDependencies,
     RunResult,
     RunStatus,
-    SubmitOutcome,
     ThreadNotAwaitingApproval,
     UnknownQueueItem,
     sqlite_checkpointer,
@@ -118,23 +121,6 @@ class WorkerNotReady(RuntimeError):
     Mapped to 503 rather than 500: nothing is wrong, the browser is simply
     not up yet, and the caller should retry.
     """
-
-
-class ComponentNotWired(BrowserError):
-    """Raised by a dependency this build deliberately does not implement.
-
-    A typed refusal, not a silent no-op. The graph contains it as a failed
-    application with the component named, so an operator reading the log
-    learns which piece is missing instead of seeing an application that
-    appears to have been filled and submitted when it was not.
-    """
-
-    def __init__(self, component: str, purpose: str) -> None:
-        self.component = component
-        super().__init__(
-            f"No {component} is wired into this build, so {purpose} cannot "
-            "happen. Nothing was typed and nothing was submitted."
-        )
 
 
 # --------------------------------------------------------------------------
@@ -460,33 +446,6 @@ SessionFactory = Callable[[Settings], BrowserSessionLike]
 DependenciesFactory = Callable[[Settings, Database, Any], GraphDependencies]
 
 
-class UnwiredFieldWriter:
-    """Refuses to type an answer, loudly.
-
-    Writing a decided answer into a live control is browser work this build
-    does not implement. Returning `False` would be quieter but would read as
-    "the value did not land", which is a different and much less alarming
-    statement than "nothing here can type".
-    """
-
-    async def write(self, page: Any, key: str, value: str) -> bool:
-        raise ComponentNotWired("field writer", f"typing an answer into {key!r}")
-
-
-class UnwiredSubmitter:
-    """Refuses to submit.
-
-    A submitter is the single most dangerous component in this project, and
-    this one exists so that the absence of a real one can never be mistaken
-    for a successful submission: `SubmitOutcome.submitted` is never
-    fabricated, and an approved application whose submitter is missing is
-    recorded as failed with the reason.
-    """
-
-    async def submit(self, page: Any) -> SubmitOutcome:
-        raise ComponentNotWired("submitter", "submitting the application")
-
-
 class ContextPageBroker:
     """One tab per thread, opened from the worker's one browser context."""
 
@@ -527,18 +486,30 @@ class ArtifactScreenshotter:
 def build_dependencies(
     settings: Settings, db: Database, context: Any
 ) -> GraphDependencies:
-    """Wire the production graph dependencies around one browser context."""
+    """Wire the production graph dependencies around one browser context.
+
+    The trigger and the writer share one `FormScanner` deliberately. A
+    scanner holds a random per-instance key that its stable keys are derived
+    with, so a writer given a scanner of its own would re-derive a different
+    key for the same control and refuse every write. Sharing this one is
+    what turns the writer's provenance check from a guaranteed refusal into
+    the guarantee it is meant to be: the control typed into is the control
+    the answer is recorded against.
+    """
+    screenshots = ArtifactScreenshotter(settings.artifacts_path)
+    trigger = JobrightTrigger.from_settings(settings)
     return GraphDependencies(
         db=db,
         settings=settings,
         logger=ApplicationLogger(db, settings),
         rate_limiter=RateLimiter(db, settings),
         pages=ContextPageBroker(context),
-        trigger=JobrightTrigger.from_settings(settings),
+        trigger=trigger,
         gap_filler=GapFiller.from_settings(settings, router=ModelRouter(settings)),
-        writer=UnwiredFieldWriter(),
-        submitter=UnwiredSubmitter(),
-        screenshots=ArtifactScreenshotter(settings.artifacts_path),
+        writer=PlaywrightFieldWriter(scanner=trigger.scanner),
+        guard=PlaywrightPageGuard(),
+        submitter=PlaywrightSubmitter(screenshots=screenshots),
+        screenshots=screenshots,
     )
 
 
