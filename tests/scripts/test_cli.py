@@ -714,6 +714,37 @@ class TestLocalBatch:
         assert "interrupt" not in payload[0]
         assert "gaps" not in payload[0]
 
+    def test_an_untrusted_url_is_reported_and_not_queued(
+        self, harness: Harness
+    ) -> None:
+        """A local run must refuse the same URLs the API refuses.
+
+        `POST /queue` checks `require_trusted_host` before writing a row;
+        `--local run` used to skip straight to `enqueue_job`, so the same
+        lookalike-domain URL that the API turns away at 422 would instead
+        occupy a queue row and wait for a worker's attention here — the one
+        difference between the two front ends this project does not want.
+        """
+        console = Console()
+
+        code = run_batch.main(
+            [
+                "--local",
+                "run",
+                "https://linkedin.com.evil.test/jobs/1",
+                "--board",
+                "linkedin",
+            ],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert "untrusted_listing_url" in console.text
+        assert harness.world.db.list_queue_items() == []
+
 
 class TestLocalJsonStaysMachineReadable:
     """Under `--json`, stdout is the document and nothing else.

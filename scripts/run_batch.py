@@ -35,6 +35,7 @@ import httpx
 
 from app.agent.approval import ApprovalError, CliApprovalGate
 from app.agent.graph import RunResult, RunStatus, thread_id_for
+from app.boards.base import UntrustedListingUrlError, require_trusted_host
 from app.config import Settings
 from app.main import ApplicationWorker, is_loopback
 from app.storage.models import Board
@@ -427,12 +428,19 @@ async def _local_run(
 
         try:
             for url in args.urls:
+                # The same check `POST /queue` makes before writing a row,
+                # so a lookalike-domain URL is refused here too rather than
+                # occupying a queue row a worker will only refuse later.
+                require_trusted_host(url, args.board)
                 queue_id = worker.db.enqueue_job(url, args.board)
                 note(f"queued {url} as run {queue_id}")
             results = await worker.drain()
             if args.prompt:
                 results = await _prompt_each(worker, results, args.actor, note, reader)
             _report_local(out, args.json, results)
+        except UntrustedListingUrlError as exc:
+            note(f"[untrusted_listing_url] {exc}")
+            code = 1
         except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
             note(f"the local batch could not be completed: {exc}")
             code = 1
