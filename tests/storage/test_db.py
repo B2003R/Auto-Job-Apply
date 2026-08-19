@@ -188,6 +188,119 @@ def test_field_values_redacted_when_logging_disabled(db: Database) -> None:
     assert fields[0].source == FieldSource.LLM
 
 
+class TestClaimingWork:
+    """`claim_next_pending` is how a worker picks up its next listing.
+
+    It has to be a compare-and-set rather than a read followed by a write:
+    two workers that both read the same pending row would both open the
+    listing and click Apply in the applicant's name.
+    """
+
+    def test_nothing_pending_is_reported_as_nothing(self, db: Database) -> None:
+        assert db.claim_next_pending() is None
+
+    def test_a_claim_hands_back_the_oldest_pending_item_as_running(
+        self, db: Database
+    ) -> None:
+        first = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.enqueue_job("https://example.com/jobs/2", Board.LINKEDIN)
+
+        claimed = db.claim_next_pending()
+
+        assert claimed is not None
+        assert claimed.id == first
+        assert claimed.state is QueueState.RUNNING
+        stored = db.get_queue_item(first)
+        assert stored is not None
+        assert stored.state is QueueState.RUNNING
+
+    def test_two_claims_never_return_the_same_item(self, db: Database) -> None:
+        first = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        second = db.enqueue_job("https://example.com/jobs/2", Board.JOBRIGHT)
+
+        claimed = [db.claim_next_pending(), db.claim_next_pending()]
+
+        assert [item.id for item in claimed if item is not None] == [first, second]
+        assert db.claim_next_pending() is None
+
+    def test_claiming_skips_items_that_are_not_pending(self, db: Database) -> None:
+        running = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.update_queue_state(running, QueueState.RUNNING)
+        pending = db.enqueue_job("https://example.com/jobs/2", Board.LINKEDIN)
+
+        claimed = db.claim_next_pending()
+
+        assert claimed is not None
+        assert claimed.id == pending
+
+    def test_a_claim_is_exclusive_across_connections(self, db: Database) -> None:
+        """A second process holding the row open must not also win it.
+
+        Simulated by starting an immediate transaction on another
+        connection and claiming from it, which is exactly the contention
+        two worker processes produce.
+        """
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        other = Database(db.settings)
+
+        first = other.claim_next_pending()
+        second = db.claim_next_pending()
+
+        assert first is not None and first.id == queue_id
+        assert second is None
+
+
+class TestListingRecords:
+    """Read-only listings, for the export CLI and the pending-approval view."""
+
+    def test_queue_items_can_be_listed_by_state(self, db: Database) -> None:
+        pending = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        done = db.enqueue_job("https://example.com/jobs/2", Board.LINKEDIN)
+        db.update_queue_state(done, QueueState.COMPLETED)
+
+        assert [item.id for item in db.list_queue_items()] == [pending, done]
+        assert [
+            item.id for item in db.list_queue_items(states=[QueueState.PENDING])
+        ] == [pending]
+
+    def test_applications_can_be_listed_by_status(self, db: Database) -> None:
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        staging = db.create_application(
+            queue_id=queue_id, thread_id="t-1", status=ApplicationStatus.STAGING
+        )
+        waiting = db.create_application(
+            queue_id=queue_id,
+            thread_id="t-2",
+            status=ApplicationStatus.AWAITING_APPROVAL,
+        )
+
+        assert [record.id for record in db.list_applications()] == [staging, waiting]
+        assert [
+            record.id
+            for record in db.list_applications(
+                statuses=[ApplicationStatus.AWAITING_APPROVAL]
+            )
+        ] == [waiting]
+
+    def test_an_empty_status_filter_is_not_read_as_no_filter(
+        self, db: Database
+    ) -> None:
+        """`statuses=[]` asks for nothing, and must not return everything.
+
+        The distinction matters because a caller building a filter from
+        user input can legitimately end up with an empty list, and reading
+        that as "unfiltered" would dump every application into an export
+        that was meant to be narrow.
+        """
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.create_application(
+            queue_id=queue_id, thread_id="t-1", status=ApplicationStatus.STAGING
+        )
+
+        assert db.list_applications(statuses=[]) == []
+        assert db.list_queue_items(states=[]) == []
+
+
 def test_field_values_persist_when_logging_enabled(tmp_path: Path) -> None:
     settings = Settings(
         sqlite_path=tmp_path / "log-values.db",

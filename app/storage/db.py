@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 from app.config import Settings
 from app.storage.models import (
@@ -243,6 +243,20 @@ def _parse_ts(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _queue_item(row: sqlite3.Row | None) -> QueueItem | None:
+    if row is None:
+        return None
+    return QueueItem(
+        id=row["id"],
+        listing_url=row["listing_url"],
+        board=Board(row["board"]),
+        state=QueueState(row["state"]),
+        error_reason=row["error_reason"],
+        created_at=_parse_ts(row["created_at"]),
+        updated_at=_parse_ts(row["updated_at"]),
+    )
+
+
 def _application(row: sqlite3.Row | None) -> ApplicationRecord | None:
     if row is None:
         return None
@@ -361,17 +375,97 @@ class Database:
                 "SELECT * FROM job_queue WHERE id = ?",
                 (queue_id,),
             ).fetchone()
-        if row is None:
-            return None
-        return QueueItem(
-            id=row["id"],
-            listing_url=row["listing_url"],
-            board=Board(row["board"]),
-            state=QueueState(row["state"]),
-            error_reason=row["error_reason"],
-            created_at=_parse_ts(row["created_at"]),
-            updated_at=_parse_ts(row["updated_at"]),
-        )
+        return _queue_item(row)
+
+    def claim_next_pending(self) -> QueueItem | None:
+        """Take ownership of the oldest pending listing, or return `None`.
+
+        The read and the move to `running` happen in one immediate
+        transaction, so two workers cannot both claim the same row. Doing
+        it as a read followed by a separate write would let both of them
+        open the same listing and click Apply in the applicant's name,
+        which is the one mistake this queue exists to prevent.
+
+        Claiming is deliberately *not* the same as leasing the graph
+        thread. This says "this row is mine to start"; the execution lease
+        says "this thread is mine to run", and the latter is what protects
+        an application that is already in flight.
+        """
+        with self.immediate_transaction() as conn:
+            row = conn.execute(
+                """
+                UPDATE job_queue SET state = ?, updated_at = ?
+                WHERE id = (
+                    SELECT id FROM job_queue WHERE state = ?
+                    ORDER BY id LIMIT 1
+                )
+                RETURNING *
+                """,
+                (
+                    QueueState.RUNNING.value,
+                    _format_ts(_utc_now()),
+                    QueueState.PENDING.value,
+                ),
+            ).fetchone()
+        return _queue_item(row)
+
+    def list_queue_items(
+        self,
+        *,
+        states: Sequence[QueueState] | None = None,
+        limit: int | None = None,
+    ) -> list[QueueItem]:
+        """Queue rows in insertion order, optionally narrowed by state.
+
+        `states=None` means "every state"; `states=[]` means "none of
+        them", and returns nothing. A caller building a filter from user
+        input can legitimately produce an empty list, and reading that as
+        "unfiltered" would widen an export that was meant to be narrow.
+        """
+        if states is not None and not states:
+            return []
+        clause = ""
+        values: tuple[Any, ...] = ()
+        if states is not None:
+            clause = f" WHERE state IN ({', '.join('?' * len(states))})"
+            values = tuple(state.value for state in states)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM job_queue{clause} ORDER BY id"
+                + (" LIMIT ?" if limit is not None else ""),
+                (*values, *((limit,) if limit is not None else ())),
+            ).fetchall()
+        return [item for item in (_queue_item(row) for row in rows) if item is not None]
+
+    def list_applications(
+        self,
+        *,
+        statuses: Sequence[ApplicationStatus] | None = None,
+        limit: int | None = None,
+    ) -> list[ApplicationRecord]:
+        """Application rows in insertion order, optionally narrowed by status.
+
+        `statuses=[]` returns nothing, for the same reason as
+        `list_queue_items`.
+        """
+        if statuses is not None and not statuses:
+            return []
+        clause = ""
+        values: tuple[Any, ...] = ()
+        if statuses is not None:
+            clause = f" WHERE status IN ({', '.join('?' * len(statuses))})"
+            values = tuple(status.value for status in statuses)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM applications{clause} ORDER BY id"
+                + (" LIMIT ?" if limit is not None else ""),
+                (*values, *((limit,) if limit is not None else ())),
+            ).fetchall()
+        return [
+            record
+            for record in (_application(row) for row in rows)
+            if record is not None
+        ]
 
     def update_queue_state(
         self,
