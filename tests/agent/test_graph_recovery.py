@@ -434,14 +434,21 @@ class TestExecutionOwnership:
             await asyncio.wait_for(submitting.wait(), timeout=5)
             await asyncio.sleep(0.6)  # three lease terms
 
+            # Both attempts are given a deadline. A refusal is immediate, so
+            # anything that takes time here is a worker that got past the
+            # lease and is now waiting on the submit the holder is inside.
             async with world.runner(owner="impatient-worker") as other:
                 with pytest.raises(ResumeInProgress):
-                    await other.resume_application(
-                        staged.thread_id, approve(staged.application_id)
+                    await asyncio.wait_for(
+                        other.resume_application(
+                            staged.thread_id, approve(staged.application_id)
+                        ),
+                        timeout=2,
                     )
-                assert (await other.run_application(queue_id)).status is (
-                    RunStatus.IN_PROGRESS
+                refused = await asyncio.wait_for(
+                    other.run_application(queue_id), timeout=2
                 )
+                assert refused.status is RunStatus.IN_PROGRESS
 
             finish.set()
             result = await asyncio.wait_for(resuming, timeout=5)
