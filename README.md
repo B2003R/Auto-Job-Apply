@@ -386,6 +386,17 @@ Rules the gate enforces, wherever the decision comes from:
   never overwritten.
 - **A thread another worker is running is 423**, with `Retry-After`. That
   is not a conflict — your request was simply early.
+- **The decision is written before the thread is leased for execution.**
+  Recording a decision and acting on it are two separate steps, in that
+  order: your `approve` or `reject` is durably stored in the approvals
+  table first, and only then is the execution lease acquired to actually
+  resume the graph. A 423 can therefore mean either that nothing has
+  happened yet, or that your decision was just recorded and a worker
+  simply hasn't run it yet — the response cannot tell the two apart, and
+  does not need to. Either way, retrying with the *identical* decision is
+  the correct thing to do: a decision that was not yet recorded gets
+  recorded now, and one that already was is read back as the no-op replay
+  above, rather than being recorded, or acted on, twice.
 
 Approving runs the submit step **in the process that staged the tab**. This
 is why approval over HTTP goes to the server and not to a fresh CLI
