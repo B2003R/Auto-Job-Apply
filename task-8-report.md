@@ -175,6 +175,76 @@ sentence naming the path and a next step.
   produced a genuinely new test (every internal `#anchor` must resolve to
   a heading), which was then verified to fail on a renamed heading.
 
+## Part 3 — the two blocking CLI issues
+
+One commit, `4ca5abc`. Both were found by the previous round's own fixes
+being incomplete, which is worth saying plainly: Part 2 put teardown after
+the `try` rather than inside a `finally`, and routed only *some* of the
+local runner's prose away from stdout.
+
+### 1. An interrupt walked past every cleanup path
+
+`KeyboardInterrupt` and `asyncio.CancelledError` derive from
+`BaseException`, not `Exception`, and every guard around the local
+runner's startup and body caught `Exception`. **Ctrl-C — the way most long
+batches actually end — skipped teardown entirely**: the browser stayed
+open and the profile lock stayed on disk, so the next run, local or
+served, refused to start while naming a pid that no longer existed. The
+same held for a `CancelledError` arriving from the outside.
+
+Teardown is now in a `finally` covering both the partial start and the
+body, and the interrupt is re-raised after it. Re-raising is the point:
+Ctrl-C is the operator taking over, not a failed batch, and folding it
+into an exit code leaves a caller unable to tell the two apart.
+`_stop_quietly` catches `BaseException` for the matching reason — a
+teardown detail, or an impatient second Ctrl-C, must not replace the
+exception that started the unwinding.
+
+At the process boundary a new `run()` maps the interrupt to exit 130 and
+silence, which is what a shell expects; `main` still re-raises for
+anything embedding it.
+
+Tests: `TestInterrupting` — interrupts during startup and during the
+batch, both exception types, each asserting the browser was closed; the
+re-raise; a teardown failure that must not replace the interrupt; a second
+interrupt during teardown that must not replace the first; and both entry
+point paths.
+
+### 2. `--local --json` was not machine-readable
+
+A local run narrates — what it queued, what failed, what it is asking at
+the gate — and all of it went to stdout alongside the document. **`--local
+--json | jq` therefore failed on the first listing**, and the more
+interesting the run, the more prose there was to break it. The two tests
+that should have caught this parsed `console.lines[-1]`, so they passed on
+output that no consumer could read; they parse the whole of stdout now,
+which is the only assertion that actually means "machine-readable".
+
+Everything that is not the answer goes through one `note()` helper, which
+is `_aside` bound to the mode: stderr under `--json`, stdout otherwise.
+That covers the queue narration, startup failures, batch failures,
+teardown failures, gate prompts, and the two usage refusals that also
+printed to stdout.
+
+A failure leaves stdout **empty** rather than emitting `[]`. An empty list
+is a claim that zero runs were requested, and a script that skipped the
+exit code would read it as "nothing to do" — the same class of bug as the
+timeout exiting 0, which Part 2 fixed.
+
+Tests: `TestLocalJsonStaysMachineReadable`, six cases, each parsing the
+entire stdout and asserting the corresponding narration arrived on stderr,
+plus a guard that prose mode still narrates.
+
+### Verification
+
+- **Focused: 83 passed** (`tests/scripts/test_cli.py`).
+- **Full suite: 1460 passed**, up from 1445.
+- **mypy: clean**, 33 source files.
+- **Mutation check: 11 of 11 caught** — cleanup moved out of the `finally`,
+  the body catching `BaseException`, teardown re-raising over the
+  interrupt, a partial start left running, the entry point not handling the
+  interrupt, and each of the five prose routes put back on stdout.
+
 ### What I would still look at
 
 - **The snapshot blocks writers.** Correct and deliberate, but WAL mode
@@ -193,3 +263,15 @@ sentence naming the path and a next step.
   outside it, nothing protects the new location. A pre-commit hook that
   refuses `.db` and `.png` files anywhere would be sturdier than a path
   list.
+- **A real cancellation may not permit clean teardown.** The tests raise
+  `CancelledError` from inside the coroutine, which leaves the surrounding
+  task uncancelled, so the awaits in the `finally` complete normally. A
+  loop genuinely shutting down can cancel those awaits too. There is no
+  way to close a browser without awaiting something, so the honest answer
+  is that a hard cancellation may still leave a lock — which is what
+  `doctor` and the lock diagnostics exist for.
+- **`--json` prose goes to stderr through `print`, not the injected
+  writer.** That is why the tests use `capsys`. It works and it is what a
+  process boundary should do, but it means the diagnostics stream is not
+  injectable the way stdout is; an embedder wanting both in hand would
+  need a second writer parameter.
