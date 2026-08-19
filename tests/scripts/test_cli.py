@@ -768,6 +768,33 @@ class TestExportLog:
         assert code == 0
         assert json.loads(target.read_text())["applications"][0]["board"] == "linkedin"
 
+    def test_a_database_that_is_not_there_is_reported_not_created(
+        self, tmp_path: Path
+    ) -> None:
+        """A mistyped path must not read as "you have no applications".
+
+        `Database.initialize()` creates what it opens, so exporting from a
+        path with a typo in it used to print a valid, empty export — the
+        one answer an operator has no way to tell from the truth. It also
+        left a stray empty database behind.
+        """
+        missing = tmp_path / "not-here.db"
+        console = Console()
+
+        code = export_log.main(
+            ["--format", "json"],
+            settings=Settings(
+                _env_file=None,
+                sqlite_path=missing,
+                artifacts_path=tmp_path / "artifacts",
+            ),
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert str(missing) in console.text
+        assert not missing.exists()
+
     def test_an_unwritable_output_path_is_reported_not_raised(
         self, exported: Settings, tmp_path: Path
     ) -> None:

@@ -368,7 +368,9 @@ class RunView(BaseModel):
 
 
 class DecisionView(BaseModel):
-    application_id: int
+    #: Optional because `RunResult`'s is. Reporting `0` for an absent id
+    #: would be a value a client could read as an application.
+    application_id: int | None
     thread_id: str
     queue_id: int
     decision: str | None
@@ -383,7 +385,7 @@ class DecisionView(BaseModel):
     @classmethod
     def of(cls, result: RunResult) -> "DecisionView":
         return cls(
-            application_id=result.application_id or 0,
+            application_id=result.application_id,
             thread_id=result.thread_id,
             queue_id=result.queue_id,
             decision=result.decision,

@@ -209,6 +209,16 @@ def main(
             file=sys.stderr,
         )
 
+    if not resolved.sqlite_path.exists():
+        # Checked rather than created: `initialize()` would happily make an
+        # empty database at a mistyped path, and an empty export is the one
+        # answer an operator cannot tell apart from the truth.
+        out(
+            f"there is no database at {resolved.sqlite_path}. Check SQLITE_PATH, "
+            "or point it at the file you meant to export."
+        )
+        return 1
+
     db = Database(resolved)
     db.initialize()
     records = collect(
