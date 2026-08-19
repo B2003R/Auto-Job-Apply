@@ -59,6 +59,7 @@ from app.storage.models import (
     QueueState,
 )
 from tests.agent.support import (
+    LISTING_URL,
     Crash,
     FakeAdapter,
     FakeSubmitter,
@@ -1213,6 +1214,61 @@ class TestAutoSubmitBlockers:
 
         assert BlockingReason.PAGE_NEVER_SETTLED.value in _blocking(plan, (), False)
         assert BlockingReason.PAGE_NEVER_SETTLED.value not in _blocking(plan, (), True)
+
+    async def test_fill_gaps_itself_blocks_when_the_state_never_recorded_settling(
+        self, tmp_path: Path
+    ) -> None:
+        """The call site, not just the function it calls.
+
+        `_blocking` can default correctly while `fill_gaps` hands it the
+        wrong thing, and the default is only reachable through a state
+        written by a version that did not record settling — which no
+        end-to-end run can produce. So the node is driven directly, with a
+        state that has everything except `settled`.
+
+        Its staging cache is left warm by a crash part-way through the
+        writing loop, which is exactly the situation a resumed old
+        checkpoint would arrive in.
+        """
+        world = build_world(
+            tmp_path,
+            with_router=True,
+            after=snapshot(
+                make_field("name", label="Full name", required=True, filled=True, value="Ada"),
+                cover_letter_gap(),
+            ),
+        )
+        queue_id = world.enqueue()
+        attempts = {"count": 0}
+        real_write = world.writer.write
+
+        async def flaky(page: Any, key: str, value: str) -> bool:
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise Crash("the worker died while typing")
+            return await real_write(page, key, value)
+
+        world.writer.write = flaky  # type: ignore[method-assign]
+
+        async with world.runner() as runner:
+            with pytest.raises(Crash):
+                await runner.run_application(queue_id)
+
+            application = world.db.get_application_by_thread(thread_id_for(queue_id))
+            assert application is not None
+            unsettled = {
+                "queue_id": queue_id,
+                "thread_id": thread_id_for(queue_id),
+                "application_id": application.id,
+                "listing_url": LISTING_URL,
+                "board": Board.LINKEDIN.value,
+                "visited": [],
+            }
+
+            update = await runner.graph.nodes["fill_gaps"].bound.ainvoke(unsettled)
+
+        assert "settled" not in unsettled
+        assert BlockingReason.PAGE_NEVER_SETTLED.value in update["blocking_reasons"]
 
     def test_an_answered_field_the_applicant_must_operate_still_blocks(
         self,
