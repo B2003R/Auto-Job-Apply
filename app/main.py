@@ -582,6 +582,7 @@ class ApplicationWorker:
         self.starts += 1
 
         self._db.initialize()
+        self._recover_abandoned()
         self._checkpointer_cm = sqlite_checkpointer(self._checkpointer_path)
         checkpointer = await self._checkpointer_cm.__aenter__()
         self._session = self._session_factory(self._settings)
@@ -632,6 +633,35 @@ class ApplicationWorker:
         self._runner = None
         if failures:
             raise failures[0]
+
+    def _recover_abandoned(self) -> None:
+        """Return listings a dead worker was holding to the pending queue.
+
+        A claim moves a row to `running`, and `claim_next_pending` only
+        ever claims `pending`, so a process killed mid-application leaves a
+        listing no worker will ever look at again — with no error, no
+        failure, and nothing for an operator to notice. The application row
+        and the execution lease both recover on their own; this is the
+        piece that does not.
+
+        A live lease is the one thing that means "somebody is still working
+        on this", so a leased row is left alone. The window between a claim
+        and its lease is the case this can get wrong, and it is safe to
+        get wrong: the loser of that race finds the thread leased and
+        returns `IN_PROGRESS` without touching the browser, so the worst
+        outcome is a wasted claim rather than a second application.
+        """
+        now = datetime.now(timezone.utc)
+        for item in self._db.list_queue_items(states=[QueueState.RUNNING]):
+            lease = self._db.get_lease(thread_id_for(item.id))
+            if lease is not None and lease.expires_at > now:
+                continue
+            if self._db.requeue_running(item.id, "worker_abandoned"):
+                logger.warning(
+                    "queue item %s was left running by a worker that is gone; "
+                    "it has been returned to the queue",
+                    item.id,
+                )
 
     def wake(self) -> None:
         """Tell the loop there is new work, instead of waiting out the poll."""

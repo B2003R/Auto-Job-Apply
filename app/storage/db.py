@@ -409,6 +409,37 @@ class Database:
             ).fetchone()
         return _queue_item(row)
 
+    def requeue_running(self, queue_id: int, reason: str) -> bool:
+        """Put a claimed-but-abandoned listing back, if it is still claimed.
+
+        Guarded on `running` specifically, not merely on "not terminal".
+        A row that is already pending is one another worker may be about to
+        claim, and rewriting it would stamp a stale reason on live work; a
+        terminal row must never come back at all, since requeueing a
+        submitted application means applying to the job twice.
+
+        Whether a running row is genuinely abandoned is a question about
+        the execution lease, and the lease is keyed by thread id — which
+        this layer has no business deriving. The caller decides; this only
+        makes the move atomic, so two workers starting at once cannot both
+        believe they recovered the same listing.
+        """
+        with self.immediate_transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE job_queue SET state = ?, error_reason = ?, updated_at = ?
+                WHERE id = ? AND state = ?
+                """,
+                (
+                    QueueState.PENDING.value,
+                    reason,
+                    _format_ts(_utc_now()),
+                    queue_id,
+                    QueueState.RUNNING.value,
+                ),
+            )
+            return cursor.rowcount == 1
+
     def list_queue_items(
         self,
         *,

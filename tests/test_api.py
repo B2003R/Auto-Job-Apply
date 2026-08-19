@@ -694,6 +694,57 @@ class TestWorkerLoop:
 
         assert harness.sessions[0].closes == 1
 
+    async def test_a_listing_abandoned_by_a_dead_worker_is_picked_up_again(
+        self, harness: Harness
+    ) -> None:
+        """A row left `running` by a killed process is nobody's, forever.
+
+        `claim_next_pending` claims pending rows only, so without a sweep
+        at startup the listing is silently never applied to and the
+        operator has no signal that anything went wrong. The sweep runs
+        once, when the worker starts, which is the moment a previous
+        process is known to be gone.
+        """
+        queue_id = harness.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        harness.db.claim_next_pending()  # the worker that then died
+
+        worker = harness.build_worker(run_loop=False)
+        await worker.start()
+        try:
+            results = await worker.drain()
+        finally:
+            await worker.stop()
+
+        assert [result.queue_id for result in results] == [queue_id]
+        assert results[0].awaiting_approval
+
+    async def test_a_listing_another_worker_is_running_is_left_alone(
+        self, harness: Harness
+    ) -> None:
+        """A live lease means a live worker, whatever the queue row says."""
+        from datetime import datetime, timedelta, timezone
+
+        queue_id = harness.db.enqueue_job(LISTING_URL, Board.LINKEDIN)
+        harness.db.claim_next_pending()
+        harness.db.acquire_lease(
+            thread_id_for(queue_id),
+            "another-worker",
+            ttl=timedelta(seconds=120),
+            now=datetime.now(timezone.utc),
+        )
+
+        worker = harness.build_worker(run_loop=False)
+        await worker.start()
+        try:
+            assert await worker.drain() == []
+        finally:
+            await worker.stop()
+
+        item = harness.db.get_queue_item(queue_id)
+        assert item is not None
+        assert item.state is QueueState.RUNNING
+        assert harness.world.adapter.started == 0
+
     async def test_a_running_worker_exposes_the_shipped_runner_type(
         self, harness: Harness
     ) -> None:

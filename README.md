@@ -509,6 +509,7 @@ type the answer yourself, then approve.
 | Worker restarted after you approved | **failed**, and the reason says so | somebody approved a submission that did not happen; queue it again and decide again |
 | Approved application whose checkpoint is gone | skipped, `stale_approval` | queue the listing again; the old decision is never replayed onto a freshly scanned form |
 | A worker was killed holding a thread | its execution lease expires after two minutes, then another worker may take over | wait, or retry the decision |
+| A worker died with a listing claimed | the next worker to start returns it to the queue with `worker_abandoned` and runs it | nothing; it is picked up automatically |
 | The runner itself fell over on one item | queue row `failed`, reason `worker_error`; the batch continues | read the traceback in the worker's log |
 
 The consistent rule: **before a decision, a loss is a skip** (nothing was

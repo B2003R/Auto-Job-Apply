@@ -250,6 +250,67 @@ class TestClaimingWork:
         assert second is None
 
 
+class TestReturningWorkToTheQueue:
+    """A killed worker must not strand its listing forever.
+
+    `claim_next_pending` only ever claims a *pending* row, so a row left
+    `running` by a process that died is invisible to every worker that
+    follows. The application row and the execution lease both recover on
+    their own; the queue row is the one piece that would sit there silently
+    for good.
+
+    Whether a given row is genuinely abandoned is a question about the
+    execution lease, which is keyed by thread id — something this layer has
+    no business deriving. So storage offers only the guarded move, and the
+    worker decides which rows deserve it.
+    """
+
+    def test_a_running_row_is_returned_to_pending(self, db: Database) -> None:
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.claim_next_pending()
+
+        assert db.requeue_running(queue_id, "worker_abandoned") is True
+
+        stored = db.get_queue_item(queue_id)
+        assert stored is not None
+        assert stored.state is QueueState.PENDING
+        assert stored.error_reason == "worker_abandoned"
+        claimed = db.claim_next_pending()
+        assert claimed is not None and claimed.id == queue_id
+
+    @pytest.mark.parametrize(
+        "state", [QueueState.PENDING, QueueState.COMPLETED, QueueState.FAILED]
+    )
+    def test_no_other_state_is_moved(self, db: Database, state: QueueState) -> None:
+        """Terminal rows especially: requeueing one re-applies to the job.
+
+        The guard is on `running` rather than on "not terminal", because a
+        row that is already pending is one another worker may be about to
+        claim, and rewriting it would put a stale reason on live work.
+        """
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.update_queue_state(queue_id, state)
+
+        assert db.requeue_running(queue_id, "worker_abandoned") is False
+
+        stored = db.get_queue_item(queue_id)
+        assert stored is not None
+        assert stored.state is state
+
+    def test_only_one_of_two_racing_sweeps_wins(self, db: Database) -> None:
+        """Two workers starting at once must not both requeue one row."""
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        db.claim_next_pending()
+        other = Database(db.settings)
+
+        outcomes = [
+            other.requeue_running(queue_id, "worker_abandoned"),
+            db.requeue_running(queue_id, "worker_abandoned"),
+        ]
+
+        assert outcomes == [True, False]
+
+
 class TestListingRecords:
     """Read-only listings, for the export CLI and the pending-approval view."""
 
