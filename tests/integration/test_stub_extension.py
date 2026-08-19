@@ -55,6 +55,8 @@ from app.agent.graph import (
     ApplicationRunner,
     GraphDependencies,
     RunStatus,
+    SubmitAuthorization,
+    SubmitPermit,
     sqlite_checkpointer,
 )
 from app.agent.jobright_trigger import (
@@ -202,6 +204,244 @@ def _queue(database: Database, fixture_server: str) -> int:
     return database.enqueue_job(
         listing_url=loopback_only(f"{fixture_server}/ats/greenhouse.html"),
         board=Board.LINKEDIN,
+    )
+
+
+# --------------------------------------------------------------------------
+# The two places a form can be that is not the top document
+# --------------------------------------------------------------------------
+
+
+#: A submission the graph would have authorised, restated as the data the
+#: submitter is actually given. The component tests below drive the writer
+#: and the submitter directly: the stub extension's content script only runs
+#: in the top frame and fills by `document.querySelector`, so a whole-graph
+#: run against these pages would be measuring the stub rather than the code
+#: under test.
+APPROVED = SubmitAuthorization(
+    application_id=1,
+    thread_id="application-1",
+    decision=ApprovalDecision.APPROVED.value,
+    decided_at="2026-08-19T12:00:00+00:00",
+    gate="approval",
+)
+
+
+class _Claim:
+    """The durable claim behind a permit, kept in memory for one test."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def framed_page(context: Any, fixture_server: str) -> AsyncIterator[Any]:
+    """The ATS form in a same-origin child frame, under a standing banner."""
+    opened = await context.new_page()
+    await opened.goto(
+        loopback_only(f"{fixture_server}/ats/iframe_host.html"), wait_until="load"
+    )
+    yield opened
+    await opened.close()
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def shadow_page(context: Any, fixture_server: str) -> AsyncIterator[Any]:
+    """A form whose last field and whose submit control are in shadow roots."""
+    opened = await context.new_page()
+    await opened.goto(
+        loopback_only(f"{fixture_server}/ats/shadow_form.html"), wait_until="load"
+    )
+    yield opened
+    await opened.close()
+
+
+def _gap(snapshot: Any, name: str) -> Any:
+    return next(field for field in snapshot.fields if field.name == name)
+
+
+def _application_frame(page: Any) -> Any:
+    return next(frame for frame in page.frames if "iframe_form.html" in frame.url)
+
+
+async def _write_the_last_name(page: Any) -> Any:
+    """Fill the one gap, through the writer, and hand back the field.
+
+    Deliberately the writer rather than `page.fill`: every submitter test
+    below is submitting a form that this had to have filled correctly, so a
+    writer that resolved the wrong control or refused the write takes the
+    submission with it instead of being covered up by it.
+    """
+    scanner = FormScanner()
+    snapshot = await scanner.snapshot(page)
+    gap = _gap(snapshot, REQUIRED_GAP)
+    writer = PlaywrightFieldWriter(scanner=scanner)
+
+    assert await writer.write_or_raise(page, gap, LAST_NAME) is True
+    return gap
+
+
+class TestAFormInASameOriginChildFrame:
+    """The shape every ATS ships, and the false success it used to produce.
+
+    The employer's careers page holds the frame; the ATS's form is inside
+    it. The submitter presses a control in the child frame, so the child
+    frame is what has to be asked about the outcome — and the top page is a
+    different document with a different URL, which never held the form, and
+    which here is showing a banner that reads exactly like a confirmation
+    before anything is clicked at all.
+
+    Judged against a single shared baseline, that top page reported a
+    navigation, a vanished form, and a confirmation on the first poll of
+    every submission. All three were false, and the outcome was an
+    application recorded as sent.
+    """
+
+    async def test_a_field_in_the_frame_is_found_again_and_typed_into(
+        self, framed_page: Any
+    ) -> None:
+        """Key parity across a frame boundary, in a browser.
+
+        The scanner derives the key from a control in the child frame; the
+        writer has to find its way back to that frame, resolve the same
+        control, and re-derive the same key — which is the check that
+        refuses a write recorded against a control it did not go into.
+        """
+        gap = await _write_the_last_name(framed_page)
+        frame = _application_frame(framed_page)
+
+        assert gap.frame_url != framed_page.url
+        assert await frame.input_value(f"#{REQUIRED_GAP}") == LAST_NAME
+
+    async def test_the_frame_that_submitted_is_what_confirms_it(
+        self, framed_page: Any
+    ) -> None:
+        await _write_the_last_name(framed_page)
+        claim = _Claim()
+
+        outcome = await PlaywrightSubmitter(confirm_timeout_ms=8_000).submit(
+            framed_page, APPROVED, SubmitPermit(1, claim)
+        )
+
+        assert outcome.submitted
+        assert claim.calls == 1
+        frame = _application_frame(framed_page)
+        assert await frame.locator("#fixture-submit-confirmation").count() == 1
+        assert await frame.locator("#application-form").count() == 0
+
+    async def test_a_confirmation_the_top_page_was_already_showing_is_not_one(
+        self, framed_page: Any
+    ) -> None:
+        """The exact false success, reproduced and then refused.
+
+        The frame swallows its own submit, so nothing about this
+        application changed anywhere. The only confirmation-shaped text on
+        the whole page is the banner the top document was already showing,
+        the top document never held the form, and its URL is not the
+        frame's. An honest answer is "not confirmed".
+        """
+        await _write_the_last_name(framed_page)
+        frame = _application_frame(framed_page)
+        await frame.evaluate(
+            """
+            () => {
+              window.addEventListener(
+                'submit',
+                (event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                },
+                true,
+              );
+            }
+            """
+        )
+        claim = _Claim()
+
+        outcome = await PlaywrightSubmitter(confirm_timeout_ms=3_000).submit(
+            framed_page, APPROVED, SubmitPermit(1, claim)
+        )
+
+        assert outcome.submitted is False
+        # The press was made, so the attempt is spent whatever the page said.
+        assert claim.calls == 1
+        assert await frame.locator("#application-form").count() == 1
+        assert await framed_page.locator("#saved-applications").count() == 1
+        assert await frame.locator("#fixture-submit-confirmation").count() == 0
+
+
+class TestAControlInAnOpenShadowRoot:
+    """A control no `querySelector` reaches, written to and then pressed.
+
+    Both halves of the shadow path are here on purpose. The scanner builds
+    it and the writer reads it, and if the two disagree the writer either
+    finds nothing or finds a *different* control — which would record
+    somebody's answer against a control it never went into. And the
+    submitter has to find its final control through the same boundary,
+    press the one in the shadow root, and confirm from the light-DOM banner
+    the page puts up afterwards.
+    """
+
+    async def test_a_field_in_a_shadow_root_is_found_again_and_typed_into(
+        self, shadow_page: Any
+    ) -> None:
+        gap = await _write_the_last_name(shadow_page)
+
+        assert gap.shadow_depth > 0
+        assert gap.shadow_path
+        assert await _shadow_value(shadow_page) == LAST_NAME
+
+    async def test_the_control_in_the_shadow_root_is_the_one_pressed(
+        self, shadow_page: Any
+    ) -> None:
+        await _write_the_last_name(shadow_page)
+        claim = _Claim()
+
+        outcome = await PlaywrightSubmitter(confirm_timeout_ms=8_000).submit(
+            shadow_page, APPROVED, SubmitPermit(1, claim)
+        )
+
+        assert outcome.submitted
+        assert claim.calls == 1
+        assert await shadow_page.locator("#fixture-submit-confirmation").count() == 1
+        assert await shadow_page.locator("#application-form").count() == 0
+
+    async def test_a_page_that_says_it_refused_the_press_is_not_a_submission(
+        self, shadow_page: Any
+    ) -> None:
+        """Nothing wrote the last name, so the page rejects the press.
+
+        The rejection is a `role="alert"` the page was not showing before,
+        which ends the wait immediately instead of spending the whole
+        confirmation timeout and then reporting an outcome nobody can
+        check.
+        """
+        claim = _Claim()
+
+        outcome = await PlaywrightSubmitter(confirm_timeout_ms=8_000).submit(
+            shadow_page, APPROVED, SubmitPermit(1, claim)
+        )
+
+        assert outcome.submitted is False
+        assert "required" in outcome.reason.lower()
+        assert claim.calls == 1
+        assert await shadow_page.locator("#fixture-submit-confirmation").count() == 0
+        assert await shadow_page.locator("#application-form").count() == 1
+
+
+async def _shadow_value(page: Any) -> str:
+    """What the shadow-root control actually holds, read past the boundary."""
+    return str(
+        await page.evaluate(
+            """
+            () => document
+              .getElementById('last-name-host')
+              .shadowRoot.querySelector('#last_name').value
+            """
+        )
     )
 
 

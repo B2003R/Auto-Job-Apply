@@ -25,20 +25,21 @@ from pathlib import Path
 import pytest
 
 from app.agent.browser_actions import is_confirmation_text
-from tests.fixture_server import ATS_FIXTURES
+from tests.fixture_server import ATS_FIXTURES, NESTED_FIXTURES
 
 ATS_DIR = Path(__file__).resolve().parent / "fixtures" / "ats"
 FAKE_SUBMIT_JS = ATS_DIR / "fake_submit.js"
+SHADOW_FORM_JS = ATS_DIR / "shadow_form.js"
 
 
 def _html(slug: str) -> str:
     return (ATS_DIR / f"{slug}.html").read_text(encoding="utf-8")
 
 
-def _confirmation_wording() -> str:
+def _confirmation_wording(script: Path = FAKE_SUBMIT_JS) -> str:
     """The text the fixtures show, read out of the script itself."""
-    match = re.search(r"CONFIRMATION_TEXT\s*=\s*\"([^\"]+)\"", FAKE_SUBMIT_JS.read_text())
-    assert match is not None, "fake_submit.js must declare CONFIRMATION_TEXT"
+    match = re.search(r"CONFIRMATION_TEXT\s*=\s*\"([^\"]+)\"", script.read_text())
+    assert match is not None, f"{script.name} must declare CONFIRMATION_TEXT"
     return match.group(1)
 
 
@@ -95,3 +96,57 @@ def test_the_form_still_validates_before_it_confirms(slug: str) -> None:
     about the writer.
     """
     assert "novalidate" not in _html(slug)
+
+
+# --------------------------------------------------------------------------
+# The fixtures whose form is not in the top document
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("slug", NESTED_FIXTURES)
+def test_a_nested_fixture_submits_nowhere_either(slug: str) -> None:
+    """The same promise as above, for the iframe and shadow-root pages."""
+    assert "action=" not in _html(slug)
+
+
+def test_the_shadow_fixture_answers_its_own_press() -> None:
+    """A control in a shadow root is not the light-DOM form's control.
+
+    Neither native submission nor native constraint validation reaches
+    across the boundary, so the fixture has to do both itself — and a
+    fixture that only did the first would confirm a form whose gap was
+    never filled, which would prove nothing about the writer.
+    """
+    source = SHADOW_FORM_JS.read_text()
+
+    assert "preventDefault" in source
+    assert "is required" in source
+    assert "fetch(" not in source
+    assert "XMLHttpRequest" not in source
+
+
+def test_the_two_handlers_confirm_in_the_same_words() -> None:
+    """Two scripts is one more than one; drift would be a false negative.
+
+    The shadow fixture cannot share `fake_submit.js` — it has its own
+    reasons to intercept — so the wording is asserted equal instead of
+    asserted twice.
+    """
+    assert _confirmation_wording(SHADOW_FORM_JS) == _confirmation_wording()
+    assert is_confirmation_text(_confirmation_wording(SHADOW_FORM_JS))
+
+
+def test_the_iframe_host_baits_the_bug_it_exists_for() -> None:
+    """The standing banner has to read like a confirmation to be bait.
+
+    The whole point of `iframe_host.html` is that a submitter judging a
+    child frame's press by the top page would read this text as this
+    application being confirmed. Worded so the shipped predicate ignores
+    it, the fixture would pass whether or not the bug was fixed.
+    """
+    host = _html("iframe_host")
+    match = re.search(r'role="status">\s*([^<]+)', host)
+    assert match is not None
+
+    assert is_confirmation_text(match.group(1).strip())
+    assert "<form" not in host

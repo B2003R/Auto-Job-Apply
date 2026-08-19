@@ -15,6 +15,13 @@ FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 ATS_DIR = FIXTURES_DIR / "ats"
 ATS_FIXTURES = ("greenhouse", "lever", "workday", "unknown")
 
+#: Fixtures for the two places a form can hide: a same-origin child frame
+#: and an open shadow root. Deliberately not in `ATS_FIXTURES` — they are
+#: not ATS-detection fixtures and the stub extension's gap contract knows
+#: nothing about them. They exist so the browser suite can drive the paths
+#: where a scanned control and a submitted form are not in the top document.
+NESTED_FIXTURES = ("iframe_host", "iframe_form", "shadow_form")
+
 
 def _pick_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
