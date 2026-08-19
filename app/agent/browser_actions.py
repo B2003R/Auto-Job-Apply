@@ -24,16 +24,23 @@ every job board and "verify" is on half of all forms; a guard matching those
 would abandon applications that were perfectly fillable, and the operator
 would see `login_required` with no way to know it was wrong. So the markers
 are the things that are only ever there when a challenge or a credential
-prompt genuinely is: a *visible* reCAPTCHA/hCaptcha/Turnstile/Arkose widget,
-and a *visible* password field.
+prompt genuinely is: an *active*
+reCAPTCHA/hCaptcha/Turnstile/Arkose challenge — the challenge frame, a
+widget rendered at a size a person could use, or one in a modal dialog —
+and a *visible* password field. The markup an invisible or v3 site key
+leaves on a page that challenges nobody is not one of them.
 
 **The submitter reports a submission only when the page says so.** It
 refuses without an approval, requires exactly one visible control whose
 accessible name is on an explicit allowlist, never clicks Next or Continue
-or Save, and after clicking waits for one of three concrete signals —
-navigation, a confirmation region, or the form it clicked in disappearing.
-No signal means `submitted=False` and no second click, because the only
-thing worse than an unconfirmed submission is two of them.
+or Save, and lets the driver verify the control is genuinely clickable
+before anything is spent on this application. Afterwards it compares each
+target with *its own* pre-click reading and accepts two things: a
+confirmation the page was not already showing, or a destination only a
+submission arrives at together with the form it clicked in being gone.
+Navigation alone is not one of them. No signal means `submitted=False` and
+no second click, because the only thing worse than an unconfirmed
+submission is two of them.
 
 Playwright is never imported here. Pages, frames, elements, and the mouse
 are all duck-typed, so all of the above is unit-testable without a browser;

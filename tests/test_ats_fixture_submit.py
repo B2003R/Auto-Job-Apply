@@ -3,13 +3,13 @@
 A fixture whose submit button navigated to nothing would let a browser test
 "pass" on a blank page, which is the failure this file exists to prevent:
 the headed integration test only reports a submission when the page produces
-one of the three signals `PlaywrightSubmitter` accepts, so the fixtures have
-to produce one locally, with no network and no server-side handler.
+a signal `PlaywrightSubmitter` accepts, so the fixtures have to produce one
+locally, with no network and no server-side handler.
 
 The script is shared by every fixture and does three things on submit:
-cancels the navigation, replaces the form with a visible confirmation, and
-removes the form from the document. Two of the three accepted signals, from
-one handler, on loopback.
+cancels the navigation, replaces the form with a confirmation the page was
+not already showing, and removes the form from the document. One accepted
+signal and its corroboration, from one handler, on loopback.
 
 These are text checks on files, not browser tests — but the confirmation
 wording is checked against the *same* predicate the submitter uses, so a

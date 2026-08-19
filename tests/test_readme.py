@@ -176,13 +176,34 @@ class TestTheWarnings:
         assert "Next" in text and "Continue" in text
         assert "unconfirmed" in text
 
-    def test_the_three_success_signals_are_documented(self) -> None:
+    def test_what_counts_as_a_confirmed_submission_is_documented(self) -> None:
+        """And, just as importantly, what does not.
+
+        The prose used to promise that a navigation confirmed a submission,
+        which is how a sign-in redirect became a submitted application. An
+        operator reading the old sentence would trust exactly the rows they
+        should not.
+        """
         text = README.read_text()
         submitting = text.index("Approving submits the application")
         section = text[submitting : text.index("## The HTTP API")]
         assert "navigat" in section
         assert "confirmation" in section
         assert "disappear" in section or "no longer" in section
+        assert "navigation on its own is not" in section
+        assert "not already showing" in section
+
+    def test_a_refusal_before_the_press_is_documented_as_costing_nothing(
+        self,
+    ) -> None:
+        """Otherwise the honest advice after one is "give up on this row".
+
+        A refused press leaves the application submittable, and an operator
+        who does not know that will not fix the page and try again.
+        """
+        text = README.read_text()
+        assert "immediately before it is made" in text
+        assert "as submittable as it was" in text
 
     def test_the_readme_says_the_click_never_happens_twice(self) -> None:
         """The one thing worse than an unconfirmed submission is two."""

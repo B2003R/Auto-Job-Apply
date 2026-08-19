@@ -430,27 +430,60 @@ same-origin frames. Some consequences worth knowing before you meet them:
   behalf.
 - **Two candidates is a refusal, not a coin toss.** An ambiguous page ends
   as failed with both names on the queue row.
+- **A control something is covering is a refusal too.** Between finding the
+  button and pressing it, a cookie banner can animate in over it, a sticky
+  footer can cover it, a chat widget can take the corner, or the node can
+  detach. The press is the driver's own click, and its actionability and
+  hit-target checks run first with the press withheld — so a button that is
+  not genuinely what a pointer would reach at that spot ends as failed with
+  `FinalSubmitControlNotActionable`, and **nothing was clicked**, which
+  means there is nothing to go and check.
 
-**Confirming.** After the click the page has to say something happened.
-One of three concrete signals counts: it navigated, a status, alert, or
-heading region shows a confirmation ("application submitted", "thank you
-for applying", and similar), or the form the button belonged to has
-disappeared from the page. If none appears within about twenty seconds,
-the application is recorded as **failed** with an `unconfirmed` reason and a
-screenshot, and the control is **never clicked a second time**. That row
-means "check this one by hand", not "this did not happen": an unconfirmed
-submission may well have gone through, and a second click is how one
-application becomes two.
+**Confirming.** After the click the page has to say something happened, and
+it has to be something that was not already true. Every frame that will be
+asked — the one the button was in, and the top document — is read *before*
+the click, and each is only ever compared against its own earlier reading.
+Two things count:
 
-**Once, even across a crash.** The press is claimed in the database before
-it is made, and that claim never expires. Every other interruption in this
-system is recovered by re-running the node that was interrupted; a worker
-killed mid-submit is the one that cannot be, because its thread looks
-exactly like one whose click never happened. So the worker that picks that
-thread up finds the claim, and **it is not pressed again**: the application
-fails with a reason naming the worker that pressed it and when. If you see
-that row, the form is still filled in on the page, and the ATS is the only
-place that knows whether the first press landed.
+- a confirmation in a status, alert, or heading region ("application
+  submitted", "thank you for applying", and similar) that the page **was
+  not already showing**, or
+- a navigation to a destination only a submitted application arrives at
+  (`/thank-you`, `/confirmation`, `?submitted=true`) **together with** the
+  form the button belonged to having disappeared.
+
+**A navigation on its own is not one of them**, and neither is the form
+disappearing on its own. A board that bounces an expired session to a
+sign-in page navigates; a validation round trip navigates; a single-page ATS
+swapping in step two of three removes the form. A destination that reads
+like a sign-in, an error, a challenge, or an expired session is a refusal
+however the page is worded — and so is a validation message, a password
+field, or a challenge widget that appears after the click, which ends the
+wait there and then rather than spending the whole timeout on a page that
+has already said no.
+
+If nothing decides it within about twenty seconds, the application is
+recorded as **failed** with an `unconfirmed` reason and a screenshot, and
+the control is **never clicked a second time**. That row means "check this
+one by hand", not "this did not happen": an unconfirmed submission may well
+have gone through, and a second click is how one application becomes two.
+
+**Once, even across a crash.** The press is claimed in the database
+immediately before it is made — after the control has been found, checked
+against the name rules, and confirmed clickable — and that claim never
+expires. Everything that can still refuse happens on the near side of it,
+so a refusal costs nothing: a page with two Submit buttons, or a banner over
+the only one, leaves the application exactly as submittable as it was, and
+fixing the page and approving again works.
+
+Once the claim is taken it outlives the process that took it. Every other
+interruption in this system is recovered by re-running the node that was
+interrupted; a worker killed mid-submit is the one that cannot be, because
+its thread looks exactly like one whose click never happened. So the worker
+that picks that thread up finds the claim, and **it is not pressed again**:
+the application fails with a reason naming the worker that pressed it and
+when. If you see that row, the form is still filled in on the page, and the
+ATS is the only place that knows whether the first press landed.
 
 Everything before the click is unchanged: queueing, navigation, the Apply
 click, autofill, scanning, attribution, gap detection, the rate cap, the
@@ -726,9 +759,14 @@ The offline test system has four pieces:
 - **A stub-driven confirmation.** The ATS fixtures answer their own submit
   locally (`tests/fixtures/ats/fake_submit.js`): the navigation is cancelled,
   a confirmation appears in a `role="status"` region, and the form is
-  removed. That is two of the three signals the submitter accepts, produced
-  with no server behind them — so a browser test can observe a submission
-  without one existing anywhere.
+  removed. That is a confirmation the page was not already showing, produced
+  with no server behind it — so a browser test can observe a submission
+  without one existing anywhere. Two further fixtures put the form where it
+  is hardest to get right: `iframe_host.html` holds it in a same-origin
+  child frame, under a top page that is *already* showing text reading
+  "thank you for applying", and `shadow_form.html` puts the last required
+  field and the submit control inside open shadow roots and answers its own
+  press (including refusing one whose field was never filled).
 
 **No test submits a real application.** One suite does launch a browser:
 
@@ -746,9 +784,19 @@ shadow root, that the page is waited out rather than slept through, that
 exactly one required input and one textarea are left as gaps, that a scanned
 field can be found again and typed into with its stable key re-derived from
 the control that was found, and that an approved application is clicked once
-and confirmed by the page. Two of its tests prove the refusals: a page with
-two `Submit application` buttons is not submitted, and neither is one whose
-only control says `Next`.
+and confirmed by the page. The refusals are proved there too: a page with two
+`Submit application` buttons is not submitted, nor is one whose only control
+says `Next`, nor one with a transparent banner covering the button.
+
+It also drives the two shapes where a form is not in the top document, both
+of which used to produce a *false* success. A form in a same-origin child
+frame is written to across the frame boundary and confirmed by that frame's
+own before-and-after, while the top page's standing "thank you for applying"
+banner is correctly not this application's confirmation. And a field and a
+submit control inside open shadow roots are found, written to, and pressed —
+with the stable key re-derived through the same shadow path, since a scanner
+and a writer that built it differently would record somebody's answer
+against a control it never went into.
 
 Only the board adapter and the listing URL are faked there, and both in the
 direction of safety: the adapter never navigates a real board, and the
@@ -806,8 +854,15 @@ otherwise be mistaken for "it worked":
   word is ambiguous with starting an application, and the ambiguity is
   resolved by leaving it to you.
 - **The captcha and login-wall guard reads structure, never prose.** A
-  visible reCAPTCHA, hCaptcha, Turnstile, or Arkose widget and a visible
-  password field are what it matches. A page that *says* "please verify" or
+  reCAPTCHA, hCaptcha, Turnstile, or Arkose *challenge* and a visible
+  password field are what it matches: the challenge frame itself, a widget
+  the page has rendered at a size a person could actually use, or one held
+  in a modal dialog. The markup an invisible or v3 site key leaves behind on
+  a page that challenges nobody — the corner badge, its anchor frame, a
+  container declaring itself invisible — is deliberately ignored, because
+  those are on a great many pages that never ask anyone anything, and
+  abandoning them would report `captcha_required` for an application you
+  could have filled in yourself. A page that *says* "please verify" or
   carries a "Sign in" link in its header is not treated as challenged,
   because those words are on an enormous number of perfectly fillable
   application pages and abandoning those would be a silent loss.

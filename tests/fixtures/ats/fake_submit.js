@@ -3,9 +3,10 @@
 // The fixtures are served by a loopback file server with no handler behind
 // them, so a real submit would navigate to the same page and lose the form —
 // which a browser test could easily mistake for success. Instead this
-// cancels the navigation and produces two of the three signals
-// `PlaywrightSubmitter` accepts: a visible confirmation in a status region,
-// and the disappearance of the form that was submitted.
+// cancels the navigation and produces the signal `PlaywrightSubmitter`
+// accepts on its own: a confirmation, in a status region, that the page was
+// not already showing. The form that was submitted is removed too, which is
+// what corroborates a success destination when there is one.
 //
 // Native constraint validation is left alone on purpose. A required input
 // the writer failed to fill blocks the submit event exactly as it would on a
