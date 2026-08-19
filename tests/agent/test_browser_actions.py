@@ -690,23 +690,25 @@ class TestNoFrameCanHoldTheWriter:
     """
 
     async def test_a_frame_that_never_answers_the_count_is_a_refusal(self) -> None:
-        """Not a skip: uniqueness cannot be established without it.
+        """And the refusal says so, because "no match" is a different bug.
 
         "Exactly one control answers to this key" is the check that stops
-        somebody's answer going into the wrong box, and a frame that did not
-        answer might be holding the second match. So the write is refused,
-        which the graph records as an unfilled gap — visible at the approval
-        gate, where a human decides.
+        somebody's answer going into the wrong box, and it cannot be made
+        about a frame that did not answer. Reported as a silent frame rather
+        than as zero matches: this reason reaches a log, and an operator told
+        the control was not found goes looking at the form instead of at a
+        frame that never had an execution context.
         """
         target = field()
         silent = FakeFrame(MAIN_URL, {WRITE_COUNT_SCRIPT: _never_answers})
         writer = PlaywrightFieldWriter(frame_timeout_ms=20)
 
-        with pytest.raises(FieldNotUniquelyResolved):
+        with pytest.raises(FieldNotUniquelyResolved) as raised:
             await asyncio.wait_for(
                 writer.write_or_raise(FakePage(silent), target, ANSWER), timeout=5
             )
 
+        assert "stopped answering" in str(raised.value)
         assert silent.times_run(WRITE_SCRIPT) == 0
 
     async def test_a_frame_that_stops_answering_mid_write_is_never_retried(

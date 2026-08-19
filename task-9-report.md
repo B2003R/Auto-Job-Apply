@@ -887,3 +887,238 @@ Concern 3 is narrowed as described under finding 6. New:
    shape for a suite that observes what a page does, and the browser fixtures
    for the two new pages open their own tab in that context rather than
    sharing the Greenhouse one.
+
+---
+
+# Task 9 addendum 2: the remaining Critical, and four hardenings
+
+## Status
+
+DONE. The remaining Critical is closed, along with four smaller things next
+to it. `AUTO_SUBMIT` is still `false`, no blocker gate changed, and nothing
+here submits anything external.
+
+The Critical, in one line: confirmation *freshness* was a comparison of
+text, so a careers page whose standing thank-you panel counts, cycles, or
+rebuilds itself produced a confirmation nobody had been showing on the first
+poll after any click at all — an application recorded as sent, an approval
+spent, and a queue row completed for a form that never went anywhere. The
+four hardenings: `?submitted=false` counted as a success destination; the
+field writer's evaluations and the submitter's scroll were the last
+unbounded waits left; every application's screenshots overwrote the last
+one's; and every browser run printed a Playwright teardown trace that read
+like a crash.
+
+## Commits
+
+Five commits, on top of `64693a2` (the addendum above), plus this report.
+
+| SHA | Message |
+|-----|---------|
+| `2c465c6` | `fix(submit): judge confirmation freshness by region, not by wording` |
+| `72e7354` | `fix(submit): a success destination has to say so affirmatively` |
+| `ade94f9` | `fix(writer,submit): bound the two evaluations that were still unbounded` |
+| `4323776` | `fix(artifacts): one screenshot per application, per attempt` |
+| `cdcaf6a` | `test(integration): stop asking Playwright a question that prints a crash` |
+
+**Not pushed, no PR**, per the task instructions.
+
+## Files changed
+
+| File | Action |
+|------|--------|
+| `app/agent/browser_actions.py` | Modified — `ConfirmationRegion` and `_fresh_confirmations`; `SUBMIT_STATE_SCRIPT` stamps and reports a region identity; `SUCCESS_PATH`/`NEGATED_SUCCESS`/`SUCCESS_QUERY_KEY` with a parsed query; the writer's per-frame deadline; a bounded scroll; screenshots named after the application |
+| `app/main.py` | Modified — `ArtifactScreenshotter` never overwrites, and a name never decides where a file goes |
+| `README.md` | Modified — what makes a confirmation a new one, what a success destination has to say, and the fixture that will not hold still |
+| `tests/agent/test_browser_actions.py` | Modified — `TestWhatMakesAConfirmationANewOne`, `TestNoFrameCanHoldTheWriter`, truthy/negated destinations, the screenshot's name, a control that never finishes scrolling |
+| `tests/test_api.py` | Modified — `TestTheScreenshotsAnOperatorHasToLookAt` |
+| `tests/integration/test_stub_extension.py` | Modified — `TestAConfirmationShapedPanelThatWillNotHoldStill` (five real-Chromium regressions) |
+| `tests/fixtures/ats/live_status.html`, `live_status.js` | Created — a standing thank-you panel that ticks, rebuilds itself, has no id, or counts the press, plus the neutral status region the happy case confirms into |
+| `tests/fixture_server.py` | Modified — `LIVE_REGION_FIXTURES` |
+| `tests/test_ats_fixture_submit.py` | Modified — offline checks that the panel is bait and that the region it confirms into starts neutral |
+| `tests/integration/browser.py` | Modified — the Chromium path is asked for in a subprocess |
+| `tests/test_readme.py` | Modified — the freshness rule is pinned in the prose |
+
+## Verification
+
+```bash
+python3 -m pytest -q                                    # 1872 passed (1835 before, +37)
+python3 -m pytest -q --ignore=tests/integration         # 1842 passed, no browser
+DISPLAY=:1 python3 -m pytest tests/integration -q       # 30 passed in 65s, real Chromium
+env -u DISPLAY python3 -m pytest tests/integration -q   # 30 passed in 67s — Xvfb started by the suite
+CHROME_EXECUTABLE=/nonexistent python3 -m pytest tests/integration -q -rs
+                                                        # 1 passed, 29 skipped, reason names the variable
+python3 -m mypy app                                     # Success: no issues found in 29 source files
+python3 -m compileall -q app tests scripts              # OK
+git diff --check 64693a2..HEAD                          # clean
+```
+
+**Browser result: 30 passed** (25 before, +5), both under the inherited
+`DISPLAY=:1` and under an `Xvfb` the suite starts itself — and now without
+the Playwright teardown trace that used to follow every run.
+
+`mypy app tests` still reports the pre-existing `Settings(_env_file=None)`
+errors present in every test module here; nothing added contributes a new
+one, and `mypy app` is clean.
+
+## Finding by finding
+
+### 1. Freshness is a property of the region, not of its wording (Critical)
+
+`PageState.confirmations` was a tuple of *texts*, and a confirmation counted
+as new when its text was not in the pre-click reading. Every careers page
+with a standing "you have applied to N roles this month" panel therefore
+confirmed every click: the panel's wording changes on a timer, so the very
+first poll found confirmation-shaped text nobody had been showing.
+
+It is now a tuple of `ConfirmationRegion(identity, text)`. The state script
+addresses each confirmation-shaped region in three fallbacks, in the order
+they survive a repaint: an identity it has already stamped on the node
+(`data-jobright-confirmation-region`), the page's own `id` for it, and
+failing both a token minted and stamped now. The shadow-root path prefixes
+all three, so an `id` inside a component cannot collide with the same `id` in
+the light DOM.
+
+`_fresh_confirmations` then requires **both** halves, and each is
+load-bearing in a different direction:
+
+* a region whose *identity* is in the baseline is not new, however its text
+  changed — the counting panel;
+* a region whose *text* the target was already showing is not new, however
+  new the node is — the framework that rebuilds its banner rather than
+  editing it, which an identity rule alone would read as a confirmation
+  arriving.
+
+What must not break, and does not: the empty `role="status"` region almost
+every ATS confirms into is not in the confirmation *baseline*, because
+nothing that is not already shaped like a confirmation ever is. The moment
+it reads like one it is a new region by both halves of the rule.
+
+A region reported without both an identity and a text is dropped rather than
+guessed at, which costs an honest "not confirmed".
+
+**Real Chromium.** `live_status.html` is the page this could not be proved
+without: a panel that rewrites its own text on a 60ms timer, one that throws
+its node away and rebuilds it (same `id`, new element), one with no `id` at
+all, and one that bumps its count the instant the button is pressed. All four
+swallow the submit, so the honest answer to each is "not confirmed". The
+fifth test is the ordinary case on the same restless page — a neutral
+`role="status"` region that the click fills in — and it still confirms, with
+the panel counting throughout and the reason naming the banner rather than
+the counter.
+
+### 2. A success destination has to say so affirmatively
+
+`SUCCESS_DESTINATION` was one word list searched over the path and the query
+joined together, so `?submitted=false` — how an ATS records a draft —
+matched, as did `?submitted=` and `/application/not-submitted`. On the one
+acceptance path where a vanished form is already half the evidence, a
+validation round trip that reloaded with a state flag was a submitted
+application.
+
+The path is now matched on its own (`SUCCESS_PATH`), a negation anywhere in
+it disqualifies the URL outright (`NEGATED_SUCCESS`), and the query is
+*parsed*: a key that could carry a claim (`submitted`, `confirmed`,
+`success`, `complete`, camel-cased or separated) only carries one when its
+value is on `TRUTHY_QUERY_VALUES`. `?submitted=true`, `?success=yes`,
+`?applicationSubmitted=TRUE` count; `?submitted=false`, `?submitted=0`,
+`?submitted=`, `?not_submitted=1` do not.
+
+### 3. The last two unbounded waits
+
+The guard, the scanner, and the submitter's questions all stop waiting on a
+frame with no execution context. Two calls did not: every `evaluate` the
+field writer makes, and the submitter scrolling its control into view. A
+worker stuck in the writer holds a half-filled form, a lease nobody renews,
+and the queue behind it.
+
+* A frame that stops answering while its controls are counted is a
+  **refusal** naming the silent frame, not a skip reported as zero matches:
+  the reason reaches a log, and an operator told the control was not found
+  goes looking at the form rather than at a frame that never had a context.
+* A frame that stops answering *during* the write is
+  `FieldWriteNotVerified` — the value may already be in the control, and
+  that is the outcome this project never retries.
+* Scrolling stays best effort and is merely bounded. The driver's own click
+  scrolls again anyway, so giving up on a page whose smooth scroll never
+  settles costs nothing.
+
+### 4. One screenshot per application, per attempt
+
+Diagnostics went to `{name}.png`, and the submitter's three names —
+`submitted`, `refused`, `unconfirmed` — carried nothing identifying the
+application. Every application overwrote the last one's evidence, so a queue
+row telling an operator to check a screenshot pointed at a picture of
+somebody else's page. For an unconfirmed submission that image is the only
+evidence there is.
+
+The submitter now names its images after the thread, like every other
+artifact a run writes, and `ArtifactScreenshotter` never overwrites: each
+capture gets a timestamped filename, and probes for a free one if two land
+in the same microsecond, so one application photographed on two attempts
+keeps both. A name is also no longer allowed to decide *where* a file is
+written — it is built from a thread id, which comes out of the database.
+
+### 5. The teardown trace that read like a crash
+
+Reading `chromium.executable_path` starts a Playwright driver, and the sync
+API's connection is torn down by the interpreter rather than by a running
+event loop — leaving a cancelled task and an unretrieved `TargetClosedError`
+printed to stderr at the end of every browser run. Deterministic, harmless,
+and indistinguishable at a glance from a browser test having died. The
+question is asked in a child process now, whose output is ours to discard.
+
+## Mutation testing
+
+Every fix was reverted in place and the tests re-run.
+
+| Mutation | Caught by |
+|---|---|
+| Freshness by text only (the original bug) | 3 unit tests, and all 5 Chromium regressions |
+| Freshness by identity only | the rebuilt-banner unit test |
+| Region identity minted per node, ignoring the page's `id` | the Chromium rebuild test, alone |
+| Region identity ignoring its own stamp | the Chromium no-`id` test, alone |
+| Success destination searched over path and query together | 11 unit tests |
+| A silent frame skipped rather than refused while counting | the writer's refusal-reason test |
+| Screenshot name without the application | the submitter's naming test |
+| Artifact filenames not made unique | the two-attempts test |
+
+Two of the eight are caught **only** in a real browser, which is the answer
+to whether the Chromium fixtures earn their 15 seconds: an identity that has
+to survive a node being replaced cannot be tested against a double that
+never replaces one.
+
+## Concerns
+
+Every concern from the addendum above stands. New:
+
+1. **A banner whose wording the page was already showing elsewhere cannot
+   confirm.** The text half of the freshness rule means an ATS that confirms
+   with wording identical to a standing panel's records a **failed**
+   application that may well have been submitted. It needs the two to match
+   exactly after whitespace folding, and the old text-only rule refused the
+   same case, so this is not a regression — but it is a false negative kept
+   on purpose, because the alternative is the false positive above.
+2. **The state script now writes to the page.** It stamps an attribute on
+   regions that read like a confirmation, the way the submit target's form is
+   already marked. Harmless on every page seen, but it is a mutation made
+   while reading, and a page that reacted to attribute changes on its live
+   regions would see it.
+3. **A region rebuilt with no `id` and different wording is a new region.**
+   Both fallbacks are gone in that case: nothing on the node survived, and
+   the text changed. A panel that rebuilds itself anonymously *and* rewrites
+   its wording each time would still be read as confirming. The Chromium
+   fixture covers each of those alone; the combination is not covered because
+   it is not a thing a real page does — a rebuilt anonymous node with new
+   text is indistinguishable, by any means available in a page, from a
+   genuinely new banner.
+4. **`TRUTHY_QUERY_VALUES` is a list.** An ATS that signals success with
+   `?submitted=Y%20Yes` or a locale-specific word is read as not saying so,
+   which is the safe direction and another honest "unconfirmed".
+5. **Artifacts accumulate.** Nothing prunes `data/artifacts` now that
+   filenames are unique, where before it was self-limiting at a handful of
+   files. Retention is an operator's decision, but it is now theirs to make.
+6. **The Chromium path probe costs a subprocess.** Once per session, only
+   when `CHROME_EXECUTABLE` is unset, about half a second — for a question
+   whose answer is a filename. Caching it across sessions would need a file
+   nobody has asked for.

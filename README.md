@@ -771,7 +771,11 @@ The offline test system has four pieces:
   child frame, under a top page that is *already* showing text reading
   "thank you for applying", and `shadow_form.html` puts the last required
   field and the submit control inside open shadow roots and answers its own
-  press (including refusing one whose field was never filled).
+  press (including refusing one whose field was never filled). A fourth,
+  `live_status.html`, is the page that never holds still: a standing "thank
+  you for applying to N roles this month" panel that counts on a timer,
+  rebuilds itself rather than editing its text, or bumps the moment the
+  button is pressed.
 
 **No test submits a real application.** One suite does launch a browser:
 
@@ -802,6 +806,15 @@ submit control inside open shadow roots are found, written to, and pressed —
 with the stable key re-derived through the same shadow path, since a scanner
 and a writer that built it differently would record somebody's answer
 against a control it never went into.
+
+The page whose thank-you panel keeps changing is driven there too, because
+this is the one thing no double can imitate: the identity that makes a
+region *one* region has to survive its text being rewritten, its node being
+thrown away and rebuilt, and its having no id for anything to hold on to.
+Each of those confirmed a submission under the old rule. The ordinary case
+is checked on the same restless page: one neutral `role="status"` region
+that the click fills in still confirms, while the panel beside it counts
+throughout and is still not what confirmed anything.
 
 Only the board adapter and the listing URL are faked there, and both in the
 direction of safety: the adapter never navigates a real board, and the
