@@ -6,10 +6,13 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Iterator
 
 from app.config import Settings
 from app.storage.models import (
+    TERMINAL_APPLICATION_STATUSES,
+    TERMINAL_QUEUE_STATES,
     ApplicationField,
     ApplicationRecord,
     ApplicationStatus,
@@ -68,6 +71,16 @@ _SCHEMA_STATEMENTS = (
         value TEXT
     );
     """,
+    # What a provenance row asserts is "this application had this control
+    # filled from this source", which is either true or not: recording it
+    # twice states nothing new. Graph nodes are re-executed after a crash or
+    # a replayed checkpoint, so without this index the same attribution pass
+    # would append a second row every time, and a reviewer counting required
+    # fields would read a form as larger than it is.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_application_fields_identity
+        ON application_fields(application_id, stable_key, source);
+    """,
     """
     CREATE TABLE IF NOT EXISTS approvals (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +114,81 @@ _RATE_DAY_PREDICATE = (
 #: serializes concurrent workers on a single immediate transaction, so a brief
 #: wait under contention is expected and must not surface as an error.
 _BUSY_TIMEOUT_MS = 5_000
+
+
+#: Cost is stored in a REAL column but reasoned about as an exact decimal.
+#: Quantising every total to this many places keeps the float round-trip
+#: lossless (Python's shortest repr recovers the same decimal) so repeated
+#: additions cannot drift.
+_COST_PLACES = Decimal("0.000001")
+
+
+class UnknownApplication(LookupError):
+    """A write named an application row that is not there.
+
+    Distinct from the agent layer's `UnknownApplicationError`, which is
+    about a decision naming an application a human could have mistyped;
+    this one means the storage layer was asked to charge or update a row
+    that does not exist, which is a programming error.
+    """
+
+    def __init__(self, application_id: int) -> None:
+        super().__init__(f"no application with id {application_id}")
+        self.application_id = application_id
+
+
+class SchemaMigrationRequired(RuntimeError):
+    """A database written before an identity rule existed still violates it.
+
+    Raised from `Database.initialize` instead of letting `CREATE UNIQUE
+    INDEX` fail with a bare IntegrityError, which says only that some index
+    could not be built. This names the table, the columns, and the offending
+    values, so an operator can see what to merge or delete.
+    """
+
+
+#: Uniqueness rules added after the first release. Each is checked for
+#: pre-existing violations before its index is created, so an old database
+#: reports what is wrong with it rather than failing to open.
+_IDENTITY_RULES = (
+    ("applications", ("thread_id",)),
+    ("application_fields", ("application_id", "stable_key", "source")),
+)
+
+
+def _assert_no_duplicates(conn: sqlite3.Connection) -> None:
+    for table, columns in _IDENTITY_RULES:
+        if not _table_exists(conn, table):
+            continue
+        grouped = ", ".join(columns)
+        rows = conn.execute(
+            f"""
+            SELECT {grouped}, COUNT(*) AS copies FROM {table}
+            GROUP BY {grouped} HAVING copies > 1 ORDER BY copies DESC LIMIT 5
+            """
+        ).fetchall()
+        if not rows:
+            continue
+        offenders = "; ".join(
+            ", ".join(f"{column}={row[column]!r}" for column in columns)
+            + f" ({row['copies']} rows)"
+            for row in rows
+        )
+        raise SchemaMigrationRequired(
+            f"{table} holds rows that repeat ({grouped}), which this version "
+            f"treats as one identity: {offenders}. Keep the row you want to "
+            f"survive and delete the rest, then start again — for example "
+            f"`DELETE FROM {table} WHERE id NOT IN (SELECT MAX(id) FROM "
+            f"{table} GROUP BY {grouped})`."
+        )
+
+
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,),
+    ).fetchone()
+    return row is not None
 
 
 def _utc_now() -> datetime:
@@ -167,6 +255,7 @@ class Database:
     def initialize(self) -> None:
         self._settings.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as conn:
+            _assert_no_duplicates(conn)
             for statement in _SCHEMA_STATEMENTS:
                 conn.execute(statement)
             conn.commit()
@@ -211,15 +300,16 @@ class Database:
     def enqueue_job(self, listing_url: str, board: Board) -> int:
         now = _format_ts(_utc_now())
         with self.connect() as conn:
-            cursor = conn.execute(
+            row = conn.execute(
                 """
                 INSERT INTO job_queue (listing_url, board, state, error_reason, created_at, updated_at)
                 VALUES (?, ?, ?, NULL, ?, ?)
+                RETURNING id
                 """,
                 (listing_url, board.value, QueueState.PENDING.value, now, now),
-            )
+            ).fetchone()
             conn.commit()
-            return int(cursor.lastrowid)
+            return int(row["id"])
 
     def get_queue_item(self, queue_id: int) -> QueueItem | None:
         with self.connect() as conn:
@@ -244,18 +334,34 @@ class Database:
         queue_id: int,
         state: QueueState,
         error_reason: str | None = None,
-    ) -> None:
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Move a queue item, unless it has already finished.
+
+        Returns whether the row was written. A finished item is left alone:
+        a retried node or a replayed checkpoint arriving after the outcome
+        was recorded must not put a completed application back in flight.
+        `force` is for an operator deliberately requeueing something.
+        """
         now = _format_ts(_utc_now())
+        clause = ""
+        guard: tuple[Any, ...] = ()
+        if not force:
+            terminal = sorted(item.value for item in TERMINAL_QUEUE_STATES)
+            clause = f" AND state NOT IN ({', '.join('?' * len(terminal))})"
+            guard = tuple(terminal)
         with self.connect() as conn:
-            conn.execute(
-                """
+            cursor = conn.execute(
+                f"""
                 UPDATE job_queue
                 SET state = ?, error_reason = ?, updated_at = ?
-                WHERE id = ?
+                WHERE id = ?{clause}
                 """,
-                (state.value, error_reason, now, queue_id),
+                (state.value, error_reason, now, queue_id, *guard),
             )
             conn.commit()
+            return cursor.rowcount == 1
 
     def create_application(
         self,
@@ -269,13 +375,14 @@ class Database:
     ) -> int:
         now = _format_ts(_utc_now())
         with self.connect() as conn:
-            cursor = conn.execute(
+            row = conn.execute(
                 """
                 INSERT INTO applications (
                     queue_id, thread_id, ats, status, trigger_tier,
                     model_cost, screenshot_path, created_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
                 """,
                 (
                     queue_id,
@@ -288,9 +395,9 @@ class Database:
                     now,
                     now,
                 ),
-            )
+            ).fetchone()
             conn.commit()
-            return int(cursor.lastrowid)
+            return int(row["id"])
 
     def get_application(self, application_id: int) -> ApplicationRecord | None:
         with self.connect() as conn:
@@ -323,15 +430,24 @@ class Database:
         trigger_tier: int | None = None,
         model_cost: float | None = None,
         screenshot_path: str | None = None,
-    ) -> None:
+        force: bool = False,
+    ) -> bool:
         """Update only the columns actually named by the caller.
 
         Every parameter defaults to `None` meaning "leave alone", so a node
         that learns one fact (the detected ATS) cannot blank out another it
         never looked at (the trigger tier recorded a step earlier).
+
+        A *status* change is additionally refused once the application has
+        finished, because that transition is the one with consequences: a
+        node re-executed after a crash must not reopen a submitted
+        application. Facts that merely describe the finished application (a
+        screenshot taken just after submitting) are still accepted, and
+        `force` exists for an operator who means it. Returns whether the row
+        was written.
         """
         assignments: list[str] = []
-        values: list[Any] = []
+        assigned: list[Any] = []
         for column, value in (
             ("status", status.value if status is not None else None),
             ("ats", ats),
@@ -342,18 +458,109 @@ class Database:
             if value is None:
                 continue
             assignments.append(f"{column} = ?")
-            values.append(value)
+            assigned.append(value)
         if not assignments:
-            return
-
+            return False
         assignments.append("updated_at = ?")
-        values.extend([_format_ts(_utc_now()), application_id])
+        assigned.append(_format_ts(_utc_now()))
+
+        clause = ""
+        guard: tuple[Any, ...] = ()
+        if status is not None and not force:
+            terminal = sorted(item.value for item in TERMINAL_APPLICATION_STATUSES)
+            clause = f" AND status NOT IN ({', '.join('?' * len(terminal))})"
+            guard = tuple(terminal)
+
         with self.connect() as conn:
-            conn.execute(
-                f"UPDATE applications SET {', '.join(assignments)} WHERE id = ?",
-                tuple(values),
+            cursor = conn.execute(
+                f"UPDATE applications SET {', '.join(assignments)} "
+                f"WHERE id = ?{clause}",
+                (*assigned, application_id, *guard),
             )
             conn.commit()
+            return cursor.rowcount == 1
+
+    def add_model_cost(self, application_id: int, amount: Decimal) -> Decimal:
+        """Add spend to an application's running total, returning the total.
+
+        Additive rather than assigned, and atomic rather than read-then-write,
+        because a node that calls a model and then crashes before finishing
+        has still spent the money. When the graph re-executes that node the
+        model is called again, and the second charge is a second real charge:
+        replacing the total would under-report the bill by exactly the
+        amount the crashed attempt cost.
+        """
+        with self.immediate_transaction() as conn:
+            row = conn.execute(
+                "SELECT model_cost FROM applications WHERE id = ?",
+                (application_id,),
+            ).fetchone()
+            if row is None:
+                raise UnknownApplication(application_id)
+            current = Decimal(str(row["model_cost"] or "0"))
+            total = (current + amount).quantize(_COST_PLACES)
+            conn.execute(
+                "UPDATE applications SET model_cost = ?, updated_at = ? WHERE id = ?",
+                (float(total), _format_ts(_utc_now()), application_id),
+            )
+        return total
+
+    def claim_resume(
+        self, application_id: int
+    ) -> tuple[bool, ApplicationRecord | None]:
+        """Take exclusive ownership of an application's pending decision.
+
+        Compare-and-set from `awaiting_approval` to `resuming`: exactly one
+        caller can win, whichever process or thread it runs in. Returns
+        `(claimed, record)` where `record` is the application as it stands
+        after the attempt, so a caller that lost can see whether the winner
+        is still in flight or has already finished.
+
+        In-process locking is not enough here. Two workers on one database
+        each hold their own lock, and a resume that both of them start ends
+        in two submissions of the same form.
+        """
+        with self.immediate_transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE applications SET status = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    ApplicationStatus.RESUMING.value,
+                    _format_ts(_utc_now()),
+                    application_id,
+                    ApplicationStatus.AWAITING_APPROVAL.value,
+                ),
+            )
+            claimed = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM applications WHERE id = ?",
+                (application_id,),
+            ).fetchone()
+        return claimed, _application(row)
+
+    def release_resume_claim(self, application_id: int) -> bool:
+        """Hand a claimed application back to the gate, if it is still claimed.
+
+        Guarded on `resuming` so a release running after the winner reached
+        a terminal status cannot reopen a submitted application for a second
+        decision.
+        """
+        with self.immediate_transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE applications SET status = ?, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    ApplicationStatus.AWAITING_APPROVAL.value,
+                    _format_ts(_utc_now()),
+                    application_id,
+                    ApplicationStatus.RESUMING.value,
+                ),
+            )
+            return bool(cursor.rowcount == 1)
 
     def record_approval(
         self,
@@ -501,14 +708,28 @@ class Database:
         value: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> int:
+        """Record where one control's content came from, once.
+
+        Upserts on `(application_id, stable_key, source)`: replaying the
+        attribution pass after a crash restates the same fact rather than
+        appending a duplicate, and the latest observation of that fact wins,
+        so a field seen empty and later seen filled ends up recorded as
+        filled. Returns the row id either way.
+        """
         with self.connect() as conn:
-            cursor = conn.execute(
+            row = conn.execute(
                 """
                 INSERT INTO application_fields (
                     application_id, stable_key, metadata_json, source,
                     required, filled, value
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(application_id, stable_key, source) DO UPDATE SET
+                    metadata_json = excluded.metadata_json,
+                    required = excluded.required,
+                    filled = excluded.filled,
+                    value = excluded.value
+                RETURNING id
                 """,
                 (
                     application_id,
@@ -519,9 +740,9 @@ class Database:
                     int(filled),
                     value,
                 ),
-            )
+            ).fetchone()
             conn.commit()
-            return int(cursor.lastrowid)
+            return int(row["id"])
 
     def get_application_fields(self, application_id: int) -> list[ApplicationField]:
         with self.connect() as conn:

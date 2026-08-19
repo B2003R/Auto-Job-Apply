@@ -26,6 +26,10 @@ class QueueState(str, Enum):
 class ApplicationStatus(str, Enum):
     STAGING = "staging"
     AWAITING_APPROVAL = "awaiting_approval"
+    # A decision has been claimed and the submit path is in flight. Held only
+    # between the claim and the terminal write, it is what stops a second
+    # worker acting on the same approval.
+    RESUMING = "resuming"
     SUBMITTED = "submitted"
     REJECTED = "rejected"
     # Distinct from FAILED: the application was abandoned on purpose (an
@@ -33,6 +37,24 @@ class ApplicationStatus(str, Enum):
     # Conflating the two would make a log of genuine malfunctions unreadable.
     SKIPPED = "skipped"
     FAILED = "failed"
+
+
+#: Statuses that mean this application's story is over. Reaching one is a
+#: one-way door: a late writer from a retried node or a replayed checkpoint
+#: must not walk a submitted application back to staging and apply again.
+TERMINAL_APPLICATION_STATUSES = frozenset(
+    {
+        ApplicationStatus.SUBMITTED,
+        ApplicationStatus.REJECTED,
+        ApplicationStatus.SKIPPED,
+        ApplicationStatus.FAILED,
+    }
+)
+
+#: The queue-side equivalent, for the same reason.
+TERMINAL_QUEUE_STATES = frozenset(
+    {QueueState.COMPLETED, QueueState.FAILED, QueueState.SKIPPED}
+)
 
 
 class FieldSource(str, Enum):
