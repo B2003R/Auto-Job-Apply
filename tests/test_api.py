@@ -296,6 +296,58 @@ class TestRunStatus:
         assert "Because the work matters." in response.text
 
 
+class TestApplicationListing:
+    """`GET /applications` is what a reviewer's queue is built from."""
+
+    def test_an_empty_installation_lists_nothing(self, client: TestClient) -> None:
+        response = client.get("/applications")
+        assert response.status_code == 200
+        assert response.json() == []
+
+    def test_every_application_is_listed_with_its_run(
+        self, client: TestClient, harness: Harness
+    ) -> None:
+        first = queue_one(client, "https://www.linkedin.com/jobs/view/1/")
+        second = queue_one(client, "https://www.linkedin.com/jobs/view/2/")
+        staged_application(harness, first["queue_id"])
+        staged_application(harness, second["queue_id"])
+
+        body = client.get("/applications").json()
+
+        assert [view["queue_id"] for view in body] == [
+            first["queue_id"],
+            second["queue_id"],
+        ]
+        assert all(view["listing_url"] for view in body)
+        assert all(view["awaiting_decision"] for view in body)
+
+    def test_the_status_filter_narrows_the_list(
+        self, client: TestClient, harness: Harness
+    ) -> None:
+        queued = queue_one(client)
+        application_id = staged_application(harness, queued["queue_id"])
+        client.post(f"/applications/{application_id}/reject", json={})
+
+        awaiting = client.get(
+            "/applications", params={"status": ApplicationStatus.AWAITING_APPROVAL.value}
+        ).json()
+        rejected = client.get(
+            "/applications", params={"status": ApplicationStatus.REJECTED.value}
+        ).json()
+
+        assert awaiting == []
+        assert [view["application"]["id"] for view in rejected] == [application_id]
+
+    def test_an_unknown_status_is_a_validation_error(
+        self, client: TestClient
+    ) -> None:
+        """Not an empty list: a typo would otherwise read as "none of those"."""
+        response = client.get("/applications", params={"status": "nearly_submitted"})
+
+        assert response.status_code == 422
+        assert response.json()["error"]["kind"] == "validation_error"
+
+
 class TestApprovalEndpoints:
     def test_approving_submits_the_application(
         self, client: TestClient, harness: Harness
