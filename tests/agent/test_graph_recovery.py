@@ -471,16 +471,24 @@ class TestMidFlightThreads:
     """
 
     async def _staged_then_died_in_submit(self, world: World, queue_id: int) -> str:
-        async def explode(page: Any, authorization: SubmitAuthorization) -> SubmitOutcome:
-            raise Crash("the worker died between approving and submitting")
+        """Stage, decide, then die *before* anything was pressed.
 
+        The crash is put in the page guard, which the submit node runs
+        immediately before it claims its one press. That is what makes these
+        threads recoverable: the successor can see that no press was ever
+        claimed, and pressing is still the right thing to do. A crash on the
+        other side of that claim is a different situation with a different
+        answer — see
+        `test_a_click_a_crash_interrupted_is_not_sent_a_second_time`.
+        """
         async with world.runner() as runner:
             staged = await runner.run_application(queue_id)
-            world.submitter.submit = explode  # type: ignore[method-assign]
+            world.guard.error = Crash("the worker died between approving and submitting")
             with pytest.raises(Crash):
                 await runner.resume_application(
                     staged.thread_id, approve(staged.application_id)
                 )
+        world.guard.error = None
         return staged.thread_id
 
     async def test_a_resume_continues_it_and_returns_the_real_outcome(
@@ -505,6 +513,55 @@ class TestMidFlightThreads:
         record = world.db.get_application(application.id)
         assert record is not None
         assert record.status is ApplicationStatus.SUBMITTED
+
+    async def test_a_click_a_crash_interrupted_is_not_sent_a_second_time(
+        self, tmp_path: Path
+    ) -> None:
+        """The one duplicate nobody can take back.
+
+        A worker killed *after* the submit click leaves a thread that looks
+        identical to one whose click never happened: no outcome recorded, no
+        interrupt resolved, an approval on file. Continuing it by replaying
+        the node is right for every other node in this graph and wrong for
+        this one — the page has already had the application, and a second
+        press is a second application with somebody's name on it.
+
+        So the attempt is claimed before the click and the claim outlives
+        the process. The successor finds it, does not press anything, and
+        fails the application with an outcome nobody can confirm — which is
+        a person checking one ATS by hand, rather than a duplicate.
+        """
+        world = build_world(tmp_path)
+        queue_id = world.enqueue()
+        clicked = {"count": 0}
+
+        async def click_then_die(
+            page: Any, authorization: SubmitAuthorization
+        ) -> SubmitOutcome:
+            clicked["count"] += 1
+            raise Crash("the worker was killed after the submit click landed")
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.submitter.submit = click_then_die  # type: ignore[method-assign]
+            with pytest.raises(Crash):
+                await runner.resume_application(
+                    staged.thread_id, approve(staged.application_id)
+                )
+
+        successor_submitter = FakeSubmitter()
+        world.submitter.submit = successor_submitter.submit  # type: ignore[method-assign]
+        async with world.runner() as successor:
+            result = await successor.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert clicked["count"] == 1
+        assert successor_submitter.calls == 0
+        assert result.status is RunStatus.FAILED
+        record = world.db.get_application(staged.application_id or 0)
+        assert record is not None
+        assert record.status is ApplicationStatus.FAILED
 
     async def test_a_resume_refuses_while_another_owner_holds_it(
         self, tmp_path: Path

@@ -109,6 +109,7 @@ from app.agent.errors import (
     ServiceWorkerNotFoundError,
     ServiceWorkerUnresponsiveError,
     StagingArtefactsLost,
+    SubmitAlreadyAttempted,
     TriggerFailed,
     UnknownAtsLayout,
 )
@@ -954,6 +955,24 @@ def build_graph(
         resumed = interrupt(_gate_payload(state))
         return {"visited": ["approval_gate"], **_decision_from(resumed, state)}
 
+    def claim_the_press(state: ApplicationState) -> None:
+        """Take the one press this application is allowed, or refuse.
+
+        Claimed here rather than inside the submitter because the danger is
+        a *replay* of this node, and the submitter is a fresh object with no
+        memory of the attempt the last process made. The claim is recorded
+        by the worker holding the thread's lease — which is by definition
+        whoever is about to press — and outlives it.
+        """
+        application_id = state["application_id"]
+        lease = deps.db.get_lease(state["thread_id"])
+        claimed, held = deps.db.try_claim_submit(
+            application_id,
+            owner=lease.owner if lease is not None else "a caller holding no lease",
+        )
+        if not claimed:
+            raise SubmitAlreadyAttempted(application_id, held.owner, held.attempted_at)
+
     async def submit(state: ApplicationState) -> dict[str, Any]:
         try:
             page = await require_page(state)
@@ -961,6 +980,9 @@ def build_graph(
             # that appeared while the application sat at the gate is not
             # something to click Submit underneath.
             await guard(page)
+            # Then the press is claimed, in that order: a captcha found at
+            # the gate must not spend an application's one attempt.
+            claim_the_press(state)
             outcome = await deps.submitter.submit(page, _authorization(state))
         except GraphBubbleUp:
             raise

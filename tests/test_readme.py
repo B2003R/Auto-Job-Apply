@@ -189,6 +189,19 @@ class TestTheWarnings:
         text = README.read_text()
         assert "never clicked a second time" in text
 
+    def test_a_worker_killed_mid_submit_is_documented(self) -> None:
+        """The only crash in this system whose damage cannot be undone.
+
+        Every other interruption is recovered by re-running the node. This
+        one cannot be, and an operator who does not know that will read the
+        failure as "it did not happen" and retry it by hand.
+        """
+        text = README.read_text()
+        assert "killed" in text
+        killed = text.index("killed mid-submit")
+        window = text[killed - 800 : killed + 800]
+        assert "not pressed again" in window or "is not clicked again" in window
+
     def test_queueing_is_documented_as_not_idempotent(self) -> None:
         text = README.read_text()
         assert "not idempotent" in text

@@ -151,3 +151,18 @@ class ApprovalRecord:
     actor: str
     note: str | None
     timestamp: datetime
+
+
+@dataclass(frozen=True)
+class SubmitAttempt:
+    """A record that this application's final control was pressed once.
+
+    Not a lease and deliberately not expiring. A lease answers "is somebody
+    running this thread now?", which stops being true when its holder dies.
+    This answers "has this application already been sent?", which does not:
+    the press happened to a page in the world, and no clock undoes it.
+    """
+
+    application_id: int
+    owner: str
+    attempted_at: datetime

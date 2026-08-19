@@ -24,6 +24,7 @@ from app.storage.models import (
     LeaseAttempt,
     QueueItem,
     QueueState,
+    SubmitAttempt,
 )
 
 _SCHEMA_STATEMENTS = (
@@ -103,6 +104,19 @@ _SCHEMA_STATEMENTS = (
         acquired_at TEXT NOT NULL,
         renewed_at TEXT NOT NULL,
         expires_at TEXT NOT NULL
+    );
+    """,
+    # One row per application whose final submit control has been pressed.
+    # The primary key is the whole mechanism: a worker claims the press
+    # before making it, so a successor replaying the submit node after a
+    # crash finds the claim and does not press again. Unlike a lease this
+    # never expires, because it records something that happened to a page
+    # rather than who is currently working.
+    """
+    CREATE TABLE IF NOT EXISTS submit_attempts (
+        application_id INTEGER PRIMARY KEY REFERENCES applications(id),
+        owner TEXT NOT NULL,
+        attempted_at TEXT NOT NULL
     );
     """,
     """
@@ -283,6 +297,16 @@ def _lease(row: sqlite3.Row | None) -> ExecutionLease | None:
         acquired_at=_parse_ts(row["acquired_at"]),
         renewed_at=_parse_ts(row["renewed_at"]),
         expires_at=_parse_ts(row["expires_at"]),
+    )
+
+
+def _submit_attempt(row: sqlite3.Row | None) -> SubmitAttempt | None:
+    if row is None:
+        return None
+    return SubmitAttempt(
+        application_id=row["application_id"],
+        owner=row["owner"],
+        attempted_at=_parse_ts(row["attempted_at"]),
     )
 
 
@@ -915,6 +939,57 @@ class Database:
                 (application_id,),
             ).fetchone()
         return _approval(row)
+
+    def try_claim_submit(
+        self,
+        application_id: int,
+        *,
+        owner: str,
+        now: datetime | None = None,
+    ) -> tuple[bool, SubmitAttempt]:
+        """Become the one attempt allowed to press this application's Submit.
+
+        Returns `(claimed, attempt)` where `attempt` is always the claim now
+        in the table — this call's, or the one that was already there, so a
+        caller that lost can say when the earlier press was made and by
+        which worker.
+
+        Insert-only and compare-and-set inside one immediate transaction,
+        for the same reason `try_record_approval` is: the loser must be able
+        to tell it lost. The dangerous caller is not a concurrent one — the
+        execution lease handles those — but a successor replaying the submit
+        node after the presser died, which is indistinguishable from a first
+        attempt in every other respect.
+        """
+        moment = now or _utc_now()
+        with self.immediate_transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO submit_attempts (application_id, owner, attempted_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(application_id) DO NOTHING
+                """,
+                (application_id, owner, _format_ts(moment)),
+            )
+            claimed = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM submit_attempts WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        held = _submit_attempt(row)
+        if held is None:  # pragma: no cover - the insert above guarantees a row
+            raise RuntimeError(
+                f"submit claim for application {application_id} vanished while being made"
+            )
+        return claimed, held
+
+    def get_submit_attempt(self, application_id: int) -> SubmitAttempt | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM submit_attempts WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        return _submit_attempt(row)
 
     def record_rate_event(
         self,

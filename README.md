@@ -442,6 +442,16 @@ means "check this one by hand", not "this did not happen": an unconfirmed
 submission may well have gone through, and a second click is how one
 application becomes two.
 
+**Once, even across a crash.** The press is claimed in the database before
+it is made, and that claim never expires. Every other interruption in this
+system is recovered by re-running the node that was interrupted; a worker
+killed mid-submit is the one that cannot be, because its thread looks
+exactly like one whose click never happened. So the worker that picks that
+thread up finds the claim, and **it is not pressed again**: the application
+fails with a reason naming the worker that pressed it and when. If you see
+that row, the form is still filled in on the page, and the ATS is the only
+place that knows whether the first press landed.
+
 Everything before the click is unchanged: queueing, navigation, the Apply
 click, autofill, scanning, attribution, gap detection, the rate cap, the
 approval gate, the audit record. What is new is that the last step is real,
@@ -653,6 +663,7 @@ type the answer yourself, then approve.
 | The runner itself fell over on one item | queue row `failed`, reason `worker_error`; the batch continues | read the traceback in the worker's log |
 | You approved, and the page never confirmed | **failed**, reason says the click happened and nothing confirmed it | check the screenshot and the ATS by hand; it is not clicked again ([why](#what-approving-actually-does)) |
 | You approved, and there was no single final-submit control | **failed**, reason names what it found or refused | finish that one by hand: the form is filled and waiting ([why](#what-approving-actually-does)) |
+| A worker was killed between the press and the outcome | **failed**, reason names the worker that pressed and when; no second press is made | check that one application in the ATS by hand ([why](#what-approving-actually-does)) |
 | A local run dies before the worker starts | the CLI reports why and exits nonzero; the listing is not queued | fix what it named — usually a profile lock — and run it again |
 
 The consistent rule: **before a decision, a loss is a skip** (nothing was

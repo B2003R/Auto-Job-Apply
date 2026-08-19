@@ -251,6 +251,98 @@ class TestClaimingWork:
         assert second is None
 
 
+class TestClaimingTheFinalClick:
+    """`try_claim_submit` is what makes one approval one submission.
+
+    The execution lease stops two live workers pressing Submit together,
+    but it expires by design so that a killed worker's thread can be picked
+    up. That leaves the one case a lease cannot cover: a worker that pressed
+    Submit and died before recording the outcome. Its successor sees a
+    thread indistinguishable from one whose click never happened.
+
+    So the attempt is claimed in the database before the press, and the
+    claim has no expiry — unlike a lease, it is not a statement about who is
+    working but about what has already been done to somebody's application.
+    """
+
+    def _application(self, db: Database) -> int:
+        queue_id = db.enqueue_job("https://example.com/jobs/1", Board.LINKEDIN)
+        return db.create_application(
+            queue_id=queue_id,
+            thread_id="thread-submit",
+            status=ApplicationStatus.AWAITING_APPROVAL,
+        )
+
+    def test_the_first_claim_is_granted(self, db: Database) -> None:
+        application_id = self._application(db)
+
+        claimed, attempt = db.try_claim_submit(application_id, owner="worker-1")
+
+        assert claimed is True
+        assert attempt.application_id == application_id
+        assert attempt.owner == "worker-1"
+        assert attempt.attempted_at.tzinfo == timezone.utc
+
+    def test_a_second_claim_is_refused_and_names_the_first(
+        self, db: Database
+    ) -> None:
+        application_id = self._application(db)
+        db.try_claim_submit(application_id, owner="worker-that-died")
+
+        claimed, attempt = db.try_claim_submit(application_id, owner="successor")
+
+        assert claimed is False
+        assert attempt.owner == "worker-that-died"
+
+    def test_a_claim_is_exclusive_across_connections(self, db: Database) -> None:
+        """The successor is usually a different process, not a retry loop."""
+        application_id = self._application(db)
+        other = Database(db.settings)
+
+        first, _ = other.try_claim_submit(application_id, owner="worker-1")
+        second, held = db.try_claim_submit(application_id, owner="worker-2")
+
+        assert first is True
+        assert second is False
+        assert held.owner == "worker-1"
+
+    def test_the_claim_does_not_expire(self, db: Database) -> None:
+        """A lease lapses so work can be recovered; this must not.
+
+        Whatever happened to the process, the click still happened to the
+        page, and time passing does not unhappen it.
+        """
+        application_id = self._application(db)
+        db.try_claim_submit(
+            application_id,
+            owner="worker-1",
+            now=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        )
+
+        claimed, _ = db.try_claim_submit(application_id, owner="successor")
+
+        assert claimed is False
+
+    def test_an_unclaimed_application_reports_no_attempt(self, db: Database) -> None:
+        application_id = self._application(db)
+
+        assert db.get_submit_attempt(application_id) is None
+
+    def test_two_applications_are_claimed_independently(self, db: Database) -> None:
+        first = self._application(db)
+        queue_id = db.enqueue_job("https://example.com/jobs/2", Board.LINKEDIN)
+        second = db.create_application(
+            queue_id=queue_id,
+            thread_id="thread-submit-2",
+            status=ApplicationStatus.AWAITING_APPROVAL,
+        )
+        db.try_claim_submit(first, owner="worker-1")
+
+        claimed, _ = db.try_claim_submit(second, owner="worker-1")
+
+        assert claimed is True
+
+
 class TestReturningWorkToTheQueue:
     """A killed worker must not strand its listing forever.
 

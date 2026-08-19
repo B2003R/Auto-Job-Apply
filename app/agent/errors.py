@@ -446,6 +446,33 @@ class SubmitNotAuthorized(SubmitRefused):
         )
 
 
+class SubmitAlreadyAttempted(SubmitRefused):
+    """Raised when this application's final control has already been pressed.
+
+    The case is a worker killed between the press and the outcome. Its
+    thread is left looking exactly like one whose press never happened: an
+    approval on file, no outcome recorded, an interrupt still in the
+    checkpoint. Replaying the node is the right recovery for every other
+    node in the graph and the wrong one here, because the page has already
+    had the application.
+
+    So the outcome is a failure rather than a second attempt. That is a
+    person checking one ATS by hand — the honest cost of not knowing —
+    instead of an applicant explaining a duplicate they did not send.
+    """
+
+    def __init__(self, application_id: int, owner: str, attempted_at: datetime) -> None:
+        self.application_id = application_id
+        self.owner = owner
+        self.attempted_at = attempted_at
+        super().__init__(
+            f"The final submit control for application {application_id} was already "
+            f"pressed by {owner!r} at {attempted_at.isoformat()}, and no outcome was "
+            "recorded — most likely that worker was killed mid-submit. It is not "
+            "pressed again: check this application in the ATS by hand."
+        )
+
+
 class FinalSubmitControlNotFound(SubmitRefused):
     """Raised when nothing on the page is recognisably the last click.
 
