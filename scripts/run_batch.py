@@ -260,11 +260,15 @@ def main(
     try:
         with factory(api_url, token) as http:
             return _remote(args, ControlPlaneClient(http, api_url), out)
+    # Both refusals are narration, not the answer. Under `--json` stdout is
+    # the document, and a prose sentence written there instead of a JSON one
+    # breaks the pipe the README says works — while a script reading only
+    # the exit code learns nothing either way.
     except ControlPlaneUnreachable as exc:
-        out(str(exc))
+        _aside(out, args.json, str(exc))
         return 1
     except ControlPlaneError as exc:
-        out(str(exc))
+        _aside(out, args.json, str(exc))
         return 1
 
 

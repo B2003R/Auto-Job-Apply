@@ -398,6 +398,85 @@ class TestHttpBatch:
         assert "could not reach" in console.text
 
 
+class TestJsonStdoutPurity:
+    """Under `--json`, stdout is the document — including when there is none.
+
+    The README promises `run_batch --json ... | jq` works. A refusal from
+    the control plane, or a control plane that is not there at all, used to
+    be written through the same writer as the answer, so the pipe received
+    a prose sentence where a JSON document was expected and `jq` failed on
+    input the operator never asked for.
+    """
+
+    def _unreachable(
+        self, api_url: str, token: str | None
+    ) -> AbstractContextManager[httpx.Client]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise httpx.ConnectError("connection refused", request=request)
+
+        return httpx.Client(base_url=api_url, transport=httpx.MockTransport(handler))
+
+    def _refusing(
+        self, api_url: str, token: str | None
+    ) -> AbstractContextManager[httpx.Client]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                409,
+                json={"error": {"kind": "approval_conflict", "message": "already decided"}},
+            )
+
+        return httpx.Client(base_url=api_url, transport=httpx.MockTransport(handler))
+
+    def test_an_unreachable_api_leaves_stdout_empty_under_json(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        console = Console()
+
+        code = run_batch.main(
+            ["--json", "status", "1"],
+            settings=harness.settings,
+            client_factory=self._unreachable,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert console.lines == []
+        assert "could not reach" in capsys.readouterr().err
+
+    def test_a_refusal_leaves_stdout_empty_under_json(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        console = Console()
+
+        code = run_batch.main(
+            ["--json", "approve", "1"],
+            settings=harness.settings,
+            client_factory=self._refusing,
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert console.lines == []
+        assert "approval_conflict" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("factory_name", ["_unreachable", "_refusing"])
+    def test_without_json_the_operator_still_reads_it_on_stdout(
+        self, harness: Harness, factory_name: str
+    ) -> None:
+        """Routing to stderr must not silence the prose mode."""
+        console = Console()
+
+        code = run_batch.main(
+            ["status", "1"],
+            settings=harness.settings,
+            client_factory=getattr(self, factory_name),
+            writer=console.write,
+        )
+
+        assert code == 1
+        assert console.lines != []
+
+
 class TestWatching:
     """`run` waits for each listing, and says so when it gave up waiting."""
 
