@@ -161,6 +161,20 @@ class TestTheWarnings:
         assert "not idempotent" in text
         assert text.count("per queue item, not per") >= 1
 
+    def test_every_internal_link_lands_on_a_heading(self) -> None:
+        """A `#link` to a renamed section fails silently and forever."""
+        text = README.read_text()
+        headings = {
+            re.sub(r"[^a-z0-9 -]", "", line.lstrip("#").strip().lower()).replace(
+                " ", "-"
+            )
+            for line in text.splitlines()
+            if line.startswith("#")
+        }
+        targets = set(re.findall(r"\]\(#([\w-]+)\)", text))
+        assert targets, "the README stopped cross-referencing itself"
+        assert targets <= headings, targets - headings
+
     def test_the_token_exposure_risks_are_documented(self) -> None:
         text = README.read_text()
         assert "no TLS" in text or "plain HTTP" in text
