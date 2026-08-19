@@ -469,4 +469,3 @@ def sponsorship_gap() -> FormField:
         label="Will you now or in the future require visa sponsorship?",
         required=True,
     )
-
