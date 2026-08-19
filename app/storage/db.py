@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from app.config import Settings
 from app.storage.models import (
     ApplicationField,
+    ApplicationRecord,
     ApplicationStatus,
     ApprovalDecision,
     ApprovalRecord,
@@ -46,6 +47,14 @@ _SCHEMA_STATEMENTS = (
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
+    """,
+    # A thread id is the key an approval resumes through, so it must identify
+    # exactly one application. Two rows sharing one thread would make
+    # `get_application_by_thread` ambiguous, and a decision recorded against
+    # one of them could release the other.
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_thread_id
+        ON applications(thread_id);
     """,
     """
     CREATE TABLE IF NOT EXISTS application_fields (
@@ -113,6 +122,36 @@ def _parse_ts(value: str) -> datetime:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _application(row: sqlite3.Row | None) -> ApplicationRecord | None:
+    if row is None:
+        return None
+    return ApplicationRecord(
+        id=row["id"],
+        queue_id=row["queue_id"],
+        thread_id=row["thread_id"],
+        ats=row["ats"],
+        status=ApplicationStatus(row["status"]),
+        trigger_tier=row["trigger_tier"],
+        model_cost=row["model_cost"],
+        screenshot_path=row["screenshot_path"],
+        created_at=_parse_ts(row["created_at"]),
+        updated_at=_parse_ts(row["updated_at"]),
+    )
+
+
+def _approval(row: sqlite3.Row | None) -> ApprovalRecord | None:
+    if row is None:
+        return None
+    return ApprovalRecord(
+        id=row["id"],
+        application_id=row["application_id"],
+        decision=ApprovalDecision(row["decision"]),
+        actor=row["actor"],
+        note=row["note"],
+        timestamp=_parse_ts(row["timestamp"]),
+    )
 
 
 class Database:
@@ -253,6 +292,69 @@ class Database:
             conn.commit()
             return int(cursor.lastrowid)
 
+    def get_application(self, application_id: int) -> ApplicationRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM applications WHERE id = ?",
+                (application_id,),
+            ).fetchone()
+        return _application(row)
+
+    def get_application_by_thread(self, thread_id: str) -> ApplicationRecord | None:
+        """The single application owning `thread_id`, if any.
+
+        A unique index makes "single" a schema fact rather than a
+        convention, so this can never silently return the first of several
+        rows an approval might otherwise resume the wrong one of.
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM applications WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return _application(row)
+
+    def update_application(
+        self,
+        application_id: int,
+        *,
+        status: ApplicationStatus | None = None,
+        ats: str | None = None,
+        trigger_tier: int | None = None,
+        model_cost: float | None = None,
+        screenshot_path: str | None = None,
+    ) -> None:
+        """Update only the columns actually named by the caller.
+
+        Every parameter defaults to `None` meaning "leave alone", so a node
+        that learns one fact (the detected ATS) cannot blank out another it
+        never looked at (the trigger tier recorded a step earlier).
+        """
+        assignments: list[str] = []
+        values: list[Any] = []
+        for column, value in (
+            ("status", status.value if status is not None else None),
+            ("ats", ats),
+            ("trigger_tier", trigger_tier),
+            ("model_cost", model_cost),
+            ("screenshot_path", screenshot_path),
+        ):
+            if value is None:
+                continue
+            assignments.append(f"{column} = ?")
+            values.append(value)
+        if not assignments:
+            return
+
+        assignments.append("updated_at = ?")
+        values.extend([_format_ts(_utc_now()), application_id])
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE applications SET {', '.join(assignments)} WHERE id = ?",
+                tuple(values),
+            )
+            conn.commit()
+
     def record_approval(
         self,
         application_id: int,
@@ -260,22 +362,64 @@ class Database:
         actor: str,
         note: str | None = None,
         timestamp: datetime | None = None,
-    ) -> None:
+    ) -> ApprovalRecord:
+        """Record a decision, or return the one already recorded.
+
+        See `try_record_approval`: an approval is append-only, so this never
+        overwrites an existing decision. Callers that need to know whether
+        theirs was the one stored should use `try_record_approval` directly.
+        """
+        _recorded, record = self.try_record_approval(
+            application_id=application_id,
+            decision=decision,
+            actor=actor,
+            note=note,
+            timestamp=timestamp,
+        )
+        return record
+
+    def try_record_approval(
+        self,
+        application_id: int,
+        decision: ApprovalDecision,
+        actor: str,
+        note: str | None = None,
+        timestamp: datetime | None = None,
+    ) -> tuple[bool, ApprovalRecord]:
+        """Store a decision only if this application has none yet.
+
+        Returns `(recorded, stored)` where `stored` is always the decision
+        that is now in the table — this call's, or the one that was already
+        there. The read-back happens inside the same immediate transaction
+        as the insert, so two concurrent gates cannot both believe they were
+        the one that decided.
+
+        Deliberately insert-only. An approval is the audit record of a
+        human authorising a submission made in their name; an upsert here
+        would let a second request quietly replace who decided, when, and
+        why, and no amount of validation in a caller could put that back.
+        """
         ts = _format_ts(timestamp or _utc_now())
-        with self.connect() as conn:
-            conn.execute(
+        with self.immediate_transaction() as conn:
+            cursor = conn.execute(
                 """
                 INSERT INTO approvals (application_id, decision, actor, note, timestamp)
                 VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(application_id) DO UPDATE SET
-                    decision = excluded.decision,
-                    actor = excluded.actor,
-                    note = excluded.note,
-                    timestamp = excluded.timestamp
+                ON CONFLICT(application_id) DO NOTHING
                 """,
                 (application_id, decision.value, actor, note, ts),
             )
-            conn.commit()
+            recorded = cursor.rowcount == 1
+            row = conn.execute(
+                "SELECT * FROM approvals WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        stored = _approval(row)
+        if stored is None:  # pragma: no cover - the insert above guarantees a row
+            raise RuntimeError(
+                f"approval for application {application_id} vanished during recording"
+            )
+        return recorded, stored
 
     def get_approval(self, application_id: int) -> ApprovalRecord | None:
         with self.connect() as conn:
@@ -283,16 +427,7 @@ class Database:
                 "SELECT * FROM approvals WHERE application_id = ?",
                 (application_id,),
             ).fetchone()
-        if row is None:
-            return None
-        return ApprovalRecord(
-            id=row["id"],
-            application_id=row["application_id"],
-            decision=ApprovalDecision(row["decision"]),
-            actor=row["actor"],
-            note=row["note"],
-            timestamp=_parse_ts(row["timestamp"]),
-        )
+        return _approval(row)
 
     def record_rate_event(
         self,
