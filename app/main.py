@@ -47,7 +47,8 @@ from typing import Any, AsyncIterator, Callable, Protocol, Sequence
 
 from fastapi import Depends, FastAPI, Path as PathParam, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -103,6 +104,13 @@ MAX_LISTING_URL_CHARS = 2_048
 #: lease expiry cannot be read.
 DEFAULT_RETRY_AFTER_S = 5
 
+#: Said in place of an unhandled exception. Deliberately incurious: the
+#: detail belongs in the log, where it is not attacker-readable.
+INTERNAL_ERROR_MESSAGE = (
+    "the control plane could not complete this request. The reason has been "
+    "logged."
+)
+
 
 class WorkerNotReady(RuntimeError):
     """Raised when a route needs the worker before it has finished starting.
@@ -154,6 +162,38 @@ def token_fingerprint(token: str) -> str:
     neither is recoverable from it.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+def _wire_bytes(value: str) -> bytes:
+    """The bytes a header value arrived as.
+
+    Starlette decodes header bytes with latin-1, which is a total mapping,
+    so encoding back with latin-1 recovers exactly what was sent — including
+    byte sequences that are not valid UTF-8 and are not valid anything else.
+    The fallback is for a caller passing a genuine Python string that never
+    came off a socket, which latin-1 cannot represent.
+    """
+    try:
+        return value.encode("latin-1")
+    except UnicodeEncodeError:
+        return value.encode("utf-8")
+
+
+def _tokens_match(presented: str, configured: str) -> bool:
+    """Constant-time comparison that cannot be crashed by its input.
+
+    `hmac.compare_digest` raises `TypeError` when handed a `str` holding
+    anything outside ASCII, and the presented half comes straight off the
+    wire. That made one accented byte an unhandled exception any anonymous
+    caller could trigger at will; compared as bytes it is what it actually
+    is, which is the wrong token.
+
+    The configured side is encoded as UTF-8 because that is how a token
+    written into `.env` reaches this process and how every client sends
+    one, so an operator whose token is not pure ASCII gets a token that
+    works rather than one that never matches.
+    """
+    return hmac.compare_digest(_wire_bytes(presented), configured.encode("utf-8"))
 
 
 def is_loopback(host: str) -> bool:
@@ -774,12 +814,46 @@ def create_app(
         title="Job Apply Agent control plane",
         version="0.1.0",
         lifespan=lifespan,
+        # FastAPI's own documentation routes are plain Starlette routes, so
+        # no dependency of ours runs for them and they would describe every
+        # route and body shape to anyone who could reach the port. They are
+        # re-registered below, authenticated, or not at all.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     app.state.settings = settings
     app.state.worker = None
     _register_error_handlers(app)
+    _register_docs(app, settings)
     _register_routes(app, settings)
     return app
+
+
+def _register_docs(app: FastAPI, settings: Settings) -> None:
+    """Serve the schema and its two viewers, behind the loopback check.
+
+    Only when no token is configured. Swagger UI and ReDoc fetch the schema
+    from the browser, which has no way to present a bearer token, so on a
+    token-protected control plane an authenticated docs page could not load
+    the very thing it exists to render. Serving the schema unauthenticated
+    to make that work is the trade this refuses: the alternative to a
+    broken docs page is no docs page, and `README.md` says so.
+    """
+    if settings.api_token.get_secret_value():
+        return
+
+    @app.get("/openapi.json", include_in_schema=False)
+    async def openapi_schema(identity: ApiIdentity = Identity) -> JSONResponse:
+        return JSONResponse(app.openapi())
+
+    @app.get("/docs", include_in_schema=False)
+    async def swagger_ui(identity: ApiIdentity = Identity) -> HTMLResponse:
+        return get_swagger_ui_html(openapi_url="/openapi.json", title=app.title)
+
+    @app.get("/redoc", include_in_schema=False)
+    async def redoc(identity: ApiIdentity = Identity) -> HTMLResponse:
+        return get_redoc_html(openapi_url="/openapi.json", title=app.title)
 
 
 def _register_error_handlers(app: FastAPI) -> None:
@@ -828,6 +902,22 @@ def _register_error_handlers(app: FastAPI) -> None:
 
     app.add_exception_handler(StarletteHTTPException, http_error)
 
+    async def unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+        """The last resort: an answer that says nothing about itself.
+
+        Everything reachable is mapped above, so arriving here means a bug.
+        The caller gets the same envelope as every other refusal and not one
+        word about the cause — exception messages carry connection strings,
+        file paths, and whatever a third-party library felt like including.
+        The operator gets the whole thing, with a traceback, in the log.
+        """
+        logger.exception(
+            "unhandled error serving %s %s", request.method, request.url.path
+        )
+        return _error_response(500, "internal_error", INTERNAL_ERROR_MESSAGE)
+
+    app.add_exception_handler(Exception, unexpected_error)
+
 
 def _worker_of(request: Request) -> ApplicationWorker:
     worker = getattr(request.app.state, "worker", None)
@@ -862,9 +952,7 @@ def _identity_of(request: Request) -> ApiIdentity:
                 "this control plane requires a bearer token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        if scheme.lower() != "bearer" or not hmac.compare_digest(
-            presented.strip(), configured
-        ):
+        if scheme.lower() != "bearer" or not _tokens_match(presented.strip(), configured):
             raise ApiError(
                 401,
                 "invalid_credentials",

@@ -384,7 +384,18 @@ An unknown field in a request body is a 422 rather than being ignored,
 because a client that believes it is controlling something it is not is a
 client about to be surprised.
 
-Interactive docs are at `/docs` while the server is running.
+**Interactive docs**, at `/docs` and `/redoc`, with the schema at
+`/openapi.json`. They are subject to the same authentication as everything
+else — FastAPI serves them unauthenticated by default, which this build
+does not — so on the loopback default they are yours and nobody else's.
+
+**With `API_TOKEN` set they are not served at all**, and return 404. Swagger
+UI and ReDoc fetch the schema from your browser, which has no way to attach
+a bearer token, so an authenticated docs page could not load the very thing
+it renders; serving the schema unauthenticated to make it work would hand
+every route and body shape to anyone who can reach the port. Read the route
+table above instead, or run a loopback instance without a token to browse
+the schema.
 
 ## Exporting the log
 

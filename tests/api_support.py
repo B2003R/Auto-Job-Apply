@@ -104,9 +104,15 @@ class Harness:
         return create_app(self.settings, self.worker_factory)
 
     def client(self, **kwargs: Any) -> TestClient:
-        headers = {}
-        if self.settings.api_token.get_secret_value():
-            headers["Authorization"] = f"Bearer {TOKEN}"
+        headers: dict[str, Any] = {}
+        token = self.settings.api_token.get_secret_value()
+        if token:
+            # The configured token rather than the module constant, so a
+            # harness built with an unusual token authenticates with it.
+            # Sent as UTF-8 bytes because that is what a real client puts on
+            # the wire, and because httpx will not encode a non-ASCII header
+            # value for us.
+            headers["Authorization"] = f"Bearer {token}".encode("utf-8")
         kwargs.setdefault("client", LOOPBACK)
         kwargs.setdefault("headers", headers)
         return TestClient(self.app(), **kwargs)

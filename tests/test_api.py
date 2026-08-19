@@ -613,6 +613,95 @@ class TestAuthentication:
         with harness.client(headers={"Authorization": "Bearer anything"}) as client:
             assert client.get("/health").status_code == 401
 
+    @pytest.mark.parametrize(
+        "presented",
+        [
+            "Bearer pässwörd-with-ümlauts".encode("utf-8"),
+            "Bearer 🔑".encode("utf-8"),
+            b"Bearer \xff\xfe\x00not-utf-8-at-all",
+        ],
+    )
+    def test_a_token_that_is_not_ascii_is_refused_not_crashed(
+        self, tmp_path: Path, presented: bytes
+    ) -> None:
+        """`hmac.compare_digest` rejects non-ASCII `str` by raising.
+
+        Header bytes are attacker-controlled and Starlette hands them over
+        latin-1 decoded, so comparing them as text handed anyone a 500 for
+        the price of one accented byte. Compared as bytes there is nothing
+        to raise about: it is simply the wrong token. The third case is not
+        valid UTF-8 in any encoding, which is exactly what a hostile client
+        would send to find out what happens.
+        """
+        harness = Harness(build_world(tmp_path), token=TOKEN)
+
+        with harness.client(
+            headers={"Authorization": presented}, raise_server_exceptions=False
+        ) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 401
+        assert response.json()["error"]["kind"] == "invalid_credentials"
+
+    def test_a_non_ascii_token_still_authenticates_its_holder(
+        self, tmp_path: Path
+    ) -> None:
+        """Comparing bytes must not break tokens that are merely unusual."""
+        unicode_token = "sésame-ouvre-toi-🔑"
+        harness = Harness(build_world(tmp_path), token=unicode_token)
+
+        with harness.client() as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["auth"] == "token"
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "Bearer",
+            "Bearer ",
+            "Basic c2VjcmV0",
+            "  ",
+            "Bearer a b c",
+            "\x00\x01",
+            "Bearer " + "x" * 10_000,
+        ],
+    )
+    def test_a_malformed_authorization_header_is_a_json_refusal(
+        self, tmp_path: Path, header: str
+    ) -> None:
+        harness = Harness(build_world(tmp_path), token=TOKEN)
+
+        with harness.client(
+            headers={"Authorization": header}, raise_server_exceptions=False
+        ) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 401
+        assert response.headers["content-type"].startswith("application/json")
+        assert set(response.json()["error"]) == {"kind", "message"}
+
+    def test_no_refusal_ever_repeats_the_configured_token(
+        self, tmp_path: Path
+    ) -> None:
+        """A rejection that echoes the secret is a rejection that leaks it."""
+        harness = Harness(build_world(tmp_path), token=TOKEN)
+
+        with harness.client(
+            headers={"Authorization": "Bearer wrong"}, raise_server_exceptions=False
+        ) as client:
+            responses = [
+                client.get("/health"),
+                client.post("/queue", json={"listing_url": LISTING_URL, "board": "linkedin"}),
+                client.post("/applications/1/approve", json={}),
+            ]
+
+        for response in responses:
+            assert response.status_code == 401
+            assert TOKEN not in response.text
+            assert TOKEN not in str(dict(response.headers))
+
     def test_a_non_loopback_bind_without_a_token_is_named_as_unsafe(self) -> None:
         wide = Settings(_env_file=None, api_host="0.0.0.0")
         loopback = Settings(_env_file=None)
@@ -855,6 +944,134 @@ class TestWorkerLoop:
             assert isinstance(worker.runner, ApplicationRunner)
         finally:
             await worker.stop()
+
+
+class TestUnexpectedFailures:
+    """An unhandled error is still an answer, and still says nothing.
+
+    Without a catch-all the client gets Starlette's bare
+    `Internal Server Error` — not the envelope every other refusal uses —
+    and in a debug configuration a traceback naming files, versions, and
+    whatever happened to be in the exception's message.
+    """
+
+    def _exploding_client(self, harness: Harness, message: str) -> TestClient:
+        class Exploding(ApplicationWorker):
+            @property
+            def runner(self) -> ApplicationRunner:
+                raise ValueError(message)
+
+        def factory(settings: Settings) -> ApplicationWorker:
+            worker = Exploding(
+                settings,
+                db=harness.world.db,
+                session_factory=harness.session_factory,
+                dependencies_factory=lambda _s, _d, _c: harness.world.deps,
+                checkpointer_path=harness.world.checkpoint_path,
+                run_loop=False,
+            )
+            harness.workers.append(worker)
+            return worker
+
+        return TestClient(
+            create_app(harness.settings, factory),
+            client=LOOPBACK,
+            raise_server_exceptions=False,
+        )
+
+    def test_an_unexpected_error_answers_in_the_usual_envelope(
+        self, harness: Harness
+    ) -> None:
+        with self._exploding_client(harness, "boom") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 500
+        assert response.headers["content-type"].startswith("application/json")
+        assert response.json() == {
+            "error": {
+                "kind": "internal_error",
+                "message": (
+                    "the control plane could not complete this request. The "
+                    "reason has been logged."
+                ),
+            }
+        }
+
+    def test_an_unexpected_error_reveals_nothing_about_itself(
+        self, harness: Harness
+    ) -> None:
+        """Exception text carries connection strings and paths often enough."""
+        secret = "psycopg://ada:hunter2@db.internal/records"
+
+        with self._exploding_client(harness, secret) as client:
+            response = client.get("/health")
+
+        assert "hunter2" not in response.text
+        assert "ValueError" not in response.text
+        assert "Traceback" not in response.text
+
+    def test_the_reason_is_logged_where_an_operator_can_read_it(
+        self, harness: Harness, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Silent to the caller is not the same as silent."""
+        with caplog.at_level("ERROR", logger="app.main"):
+            with self._exploding_client(harness, "hunter2") as client:
+                client.get("/health")
+
+        assert "hunter2" in caplog.text
+
+
+class TestDocumentationRoutes:
+    """The schema is a route like any other, and is not exempt from auth.
+
+    FastAPI mounts `/docs`, `/redoc`, and `/openapi.json` as plain Starlette
+    routes, so an app-level dependency does not touch them: they were served
+    to anyone who could reach the port, describing every route and body
+    shape. With a token configured they are not served at all, because the
+    browser fetching the schema cannot present a bearer token and a docs
+    page that cannot load its own schema is worse than an absent one.
+    """
+
+    def test_without_a_token_the_docs_are_served_to_loopback(
+        self, client: TestClient
+    ) -> None:
+        assert client.get("/docs").status_code == 200
+        assert client.get("/redoc").status_code == 200
+        schema = client.get("/openapi.json")
+        assert schema.status_code == 200
+        assert "/applications/{application_id}/approve" in schema.json()["paths"]
+
+    def test_without_a_token_the_schema_is_still_loopback_only(
+        self, harness: Harness
+    ) -> None:
+        with harness.client(client=("203.0.113.7", 40000)) as client:
+            response = client.get("/openapi.json")
+
+        assert response.status_code == 403
+        assert response.json()["error"]["kind"] == "not_loopback"
+
+    @pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+    def test_with_a_token_the_docs_are_not_served_at_all(
+        self, tmp_path: Path, path: str
+    ) -> None:
+        harness = Harness(build_world(tmp_path), token=TOKEN)
+
+        with harness.client() as client:
+            response = client.get(path)
+
+        assert response.status_code == 404
+        assert response.json()["error"]["kind"] == "http_404"
+
+    def test_an_unauthenticated_caller_learns_nothing_from_the_docs(
+        self, tmp_path: Path
+    ) -> None:
+        harness = Harness(build_world(tmp_path), token=TOKEN)
+
+        with harness.client(headers={}) as client:
+            for path in ("/docs", "/redoc", "/openapi.json"):
+                response = client.get(path)
+                assert response.status_code in {401, 404}
+                assert "approve" not in response.text
 
 
 class TestServiceUnavailable:
