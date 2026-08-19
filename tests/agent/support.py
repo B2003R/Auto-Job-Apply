@@ -25,6 +25,7 @@ from app.agent.graph import (
     DEFAULT_LEASE_TTL,
     ApplicationRunner,
     GraphDependencies,
+    SubmitAuthorization,
     SubmitOutcome,
     sqlite_checkpointer,
 )
@@ -221,11 +222,13 @@ class FakeWriter:
     def __init__(self, *, succeeds: bool = True) -> None:
         self.succeeds = succeeds
         self.written: list[tuple[str, str]] = []
+        self.fields: list[FormField] = []
 
-    async def write(self, page: Any, key: str, value: str) -> bool:
+    async def write(self, page: Any, field: FormField, value: str) -> bool:
         if not self.succeeds:
             return False
-        self.written.append((key, value))
+        self.fields.append(field)
+        self.written.append((field.key, value))
         return True
 
 
@@ -235,9 +238,18 @@ class FakeSubmitter:
             submitted=True, reason="fake submission"
         )
         self.calls = 0
+        self.authorizations: list[SubmitAuthorization] = []
 
-    async def submit(self, page: Any) -> SubmitOutcome:
+    async def submit(
+        self, page: Any, authorization: SubmitAuthorization
+    ) -> SubmitOutcome:
         self.calls += 1
+        self.authorizations.append(authorization)
+        if not authorization.approved:
+            return SubmitOutcome(
+                submitted=False,
+                reason=f"refused to submit because {authorization.refusal()}",
+            )
         return self.outcome
 
 

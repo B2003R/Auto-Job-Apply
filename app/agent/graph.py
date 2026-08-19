@@ -157,6 +157,11 @@ STAGING_NODES: tuple[str, ...] = (
 
 TERMINAL_NODES: tuple[str, ...] = ("submit", "reject", "skip", "fail")
 
+#: The `gate` value that means "no human was asked". Only ever set when
+#: `AUTO_SUBMIT` is enabled *and* nothing is blocking; see
+#: `_auto_submittable`.
+AUTO_SUBMIT_GATE = "auto_submit"
+
 #: Checkpoints are written before the next node starts, not concurrently
 #: with it. The whole point of this graph is that a process can die at any
 #: moment and the application is still recoverable; a checkpoint that was
@@ -403,6 +408,48 @@ class SubmitOutcome:
 
 
 @dataclass(frozen=True)
+class SubmitAuthorization:
+    """Why this graph believes this form may be submitted.
+
+    Built from the checkpointed state at the submit node and handed to the
+    submitter, so "only a released application is submitted" is a
+    precondition the submitter can check for itself rather than a property
+    of the wiring above it. There are exactly two ways to be released — a
+    human approved it, or an operator enabled `AUTO_SUBMIT` for a form with
+    nothing blocking it — and both are visible here.
+
+    Deliberately plain data, and deliberately without the reviewer's name or
+    note: what the submitter needs to know is whether it may act, and the
+    approvals table is the audit record for who said so.
+    """
+
+    application_id: int
+    thread_id: str
+    decision: str
+    decided_at: str
+    gate: str
+    blocking_reasons: tuple[str, ...] = ()
+
+    @property
+    def approved(self) -> bool:
+        if self.decision == ApprovalDecision.APPROVED.value:
+            return True
+        return self.gate == AUTO_SUBMIT_GATE and not self.blocking_reasons
+
+    def refusal(self) -> str:
+        """Why this authorization does not permit a submission."""
+        if self.gate == AUTO_SUBMIT_GATE:
+            return (
+                "auto-submit was chosen for this application, but it has "
+                f"blocking reasons ({', '.join(self.blocking_reasons)}) that "
+                "require a human decision"
+            )
+        if not self.decision:
+            return "no decision has been recorded for it"
+        return f"the recorded decision is {self.decision!r}, not approved"
+
+
+@dataclass(frozen=True)
 class RunResult:
     """The outcome of one `run_application` or `resume_application` call."""
 
@@ -509,16 +556,31 @@ class GapFillerLike(Protocol):
 class FieldWriter(Protocol):
     """Types one decided answer into one control.
 
+    Given the whole `FormField` rather than only its key, because an opaque
+    digest cannot be used to find a control again: an implementation needs
+    the frame, the form, the id, the name, the type, and the shadow path
+    that the key was *derived* from. The key travels along on the field, and
+    it stays the provenance the answer is recorded against.
+
     Returns whether the value actually landed. A `False` here keeps the
     approval gate in play even under `AUTO_SUBMIT`, because a form with an
     answer that was decided but never typed is not a filled form.
     """
 
-    async def write(self, page: Any, key: str, value: str) -> bool: ...
+    async def write(self, page: Any, field: FormField, value: str) -> bool: ...
 
 
 class Submitter(Protocol):
-    async def submit(self, page: Any) -> SubmitOutcome: ...
+    """Performs the last click, given the graph's reason for allowing it.
+
+    The authorization is passed rather than assumed so that an
+    implementation can refuse an unreleased application itself instead of
+    trusting whichever code path called it.
+    """
+
+    async def submit(
+        self, page: Any, authorization: SubmitAuthorization
+    ) -> SubmitOutcome: ...
 
 
 class PageGuard(Protocol):
@@ -743,6 +805,10 @@ def build_graph(
 
     async def trigger_autofill(state: ApplicationState) -> dict[str, Any]:
         page = await require_page(state)
+        # Between the Apply click and here the page has had time to put a
+        # challenge or a sign-in in front of the form, and the tiers below
+        # are about to click things on it.
+        await guard(page)
         cache = staged(state["thread_id"])
         baseline = cache.baseline
         if baseline is None:  # pragma: no cover - snapshot_fields always sets it
@@ -789,8 +855,13 @@ def build_graph(
         if result is None:
             raise StagingArtefactsLost(state["thread_id"], "trigger result")
 
+        # Checked once more before anything is typed: an answer belongs in
+        # the application form, not in whatever a challenge or a sign-in
+        # interstitial has put in its place.
+        await guard(page)
+        gaps = _open_gaps(result)
         plan = await deps.gap_filler.fill(
-            _open_gaps(result),
+            gaps,
             skipped_frames=[skip.frame_url for skip in result.diff.skipped_frames],
         )
         # Charged before a single answer is typed. The provider billed for
@@ -800,7 +871,9 @@ def build_graph(
         # would lose every crashed attempt's bill, and recording it as an
         # assignment rather than an addition would lose all but the last.
         total = deps.db.add_model_cost(state["application_id"], plan.model_cost)
-        unwritten = await _apply(plan, page, state["application_id"])
+        unwritten = await _apply(
+            plan, page, state["application_id"], {gap.key: gap for gap in gaps}
+        )
 
         return {
             "model_cost": str(total),
@@ -812,14 +885,27 @@ def build_graph(
         }
 
     async def _apply(
-        plan: GapFillPlan, page: Any, application_id: int
+        plan: GapFillPlan,
+        page: Any,
+        application_id: int,
+        fields: Mapping[str, FormField],
     ) -> list[str]:
-        """Type each decided answer, then record what every gap ended up as."""
+        """Type each decided answer, then record what every gap ended up as.
+
+        `fields` is the scanned control each plan item came from, looked up
+        by the same key the answer is recorded against. A decided answer
+        whose control is not in it is *not* typed: the writer would have no
+        frame, form, or id to find the control by, and an answer typed by
+        guesswork is worse than one left for the applicant.
+        """
         unwritten: list[str] = []
         for item in plan.items:
             applied = False
             if item.answer is not None:
-                applied = bool(await deps.writer.write(page, item.key, item.answer))
+                target = fields.get(item.key)
+                applied = target is not None and bool(
+                    await deps.writer.write(page, target, item.answer)
+                )
                 if not applied:
                     unwritten.append(item.key)
             deps.logger.log_field(
@@ -851,7 +937,7 @@ def build_graph(
         # instead of merely true of the current node order.
         staging.pop(state["thread_id"], None)
         if _auto_submittable(state, deps.settings.auto_submit):
-            return {"gate": "auto_submit"}
+            return {"gate": AUTO_SUBMIT_GATE}
         deps.db.update_application(
             state["application_id"], status=ApplicationStatus.AWAITING_APPROVAL
         )
@@ -871,7 +957,11 @@ def build_graph(
     async def submit(state: ApplicationState) -> dict[str, Any]:
         try:
             page = await require_page(state)
-            outcome = await deps.submitter.submit(page)
+            # The last look at the page before the last click. A challenge
+            # that appeared while the application sat at the gate is not
+            # something to click Submit underneath.
+            await guard(page)
+            outcome = await deps.submitter.submit(page, _authorization(state))
         except GraphBubbleUp:
             raise
         except Exception as exc:  # noqa: BLE001 - contained like any other node
@@ -1046,6 +1136,24 @@ def build_graph(
     return graph.compile(checkpointer=checkpointer)
 
 
+def _authorization(state: ApplicationState) -> SubmitAuthorization:
+    """The graph's reason for allowing this submission, as typed data.
+
+    Read straight off the checkpointed state, so it says what this thread
+    actually recorded rather than what the caller believes: a state with no
+    decision and no auto-submit gate produces an authorization that refuses
+    itself.
+    """
+    return SubmitAuthorization(
+        application_id=state["application_id"],
+        thread_id=state["thread_id"],
+        decision=str(state.get("decision", "")),
+        decided_at=str(state.get("decided_at", "")),
+        gate=str(state.get("gate", "")),
+        blocking_reasons=tuple(state.get("blocking_reasons", ())),
+    )
+
+
 def _open_gaps(result: TriggerResult) -> list[FormField]:
     """Every control still needing an answer, each listed once."""
     gaps: dict[str, FormField] = {}
@@ -1166,7 +1274,7 @@ def _after_stage(state: ApplicationState) -> str:
     failure = state.get("failure")
     if failure:
         return failure.get("terminal", "fail")
-    return "submit" if state.get("gate") == "auto_submit" else "approval_gate"
+    return "submit" if state.get("gate") == AUTO_SUBMIT_GATE else "approval_gate"
 
 
 def _after_gate(state: ApplicationState) -> str:

@@ -35,6 +35,7 @@ from langgraph.types import Interrupt
 
 from app.agent.approval import ApprovalConflict, ApprovalRequest
 from app.agent.errors import PageUnavailable
+from app.agent.form_scanner import FormField
 from app.agent.gap_filler import (
     GapFillItem,
     GapFillPlan,
@@ -45,6 +46,7 @@ from app.agent.graph import (
     ResumeInProgress,
     RunStatus,
     SkipKind,
+    SubmitAuthorization,
     SubmitOutcome,
     ThreadNotAwaitingApproval,
     _auto_submittable,
@@ -246,7 +248,7 @@ class TestConcurrentResumes:
         """
         queue_id = world.enqueue()
 
-        async def explode(page: Any) -> SubmitOutcome:
+        async def explode(page: Any, authorization: SubmitAuthorization) -> SubmitOutcome:
             raise Crash("the worker died mid-submit")
 
         async with world.runner() as runner:
@@ -415,7 +417,7 @@ class TestExecutionOwnership:
         submitting = asyncio.Event()
         finish = asyncio.Event()
 
-        async def slow(page: Any) -> SubmitOutcome:
+        async def slow(page: Any, authorization: SubmitAuthorization) -> SubmitOutcome:
             submitting.set()
             await finish.wait()
             return SubmitOutcome(submitted=True, reason="eventually")
@@ -469,7 +471,7 @@ class TestMidFlightThreads:
     """
 
     async def _staged_then_died_in_submit(self, world: World, queue_id: int) -> str:
-        async def explode(page: Any) -> SubmitOutcome:
+        async def explode(page: Any, authorization: SubmitAuthorization) -> SubmitOutcome:
             raise Crash("the worker died between approving and submitting")
 
         async with world.runner() as runner:
@@ -545,7 +547,9 @@ class TestMidFlightThreads:
         submitting = asyncio.Event()
         finish = asyncio.Event()
 
-        async def slow(page: Any) -> SubmitOutcome:
+        async def slow(
+            page: Any, authorization: SubmitAuthorization
+        ) -> SubmitOutcome:
             submitting.set()
             await finish.wait()
             return SubmitOutcome(submitted=True, reason="filed after a long pause")
@@ -944,11 +948,11 @@ class TestReplayedNodesDoNotDuplicateWork:
         attempts = {"count": 0}
         real_write = world.writer.write
 
-        async def flaky(page: Any, key: str, value: str) -> bool:
+        async def flaky(page: Any, field: FormField, value: str) -> bool:
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise Crash("the worker died while typing the cover letter")
-            return await real_write(page, key, value)
+            return await real_write(page, field, value)
 
         world.writer.write = flaky  # type: ignore[method-assign]
 
@@ -979,11 +983,11 @@ class TestReplayedNodesDoNotDuplicateWork:
         attempts = {"count": 0}
         real_write = world.writer.write
 
-        async def flaky(page: Any, key: str, value: str) -> bool:
+        async def flaky(page: Any, field: FormField, value: str) -> bool:
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise Crash("the worker died while typing the cover letter")
-            return await real_write(page, key, value)
+            return await real_write(page, field, value)
 
         world.writer.write = flaky  # type: ignore[method-assign]
 
@@ -1011,7 +1015,7 @@ class TestReplayedNodesDoNotDuplicateWork:
         world = self._world(tmp_path)
         queue_id = world.enqueue()
 
-        async def die(page: Any, key: str, value: str) -> bool:
+        async def die(page: Any, field: FormField, value: str) -> bool:
             raise Crash("the worker died before typing anything")
 
         world.writer.write = die  # type: ignore[method-assign]
@@ -1049,7 +1053,7 @@ class TestColdStagingCache:
         )
         queue_id = world.enqueue()
 
-        async def die(page: Any, key: str, value: str) -> bool:
+        async def die(page: Any, field: FormField, value: str) -> bool:
             raise Crash("the worker died mid-fill")
 
         world.writer.write = die  # type: ignore[method-assign]
@@ -1319,11 +1323,11 @@ class TestAutoSubmitBlockers:
         attempts = {"count": 0}
         real_write = world.writer.write
 
-        async def flaky(page: Any, key: str, value: str) -> bool:
+        async def flaky(page: Any, field: FormField, value: str) -> bool:
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise Crash("the worker died while typing")
-            return await real_write(page, key, value)
+            return await real_write(page, field, value)
 
         world.writer.write = flaky  # type: ignore[method-assign]
 

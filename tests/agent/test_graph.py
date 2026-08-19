@@ -27,6 +27,7 @@ The properties under test are the ones the whole design exists for:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -48,10 +49,13 @@ from app.agent.errors import (
     LoginWallEncountered,
     TriggerFailed,
 )
+from app.agent.gap_filler import GapFillItem, GapFillPlan, Resolution
 from app.agent.graph import (
+    AUTO_SUBMIT_GATE,
     STAGING_NODES,
     RunStatus,
     SkipKind,
+    SubmitAuthorization,
     SubmitOutcome,
     ThreadNotAwaitingApproval,
     UnknownQueueItem,
@@ -88,6 +92,15 @@ from tests.agent.support import (
 )
 
 __all__ = ["world"]
+
+
+def approve(application_id: int | None) -> ApprovalRequest:
+    return ApprovalRequest(
+        application_id=application_id or 0,
+        decision=ApprovalDecision.APPROVED,
+        actor="me@example.com",
+        note="looks right",
+    )
 
 
 class TestNodeOrder:
@@ -1164,6 +1177,244 @@ class TestFieldProvenance:
         assert result.interrupt is not None
         assert "Because the work matters." not in repr(result.interrupt)
         assert world.checkpoint_path.read_bytes().find(b"Because the work") == -1
+
+
+class TestWhatTheWriterIsGiven:
+    """A key is a digest; a control is found by the metadata behind it.
+
+    The writer has to locate a live control on a page, which needs the
+    frame, the form, the id, the name, the type, and the shadow path the key
+    was derived from. Passing only the key would leave an implementation
+    guessing, and a guess types somebody's answer into the wrong box.
+    """
+
+    async def test_the_writer_is_handed_the_scanned_control(
+        self, tmp_path: Path
+    ) -> None:
+        world = build_world(
+            tmp_path,
+            with_router=True,
+            before=snapshot(cover_letter_gap()),
+            after=snapshot(cover_letter_gap()),
+        )
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            await runner.run_application(queue_id)
+
+        assert [field.key for field in world.writer.fields] == ["cover_letter"]
+        written = world.writer.fields[0]
+        assert written.frame_url == cover_letter_gap().frame_url
+        assert written.control_id == "cover_letter"
+        assert written.field_type == "textarea"
+
+    async def test_the_key_the_answer_is_recorded_against_is_the_fields_own(
+        self, tmp_path: Path
+    ) -> None:
+        world = build_world(
+            tmp_path,
+            with_router=True,
+            before=snapshot(cover_letter_gap()),
+            after=snapshot(cover_letter_gap()),
+        )
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            result = await runner.run_application(queue_id)
+
+        rows = world.db.get_application_fields(result.application_id or 0)
+        assert {row.stable_key for row in rows} == {field.key for field in world.writer.fields}
+
+    async def test_an_answer_with_no_scanned_control_is_never_typed(
+        self, tmp_path: Path
+    ) -> None:
+        """A plan item nothing was scanned for has no control to type into.
+
+        It cannot happen through the real gap filler, which is handed the
+        scanned gaps and keys its items by them. It is checked because the
+        alternative — passing a fabricated field, or the key alone — is how
+        an answer ends up in whichever control happened to look similar.
+        """
+        world = build_world(tmp_path, with_router=True)
+        queue_id = world.enqueue()
+        world.deps = replace(
+            world.deps, gap_filler=_StrayPlanFiller(world.deps.gap_filler)
+        )
+
+        async with world.runner() as runner:
+            result = await runner.run_application(queue_id)
+
+        assert world.writer.written == []
+        assert "unwritten_answer" in result.blocking_reasons
+        rows = world.db.get_application_fields(result.application_id or 0)
+        stray = [row for row in rows if row.stable_key == "never-scanned"]
+        assert [row.filled for row in stray] == [False]
+
+
+class _StrayPlanFiller:
+    """Answers a question nothing on the page was scanned for."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self.log_payload = real.log_payload
+
+    async def fill(
+        self, gaps: Any, *, skipped_frames: Any = ()
+    ) -> GapFillPlan:
+        return GapFillPlan(
+            items=(
+                GapFillItem(
+                    key="never-scanned",
+                    label="Salary expectation",
+                    name="salary",
+                    field_type="text",
+                    required=True,
+                    free_text=False,
+                    resolution=Resolution.CANONICAL,
+                    reason="answered from the answers file",
+                    answer="120000",
+                    source=FieldSource.USER,
+                ),
+            ),
+        )
+
+
+class TestWhatAuthorizesASubmission:
+    """The submitter is told why it is allowed to click, in typed data.
+
+    "Only an approved application is submitted" was previously true only of
+    the node order. Handing the submitter the recorded decision makes it a
+    precondition the submitter itself can check, which is what stops a
+    future caller — a retry path, a script, a test — from submitting an
+    application nobody released.
+    """
+
+    async def test_an_approved_run_authorizes_with_the_recorded_decision(
+        self, world: World
+    ) -> None:
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        authorization = world.submitter.authorizations[-1]
+        assert authorization.approved is True
+        assert authorization.decision == ApprovalDecision.APPROVED.value
+        assert authorization.application_id == staged.application_id
+        assert authorization.thread_id == staged.thread_id
+        assert authorization.decided_at
+
+    async def test_an_auto_submitted_run_authorizes_through_the_gate(
+        self, tmp_path: Path
+    ) -> None:
+        world = build_world(tmp_path, auto_submit=True)
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            await runner.run_application(queue_id)
+
+        authorization = world.submitter.authorizations[-1]
+        assert authorization.gate == AUTO_SUBMIT_GATE
+        assert authorization.blocking_reasons == ()
+        assert authorization.approved is True
+
+    async def test_an_authorization_with_neither_refuses_itself(self) -> None:
+        unreleased = SubmitAuthorization(
+            application_id=7, thread_id="application-7", decision="", decided_at="",
+            gate="",
+        )
+
+        assert unreleased.approved is False
+        assert "no decision has been recorded" in unreleased.refusal()
+
+    async def test_a_rejected_decision_refuses_itself(self) -> None:
+        rejected = SubmitAuthorization(
+            application_id=7,
+            thread_id="application-7",
+            decision=ApprovalDecision.REJECTED.value,
+            decided_at="2026-08-19T00:00:00+00:00",
+            gate="api",
+        )
+
+        assert rejected.approved is False
+        assert "rejected" in rejected.refusal()
+
+    async def test_auto_submit_with_something_blocking_refuses_itself(self) -> None:
+        """The gate alone is not a release; blockers are why it is not."""
+        blocked = SubmitAuthorization(
+            application_id=7,
+            thread_id="application-7",
+            decision="",
+            decided_at="",
+            gate=AUTO_SUBMIT_GATE,
+            blocking_reasons=("unanswered_gap",),
+        )
+
+        assert blocked.approved is False
+        assert "unanswered_gap" in blocked.refusal()
+
+
+class TestWhenThePageIsChecked:
+    """Before every click, not once at the start.
+
+    A challenge or a sign-in can appear at any moment, and the gap between
+    opening a listing and submitting it includes a wait for a human. Each
+    node that is about to touch the page looks again.
+    """
+
+    async def test_the_guard_runs_again_before_the_trigger_and_the_writes(
+        self, world: World
+    ) -> None:
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            await runner.run_application(queue_id)
+
+        # open_listing, start_application, trigger_autofill, fill_gaps.
+        assert world.guard.calls == 4
+
+    async def test_the_guard_runs_again_before_the_last_click(
+        self, world: World
+    ) -> None:
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            staged_calls = world.guard.calls
+            await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert world.guard.calls == staged_calls + 1
+        assert world.submitter.calls == 1
+
+    async def test_a_challenge_at_the_gate_stops_the_submission(
+        self, world: World
+    ) -> None:
+        """Nothing is clicked underneath a captcha that appeared while waiting.
+
+        Recorded as a failure rather than a skip, which is this node's
+        existing rule and the right one here: the application was approved,
+        so a person is waiting on it and has to be told it did not happen.
+        """
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.guard.error = CaptchaEncountered("https://ats.example.com/apply")
+            result = await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert world.submitter.calls == 0
+        assert result.status is RunStatus.FAILED
+        assert result.reason == SkipKind.CAPTCHA.value
+        application = world.db.get_application(result.application_id or 0)
+        assert application is not None
+        assert application.status is ApplicationStatus.FAILED
 
 
 class TestCostAccounting:
