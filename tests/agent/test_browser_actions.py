@@ -280,16 +280,17 @@ def writing_frame(
     name: str = "",
 ) -> FakeFrame:
     """A frame that resolves exactly `count` controls and writes into one."""
+    resolved = dict(identity or resolved_identity(target))
     return FakeFrame(
         url,
         {
-            WRITE_COUNT_SCRIPT: {"count": count},
+            WRITE_COUNT_SCRIPT: {"count": count, "identity": resolved},
             WRITE_SCRIPT: {
                 "ok": True,
                 "reason": "",
                 "count": count,
                 "matched": matched,
-                "identity": dict(identity or resolved_identity(target)),
+                "identity": resolved,
             },
         },
         parent=parent,
@@ -549,6 +550,29 @@ class TestProvenanceIsChecked:
         assert await PlaywrightFieldWriter(scanner=scanner).write(
             FakePage(frame), target, ANSWER
         )
+
+    async def test_a_mismatch_is_caught_before_anything_is_typed(self) -> None:
+        """The refusal has to arrive before the value does.
+
+        Checking afterwards would still report the write as failed, but the
+        answer would already be sitting in the wrong control — and the run
+        that reads "not typed" would leave a form somebody's salary was put
+        into the wrong box on. So the identity is read during the counting
+        pass, and a mismatch means the writing pass never runs.
+        """
+        scanner = FormScanner()
+        target = keyed_field(scanner)
+        frame = writing_frame(
+            target,
+            identity={**resolved_identity(target), "name": "first_name"},
+        )
+
+        written = await PlaywrightFieldWriter(scanner=scanner).write(
+            FakePage(frame), target, ANSWER
+        )
+
+        assert written is False
+        assert frame.arguments_for(WRITE_SCRIPT) == []
 
     async def test_without_a_shared_scanner_the_check_is_skipped(self) -> None:
         """A writer with no scanner cannot derive keys, and says so by not.

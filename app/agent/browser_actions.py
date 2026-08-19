@@ -256,6 +256,16 @@ _WRITE_CANDIDATES_JS = """
     return true;
   };
 
+  const identityOf = (el, entry) => ({
+    shadowPath: entry.path,
+    shadowDepth: entry.depth,
+    form: formIdentity(el),
+    id: controlIdentity(el),
+    name: text(el.getAttribute('name')),
+    type: controlType(el),
+    label: labelText(el),
+  });
+
   const findCandidates = (want) => {
     const found = [];
     for (const entry of collectRoots(document, 0, '', [])) {
@@ -289,9 +299,11 @@ def _with_supported_types(source: str) -> str:
 WRITE_CANDIDATES_JS = _with_supported_types(_WRITE_CANDIDATES_JS)
 
 
-#: Counts the controls in this frame that match a field's identity. Never
-#: given the value: a frame that turns out to hold two matches, or none, has
-#: no business receiving somebody's answer.
+#: Counts the controls in this frame that match a field's identity, and
+#: describes the one it found. Never given the value: a frame that turns out
+#: to hold two matches, or none, has no business receiving somebody's
+#: answer — and neither does one whose single match is the wrong control,
+#: which is what the identity is returned here to establish.
 WRITE_COUNT_SCRIPT = (
     """
 ((want) => {
@@ -299,7 +311,11 @@ WRITE_COUNT_SCRIPT = (
     + FIELD_IDENTITY_JS
     + WRITE_CANDIDATES_JS
     + """
-  return { count: findCandidates(want || {}).length };
+  const found = findCandidates(want || {});
+  if (found.length !== 1) {
+    return { count: found.length, identity: {} };
+  }
+  return { count: 1, identity: identityOf(found[0].el, found[0].entry) };
 })
 """
 ).strip()
@@ -362,15 +378,7 @@ WRITE_SCRIPT = (
     element.dispatchEvent(new Event('change', { bubbles: true }));
   };
 
-  const identity = {
-    shadowPath: entry.path,
-    shadowDepth: entry.depth,
-    form: formIdentity(el),
-    id: controlIdentity(el),
-    name: text(el.getAttribute('name')),
-    type: controlType(el),
-    label: labelText(el),
-  };
+  const identity = identityOf(el, entry);
 
   try {
     el.focus({ preventScroll: true });
@@ -799,17 +807,14 @@ class PlaywrightFieldWriter:
             )
 
         descriptor = self._descriptor(field)
-        matches: list[tuple[Any, int]] = []
+        matches: list[tuple[Any, Mapping[str, Any]]] = []
         total = 0
         for frame in frames:
-            found = int(
-                _mapping(await _evaluate(frame, WRITE_COUNT_SCRIPT, descriptor)).get(
-                    "count", 0
-                )
-            )
+            counted = _mapping(await _evaluate(frame, WRITE_COUNT_SCRIPT, descriptor))
+            found = int(counted.get("count", 0))
             total += found
             if found:
-                matches.append((frame, found))
+                matches.append((frame, _mapping(counted.get("identity"))))
         if total != 1:
             raise FieldNotUniquelyResolved(
                 field.key,
@@ -817,7 +822,11 @@ class PlaywrightFieldWriter:
                 f"across {len(frames)} same-origin frame(s)",
             )
 
-        frame = matches[0][0]
+        frame, counted_identity = matches[0]
+        # Before the value goes anywhere: a refusal after the write would be
+        # honestly reported and still leave somebody's answer in the wrong
+        # control.
+        self._require_provenance(field, frame, counted_identity)
         result = _mapping(
             await _evaluate(
                 frame, WRITE_SCRIPT, {"field": descriptor, "value": value}
@@ -830,6 +839,9 @@ class PlaywrightFieldWriter:
                 raise FieldNotUniquelyResolved(field.key, reported, reason)
             raise FieldWriteNotVerified(field.key, reason)
 
+        # Again, on what was actually written: the two passes resolve the
+        # control separately, and a page that repainted between them could
+        # have moved it.
         self._require_provenance(field, frame, _mapping(result.get("identity")))
         if not result.get("matched"):
             raise FieldWriteNotVerified(field.key)
