@@ -46,9 +46,13 @@ def _claimed_gitignored() -> list[str]:
     for line in README.read_text().splitlines():
         if "gitignored" in line or "is in `.gitignore`" in line:
             claims.extend(re.findall(r"`([^`]+)`", line))
-    # The file doing the ignoring is named in the same sentence and is not
-    # itself a claim.
-    return [claim for claim in claims if claim != ".gitignore"]
+    # A sentence about ignoring can mention things that are not paths — a
+    # setting name, or the ignore file itself.
+    return [
+        claim
+        for claim in claims
+        if claim != ".gitignore" and ("/" in claim or "." in claim)
+    ]
 
 
 def _git_ignores(path: str) -> bool:
@@ -129,6 +133,38 @@ class TestTheAnswersExample:
         block = _blocks("yaml")[index]
         book = AnswerBook.from_mapping(yaml.safe_load(block), source="README.md")
         assert len(book) > 0
+
+
+class TestTheWarnings:
+    """Three things an operator is worse off not knowing.
+
+    Each was true of the code and absent from the prose, which is the worst
+    combination: the reader forms a belief the system does not share. A
+    keyword check is a crude test, but it fails if someone deletes the
+    paragraph, which is what it is for.
+    """
+
+    def test_the_build_says_it_cannot_submit(self) -> None:
+        text = README.read_text()
+        assert "ComponentNotWired" in text
+        assert "does not submit it" in text
+
+    def test_the_warning_sits_where_approval_is_explained(self) -> None:
+        """Buried at the bottom it would be read after the surprise."""
+        text = README.read_text()
+        approving = text.index("## Approving and rejecting")
+        exporting = text.index("## Exporting the log")
+        assert approving < text.index("ComponentNotWired") < exporting
+
+    def test_queueing_is_documented_as_not_idempotent(self) -> None:
+        text = README.read_text()
+        assert "not idempotent" in text
+        assert text.count("per queue item, not per") >= 1
+
+    def test_the_token_exposure_risks_are_documented(self) -> None:
+        text = README.read_text()
+        assert "no TLS" in text or "plain HTTP" in text
+        assert "ps auxww" in text
 
 
 class TestTheCommands:

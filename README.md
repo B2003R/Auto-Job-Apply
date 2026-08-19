@@ -271,6 +271,27 @@ server serves loopback callers only, checked per request, and
 Set `API_TOKEN` before exposing it, and remember what the API can do: it
 can submit job applications in your name.
 
+### If you expose it, read this first
+
+The token is the whole of the authentication, and this server speaks plain
+HTTP. There is no TLS here and none is planned: adding it would mean this
+project holding your certificates and getting that wrong quietly.
+
+- **Off loopback, every request sends the token in clear.** Anything on the
+  path reads it and can then apply for jobs as you. If you need the control
+  plane from another machine, do not open the port — forward it over SSH
+  (`ssh -N -L 8765:127.0.0.1:8765 you@host`) and leave the server on
+  `127.0.0.1`, or put a reverse proxy that terminates TLS in front of it.
+- **`--token` on a command line is visible to every user on the machine.**
+  `ps auxww` shows the full argument list, and your shell history keeps a
+  copy. Prefer `API_TOKEN` in `.env` (which is gitignored) — the CLI reads
+  the same setting the server does, so `--token` is only needed to talk to
+  a *different* server than your configuration names.
+- The token never appears in a response, a log line, or an error. When no
+  `API_ACTOR` is set, the approvals table records
+  `api-token:<fingerprint>`, which distinguishes two credentials without
+  either being recoverable.
+
 ## The command line
 
 `scripts/run_batch.py` talks to the control plane by default, because that
@@ -294,7 +315,16 @@ python -m scripts.run_batch --json status 7
 
 Global options: `--api URL` (default `http://API_HOST:API_PORT`),
 `--token`, `--json`, and `--local`. `--api` and `--local` are mutually
-exclusive — naming both would hide which one a run actually used.
+exclusive — naming both would hide which one a run actually used. `--json`
+works in both modes.
+
+**Exit codes**, for anything scripting this: `0` means what you asked for
+happened, `1` means it did not, and `2` is a usage error. A `run` that
+reaches `--timeout` before its listings are ready for a decision exits `1`
+— they are still being worked on server-side, but nothing is waiting for
+you yet, and a batch script must not read "still staging" as "ready for
+review". Under `--json` that explanation goes to stderr so the document on
+stdout stays parseable.
 
 ### `--local`: an in-process worker
 
@@ -348,6 +378,34 @@ Approving runs the submit step **in the process that staged the tab**. This
 is why approval over HTTP goes to the server and not to a fresh CLI
 process: see [Recovery](#recovery-what-happens-when-something-breaks).
 
+### This build cannot submit, and says so
+
+**Approving an application in this build does not submit it.** No field
+writer and no submitter are wired in; those are the two browser-facing
+components this project deliberately does not ship. Approve something and
+the run ends as a **failed** application whose reason names the missing
+component:
+
+```
+No submitter is wired into this build, so submitting the application
+cannot happen. Nothing was typed and nothing was submitted.
+```
+
+That is a `ComponentNotWired` error, and it is a refusal rather than a
+silent no-op on purpose. The alternative — a stub returning "submitted" —
+would write a successful-looking application record for something that
+never happened, which is the one failure mode this whole project is built
+to prevent. The same is true of the field writer: an answer you decide at
+the gate is not typed into the form.
+
+Everything up to that point is real: queueing, navigation, the Apply
+click, autofill, scanning, attribution, gap detection, the rate cap, the
+approval gate, the audit record. What you have is a system that stages
+applications and records decisions, and stops at the last step. Wiring a
+submitter is a deliberate act, in `build_dependencies` in `app/main.py`,
+and `tests/test_api.py::TestTheShippedWiring` fails the moment it happens
+so that it cannot happen by accident.
+
 ## The HTTP API
 
 All routes require the loopback/bearer authentication described above.
@@ -384,6 +442,22 @@ An unknown field in a request body is a 422 rather than being ignored,
 because a client that believes it is controlling something it is not is a
 client about to be surprised.
 
+An unexpected error — a bug, in other words — is a 500 in the same
+envelope, with the kind `internal_error` and a fixed message. The cause and
+its traceback go to the server's log, not to the caller.
+
+**`POST /queue` is not idempotent.** Every call creates a new queue item,
+even for a URL that is already queued, already staged, or already
+submitted. There is no deduplication and no client-supplied request key:
+two calls mean two runs, and two runs against a live submitter would mean
+applying to the same job twice. A retry after a timeout is the case to
+watch — the first request may well have succeeded. Read the queue back
+with `GET /runs/{queue_id}` (the 201 gives you the id) rather than
+re-queueing on a hunch. Deduplicating on the URL is deliberately not done:
+re-applying after a rejection, or to a re-posted listing, is a legitimate
+thing to want, and the system cannot tell the two cases apart. The
+one-shot guarantee is per queue item, not per URL.
+
 **Interactive docs**, at `/docs` and `/redoc`, with the schema at
 `/openapi.json`. They are subject to the same authentication as everything
 else — FastAPI serves them unauthenticated by default, which this build
@@ -412,6 +486,19 @@ python -m scripts.export_log --format csv --fields --status submitted
   standing policy for the installation, the flag is you saying you mean it
   for this export. A database written while logging was on and exported
   after it was turned off stays redacted.
+
+The export **only ever reads**. It opens the database read-only and takes
+every row inside one transaction, so the file it writes describes one
+instant rather than four, and a database on read-only media exports fine.
+While an export is running a worker's writes wait for it; exports are
+small, and a torn export would be a wrong answer rather than a slow one.
+
+**CSV cells that would be formulas are escaped with a leading `'`.** A
+field label comes off the listing's own page, and a cell beginning with
+`=`, `+`, `-`, `@`, a tab, or a carriage return is executed by Excel and
+LibreOffice when the file is opened. The apostrophe is the spreadsheet
+convention for "this is text"; it is not added to JSON output, where it
+would just corrupt the value.
 
 ## Rate limits
 
@@ -522,6 +609,8 @@ type the answer yourself, then approve.
 | A worker was killed holding a thread | its execution lease expires after two minutes, then another worker may take over | wait, or retry the decision |
 | A worker died with a listing claimed | the next worker to start returns it to the queue with `worker_abandoned` and runs it | nothing; it is picked up automatically |
 | The runner itself fell over on one item | queue row `failed`, reason `worker_error`; the batch continues | read the traceback in the worker's log |
+| You approved, and nothing was submitted | **failed**, reason names `ComponentNotWired` | expected: [this build has no submitter](#this-build-cannot-submit-and-says-so) |
+| A local run dies before the worker starts | the CLI reports why and exits nonzero; the listing is not queued | fix what it named — usually a profile lock — and run it again |
 
 The consistent rule: **before a decision, a loss is a skip** (nothing was
 submitted, so the listing can be staged afresh); **after a decision, a loss
@@ -531,6 +620,12 @@ they should be told).
 A queue item is a one-shot. Re-running a finished one reports its recorded
 outcome instead of applying again — that is what stops a second Apply click
 in your name — so genuinely re-applying means queueing the listing again.
+
+That guarantee is **per queue item, not per listing**. `POST /queue` and
+`run_batch queue` create a new item every time they are called, including
+for a URL that is already in the queue, so a retried request or a
+double-pasted URL is two runs on the same job. Check with `pending` or
+`GET /runs/{queue_id}` before queueing something a second time.
 
 If a process is killed outright, its profile lock file stays behind. Run
 `doctor`, confirm the pid is gone, and remove `.job-apply-lock.json`
