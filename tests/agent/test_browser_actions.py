@@ -173,11 +173,13 @@ class FakeElement:
         box: Mapping[str, float] | None = None,
         *,
         boxless: bool = False,
+        scroll_hangs: bool = False,
         trial_error: BaseException | None = None,
         click_error: BaseException | None = None,
     ) -> None:
         self.box = dict(box or {"x": 10.0, "y": 20.0, "width": 120.0, "height": 36.0})
         self.boxless = boxless
+        self.scroll_hangs = scroll_hangs
         self.disposed = False
         self.scrolled = False
         self.trials = 0
@@ -194,6 +196,8 @@ class FakeElement:
 
     async def scroll_into_view_if_needed(self) -> None:
         self.scrolled = True
+        if self.scroll_hangs:
+            await asyncio.Event().wait()
 
     async def click(self, *, trial: bool = False, **_kwargs: Any) -> None:
         if trial:
@@ -674,6 +678,70 @@ class TestTheAnswerStaysOutOfEverythingElse:
 
     async def test_provenance_mismatch_is_a_field_write_refusal(self) -> None:
         assert issubclass(FieldProvenanceMismatch, FieldWriteRefused)
+
+
+class TestNoFrameCanHoldTheWriter:
+    """The same defect as the guard's and the submitter's, one node earlier.
+
+    An `about:blank` iframe that is still notionally navigating never
+    answers an `evaluate`, and the driver waits for a context that is not
+    coming. Here that stalls a worker holding a half-filled form, a lease
+    nobody is renewing, and every other application behind it in the queue.
+    """
+
+    async def test_a_frame_that_never_answers_the_count_is_a_refusal(self) -> None:
+        """Not a skip: uniqueness cannot be established without it.
+
+        "Exactly one control answers to this key" is the check that stops
+        somebody's answer going into the wrong box, and a frame that did not
+        answer might be holding the second match. So the write is refused,
+        which the graph records as an unfilled gap — visible at the approval
+        gate, where a human decides.
+        """
+        target = field()
+        silent = FakeFrame(MAIN_URL, {WRITE_COUNT_SCRIPT: _never_answers})
+        writer = PlaywrightFieldWriter(frame_timeout_ms=20)
+
+        with pytest.raises(FieldNotUniquelyResolved):
+            await asyncio.wait_for(
+                writer.write_or_raise(FakePage(silent), target, ANSWER), timeout=5
+            )
+
+        assert silent.times_run(WRITE_SCRIPT) == 0
+
+    async def test_a_frame_that_stops_answering_mid_write_is_never_retried(
+        self,
+    ) -> None:
+        """The value may already be in the control; a retry would type twice."""
+        target = field()
+        frame = FakeFrame(
+            MAIN_URL,
+            {
+                WRITE_COUNT_SCRIPT: {"count": 1, "identity": resolved_identity(target)},
+                WRITE_SCRIPT: _never_answers,
+            },
+        )
+        writer = PlaywrightFieldWriter(frame_timeout_ms=20)
+
+        with pytest.raises(FieldWriteNotVerified):
+            await asyncio.wait_for(
+                writer.write_or_raise(FakePage(frame), target, ANSWER), timeout=5
+            )
+
+        assert frame.times_run(WRITE_SCRIPT) == 1
+
+    async def test_the_refusal_is_contained_like_every_other_one(self) -> None:
+        target = field()
+        silent = FakeFrame(MAIN_URL, {WRITE_COUNT_SCRIPT: _never_answers})
+
+        written = await asyncio.wait_for(
+            PlaywrightFieldWriter(frame_timeout_ms=20).write(
+                FakePage(silent), target, ANSWER
+            ),
+            timeout=5,
+        )
+
+        assert written is False
 
 
 class TestTheWriterScripts:
@@ -2098,6 +2166,26 @@ class TestNoFrameCanHoldTheSubmitter:
             )
 
         assert presses(main) == 0
+
+    async def test_a_control_that_never_finishes_scrolling_is_still_pressed(
+        self,
+    ) -> None:
+        """Bringing a control into view is a courtesy, not a precondition.
+
+        A page whose smooth-scroll never settles would otherwise hold the
+        worker here, one line before the press. The driver's own click does
+        its own scrolling anyway, so giving up on this one costs nothing.
+        """
+        element = FakeElement(scroll_hangs=True)
+        frame = submitting_frame(element=element)
+
+        outcome = await asyncio.wait_for(
+            submitter(frame_timeout_ms=20).submit(FakePage(frame), APPROVED, permit()),
+            timeout=5,
+        )
+
+        assert outcome.submitted
+        assert element.presses == 1
 
 
 class TestSubmissionScreenshots:

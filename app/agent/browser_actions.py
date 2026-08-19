@@ -1227,6 +1227,13 @@ def _mapping(value: Any) -> Mapping[str, Any]:
 # --------------------------------------------------------------------------
 
 
+#: How long one frame is given to answer the writer. Same defect as the
+#: guard's: an `about:blank` iframe still notionally navigating never
+#: answers at all, and a worker stuck here is holding a half-filled form and
+#: a lease nobody is renewing.
+DEFAULT_WRITE_FRAME_TIMEOUT_MS = 3_000
+
+
 class PlaywrightFieldWriter:
     """Types one decided answer into the one control a field names.
 
@@ -1239,8 +1246,14 @@ class PlaywrightFieldWriter:
     statement.
     """
 
-    def __init__(self, *, scanner: FormScanner | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        scanner: FormScanner | None = None,
+        frame_timeout_ms: int = DEFAULT_WRITE_FRAME_TIMEOUT_MS,
+    ) -> None:
         self._scanner = scanner
+        self._frame_timeout_s = max(0.001, frame_timeout_ms / 1000)
 
     @property
     def scanner(self) -> FormScanner | None:
@@ -1285,7 +1298,18 @@ class PlaywrightFieldWriter:
         matches: list[tuple[Any, Mapping[str, Any]]] = []
         total = 0
         for frame in frames:
-            counted = _mapping(await _evaluate(frame, WRITE_COUNT_SCRIPT, descriptor))
+            try:
+                counted = _mapping(await self._ask(frame, WRITE_COUNT_SCRIPT, descriptor))
+            except (Exception, asyncio.TimeoutError) as error:  # noqa: BLE001
+                # Not skipped: this frame could be the one holding a second
+                # match, and "exactly one control answers to this key" is
+                # the check that stops an answer going into the wrong box.
+                raise FieldNotUniquelyResolved(
+                    field.key,
+                    total,
+                    f"a same-origin frame stopped answering while its controls "
+                    f"were being counted ({error!r})",
+                ) from error
             found = int(counted.get("count", 0))
             total += found
             if found:
@@ -1302,11 +1326,21 @@ class PlaywrightFieldWriter:
         # honestly reported and still leave somebody's answer in the wrong
         # control.
         self._require_provenance(field, frame, counted_identity)
-        result = _mapping(
-            await _evaluate(
-                frame, WRITE_SCRIPT, {"field": descriptor, "value": value}
+        try:
+            result = _mapping(
+                await self._ask(
+                    frame, WRITE_SCRIPT, {"field": descriptor, "value": value}
+                )
             )
-        )
+        except (Exception, asyncio.TimeoutError) as error:  # noqa: BLE001
+            # The value may already be in the control: the frame stopped
+            # answering, which says nothing about what it did first. Reported
+            # as dispatched-but-unverified, which is never retried.
+            raise FieldWriteNotVerified(
+                field.key,
+                f"the frame stopped answering before it confirmed the value "
+                f"landed ({error!r})",
+            ) from error
         if not result.get("ok"):
             reported = int(result.get("count", 0))
             reason = _text(result.get("reason")) or "the page refused the write"
@@ -1321,6 +1355,12 @@ class PlaywrightFieldWriter:
         if not result.get("matched"):
             raise FieldWriteNotVerified(field.key)
         return True
+
+    async def _ask(self, frame: Any, script: str, argument: Any) -> Any:
+        """One question to one frame, under this writer's per-frame deadline."""
+        return await asyncio.wait_for(
+            _evaluate(frame, script, argument), self._frame_timeout_s
+        )
 
     def _require_supported(self, field: FormField) -> None:
         field_type = field.field_type.strip().lower()
@@ -1678,8 +1718,11 @@ class PlaywrightSubmitter:
         scroll = getattr(element, "scroll_into_view_if_needed", None)
         if scroll is not None:
             try:
-                await scroll()
-            except Exception:  # noqa: BLE001 - scrolling is best effort
+                await self._bounded(scroll())
+            except (Exception, asyncio.TimeoutError):  # noqa: BLE001
+                # Best effort, and bounded: a page whose smooth scroll never
+                # settles would otherwise hold a worker one line before the
+                # press. The driver's own click scrolls again anyway.
                 pass
 
         box = await self._bounded(element.bounding_box())
