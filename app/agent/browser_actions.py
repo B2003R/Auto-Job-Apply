@@ -269,6 +269,29 @@ TRUTHY_QUERY_VALUES: frozenset[str] = frozenset(
     {"1", "t", "y", "true", "yes", "ok", "success", "submitted", "confirmed", "complete", "completed", "done"}
 )
 
+#: The values that make the opposite claim, which overrides even a path only
+#: a submission is supposed to reach. Anything on neither list — a
+#: confirmation id, a reference number — is not a claim about the state of
+#: the application, and is left out of the decision entirely.
+FALSEY_QUERY_VALUES: frozenset[str] = frozenset(
+    {
+        "",
+        "0",
+        "f",
+        "n",
+        "no",
+        "off",
+        "false",
+        "none",
+        "null",
+        "pending",
+        "draft",
+        "incomplete",
+        "unsubmitted",
+        "unconfirmed",
+    }
+)
+
 #: URLs a submission is never at the end of. A board that bounces an expired
 #: session to a sign-in page, a validation round trip that reloads with an
 #: error banner, and an enforcement challenge all navigate exactly like a
@@ -318,26 +341,45 @@ SUBMISSION_BLOCKER_SELECTORS: tuple[tuple[str, str], ...] = (
 def is_success_destination(url: str) -> bool:
     """Whether this URL is one only a submitted application arrives at.
 
-    The path may say so by itself; a query string only says so when it says
-    so *affirmatively*. Refusing to read `?submitted=false` as a success is
-    the whole reason the query is parsed rather than searched.
+    The query outranks the path, in both directions. A board that renders
+    `/thank-you` for every state of an application and reports which state
+    in a flag is saying "not this one" when the flag reads `submitted=false`,
+    and a path word list that overrode it would read the page's own denial
+    as a success.
     """
     parts = urlsplit(url)
+    claim = _query_claim(parts.query)
+    if claim is False:
+        return False
     if NEGATED_SUCCESS.search(parts.path):
         return False
-    if SUCCESS_PATH.search(parts.path):
+    if claim is True:
         return True
-    return _query_claims_success(parts.query)
+    return bool(SUCCESS_PATH.search(parts.path))
 
 
-def _query_claims_success(query: str) -> bool:
+def _query_claim(query: str) -> bool | None:
+    """What this query says about the submission, if it says anything.
+
+    `True` for an affirmative claim, `False` for a denial, and `None` for a
+    query that says nothing about the submission — a job id, a campaign tag,
+    or a `confirmation_id` whose value is a reference rather than a state,
+    all of which leave the path to speak for itself. A contradiction counts
+    as a denial, because half a page saying no is a page to check by hand.
+    """
+    claimed = False
     for key, value in parse_qsl(query, keep_blank_values=True):
         folded = _CAMEL_BOUNDARY.sub("_", key).casefold()
-        if NEGATED_SUCCESS.search(folded) or not SUCCESS_QUERY_KEY.search(folded):
+        if NEGATED_SUCCESS.search(folded):
+            return False
+        if not SUCCESS_QUERY_KEY.search(folded):
             continue
-        if value.strip().casefold() in TRUTHY_QUERY_VALUES:
-            return True
-    return False
+        spoken = value.strip().casefold()
+        if spoken in FALSEY_QUERY_VALUES:
+            return False
+        if spoken in TRUTHY_QUERY_VALUES:
+            claimed = True
+    return True if claimed else None
 
 
 #: Where one word ends and the next begins in `applicationSubmitted`, so a

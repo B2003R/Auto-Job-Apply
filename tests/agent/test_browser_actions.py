@@ -1973,6 +1973,13 @@ class TestNavigationAloneNeverConfirms:
             "https://ats.example.com/apply?submitted=",
             "https://ats.example.com/application/not-submitted",
             "https://ats.example.com/apply?state=unsubmitted",
+            # The path says one thing and the query says the opposite. The
+            # query is the specific one: a template that renders
+            # `/thank-you` for every state of an application and reports the
+            # state in a flag is a page saying "not this one".
+            "https://ats.example.com/thank-you?submitted=false",
+            "https://ats.example.com/confirmation?success=0",
+            "https://ats.example.com/thank-you?application_submitted=no",
         ],
     )
     def test_a_url_saying_it_was_not_submitted_confirms_nothing(
@@ -2002,6 +2009,11 @@ class TestNavigationAloneNeverConfirms:
             "https://ats.example.com/apply?success=yes",
             "https://ats.example.com/apply?applicationSubmitted=TRUE",
             "https://ats.example.com/thank-you",
+            # A query that carries no claim about the submission at all
+            # leaves the path to speak for itself — including a reference
+            # number, which is a value rather than a state.
+            "https://ats.example.com/thank-you?job=42&utm_source=email",
+            "https://ats.example.com/thank-you?confirmation_id=abc123",
         ],
     )
     def test_a_url_saying_it_was_submitted_is_a_success_destination(
