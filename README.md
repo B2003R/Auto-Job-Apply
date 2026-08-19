@@ -32,6 +32,7 @@ follows from them:
 - [Running the control plane](#running-the-control-plane)
 - [The command line](#the-command-line)
 - [Approving and rejecting](#approving-and-rejecting)
+  - [What approving actually does](#what-approving-actually-does)
 - [The HTTP API](#the-http-api)
 - [Exporting the log](#exporting-the-log)
 - [Rate limits](#rate-limits)
@@ -390,33 +391,62 @@ Approving runs the submit step **in the process that staged the tab**. This
 is why approval over HTTP goes to the server and not to a fresh CLI
 process: see [Recovery](#recovery-what-happens-when-something-breaks).
 
-### This build cannot submit, and says so
+### What approving actually does
 
-**Approving an application in this build does not submit it.** No field
-writer and no submitter are wired in; those are the two browser-facing
-components this project deliberately does not ship. Approve something and
-the run ends as a **failed** application whose reason names the missing
-component:
+**Approving submits the application.** The answers you decided at the gate
+are typed into the live form and the final submit control is clicked, once,
+in the tab that was staged for it. Nothing else in this project clicks it:
+`AUTO_SUBMIT` is off by default, and even with it on a protected question,
+an unanswered gap, an answer that could not be typed, an incompletely
+scanned page, or a page that never settled still routes to the gate.
 
-```
-No submitter is wired into this build, so submitting the application
-cannot happen. Nothing was typed and nothing was submitted.
-```
+Both halves of that are deliberately narrow, and the narrowness is what
+you will notice first.
 
-That is a `ComponentNotWired` error, and it is a refusal rather than a
-silent no-op on purpose. The alternative — a stub returning "submitted" —
-would write a successful-looking application record for something that
-never happened, which is the one failure mode this whole project is built
-to prevent. The same is true of the field writer: an answer you decide at
-the gate is not typed into the form.
+**Typing.** An answer is typed into exactly one control — the one the
+scanned field's frame, form, id, name, type, and shadow path identify, with
+its stable key re-derived from whatever was found and compared against the
+key the answer is recorded against. No unique match, or a key that does not
+match, means the answer is *not* typed; the gap is recorded as unfilled and
+that is an `unwritten_answer` blocking reason, which holds the application
+at the gate. File uploads, password fields, checkboxes, radios, and
+multi-selects are never typed into at all: a résumé cannot be satisfied by
+text, and a tick-box is a statement made on your behalf.
 
-Everything up to that point is real: queueing, navigation, the Apply
+**Clicking.** The final control has to be a button or submit input whose
+accessible name is one of a short list of exact phrases — `Submit`,
+`Submit application`, `Submit my application`, `Send application`,
+`Complete application`, and a few more of that shape — and there has to be
+exactly one of them, visible and enabled, across the page and its
+same-origin frames. Some consequences worth knowing before you meet them:
+
+- **`Apply` and `Apply now` are not on the list.** On every board this
+  project drives, those are also the words that *start* an application. A
+  form whose only final control says `Apply` is reported as having no
+  final-submit control and left filled for you to finish.
+- **`Next`, `Continue`, `Save`, `Review`, `Back`, and `Upload` are never
+  clicked**, however the rest of the name reads. A multi-step form that has
+  no final step visible is not submitted; nothing advances a wizard on your
+  behalf.
+- **Two candidates is a refusal, not a coin toss.** An ambiguous page ends
+  as failed with both names on the queue row.
+
+**Confirming.** After the click the page has to say something happened.
+One of three concrete signals counts: it navigated, a status, alert, or
+heading region shows a confirmation ("application submitted", "thank you
+for applying", and similar), or the form the button belonged to has
+disappeared from the page. If none appears within about twenty seconds,
+the application is recorded as **failed** with an `unconfirmed` reason and a
+screenshot, and the control is **never clicked a second time**. That row
+means "check this one by hand", not "this did not happen": an unconfirmed
+submission may well have gone through, and a second click is how one
+application becomes two.
+
+Everything before the click is unchanged: queueing, navigation, the Apply
 click, autofill, scanning, attribution, gap detection, the rate cap, the
-approval gate, the audit record. What you have is a system that stages
-applications and records decisions, and stops at the last step. Wiring a
-submitter is a deliberate act, in `build_dependencies` in `app/main.py`,
-and `tests/test_api.py::TestTheShippedWiring` fails the moment it happens
-so that it cannot happen by accident.
+approval gate, the audit record. What is new is that the last step is real,
+which is why the gate is the thing to trust and `AUTO_SUBMIT` is the setting
+to leave alone.
 
 ## The HTTP API
 
@@ -621,7 +651,8 @@ type the answer yourself, then approve.
 | A worker was killed holding a thread | its execution lease expires after two minutes, then another worker may take over | wait, or retry the decision |
 | A worker died with a listing claimed | the next worker to start returns it to the queue with `worker_abandoned` and runs it | nothing; it is picked up automatically |
 | The runner itself fell over on one item | queue row `failed`, reason `worker_error`; the batch continues | read the traceback in the worker's log |
-| You approved, and nothing was submitted | **failed**, reason names `ComponentNotWired` | expected: [this build has no submitter](#this-build-cannot-submit-and-says-so) |
+| You approved, and the page never confirmed | **failed**, reason says the click happened and nothing confirmed it | check the screenshot and the ATS by hand; it is not clicked again ([why](#what-approving-actually-does)) |
+| You approved, and there was no single final-submit control | **failed**, reason names what it found or refused | finish that one by hand: the form is filled and waiting ([why](#what-approving-actually-does)) |
 | A local run dies before the worker starts | the CLI reports why and exits nonzero; the listing is not queued | fix what it named — usually a profile lock — and run it again |
 
 The consistent rule: **before a decision, a loss is a skip** (nothing was
@@ -655,7 +686,7 @@ pytest tests/scripts/test_cli.py -q        # the CLIs
 python -m mypy app scripts --ignore-missing-imports
 ```
 
-The offline test system has three pieces:
+The offline test system has four pieces:
 
 - **Fixture ATS pages** in `tests/fixtures/ats/` (Greenhouse-, Lever-,
   Workday-, and unknown-like), served by a threaded HTTP server bound to
@@ -681,17 +712,48 @@ The offline test system has three pieces:
 - **Board fixtures**: adapters are tested against recorded HTML snippets,
   never against a live board.
 
-**No test submits a real application, and no test launches a browser.**
-There is no browser integration suite in this repository: every test runs
-with no browser, no display, and no network, including the control-plane
-and CLI tests, which drive the shipped worker, database, approval service,
-rate limiter, gap filler, and LangGraph graph with only the
-browser-touching parts faked. The stub extension is a contract fixture, not
-something a test loads into Chrome.
+- **A stub-driven confirmation.** The ATS fixtures answer their own submit
+  locally (`tests/fixtures/ats/fake_submit.js`): the navigation is cancelled,
+  a confirmation appears in a `role="status"` region, and the form is
+  removed. That is two of the three signals the submitter accepts, produced
+  with no server behind them — so a browser test can observe a submission
+  without one existing anywhere.
 
-The practical consequence is worth stating plainly: **the parts of this
-system that touch a real browser are the parts the suite cannot vouch for.**
-`doctor` is how you check those on your own machine.
+**No test submits a real application.** One suite does launch a browser:
+
+```bash
+pytest tests/integration -q
+```
+
+`tests/integration/test_stub_extension.py` runs a headed Chromium with the
+unpacked stub extension loaded (and `--disable-extensions-except`, so a pass
+cannot be crediting your real Jobright installation), against the fixture
+server on 127.0.0.1, with the **real** scanner, trigger, field writer, page
+guard, and submitter wired into the real graph. It checks the things only a
+browser can: that the in-page tier finds an Autofill button inside an open
+shadow root, that the page is waited out rather than slept through, that
+exactly one required input and one textarea are left as gaps, that a scanned
+field can be found again and typed into with its stable key re-derived from
+the control that was found, and that an approved application is clicked once
+and confirmed by the page. Two of its tests prove the refusals: a page with
+two `Submit application` buttons is not submitted, and neither is one whose
+only control says `Next`.
+
+Only the board adapter and the listing URL are faked there, and both in the
+direction of safety: the adapter never navigates a real board, and the
+listing is a loopback fixture (a helper asserts that, rather than trusting
+it). Every test in that file skips — with a message naming the missing
+binary or variable — on a machine with no browser or no display.
+
+Everything else runs with no browser, no display, and no network, including
+the control-plane and CLI tests, which drive the shipped worker, database,
+approval service, rate limiter, gap filler, and LangGraph graph with only
+the browser-touching parts faked.
+
+What remains outside the suite's reach is your own profile and your own
+extension: the integration suite proves the code operates *a* page with *an*
+MV3 extension, not that a particular Jobright build behaves as expected.
+`doctor` is how you check that on your own machine.
 
 ## Running without a display (`xvfb-run`)
 
@@ -703,8 +765,11 @@ xvfb-run -a python -m app.main
 xvfb-run -a python -m scripts.doctor
 ```
 
-`pytest` needs none of this — the suite never opens a display, and running
-it under `xvfb-run` changes nothing.
+Most of `pytest` needs none of this. The one exception is
+`tests/integration`, which launches a real browser: it uses `$DISPLAY` when
+there is one, starts its own `Xvfb` when there is not, and skips with a
+message naming `xvfb` when it can do neither. Running the suite inside
+`xvfb-run -a` works too and changes nothing for the other tests.
 
 Two caveats for a virtual display. The native toolbar-click tier needs a
 real or virtual display *and* calibration, and coordinates measured on your
@@ -719,16 +784,20 @@ running, really logged in, and really filling forms, with nobody watching.
 Being explicit, because these are the places where "it did nothing" could
 otherwise be mistaken for "it worked":
 
-- **There is no field writer and no submitter wired into this build.** Both
-  are injected dependencies, and the shipped defaults *raise* rather than
-  quietly no-op: an application that needs an answer typed, or that is
-  approved and would be submitted, is recorded as **failed** with the
-  missing component named. Everything up to and including the approval gate
-  works end to end; the last click does not exist yet. This is why nothing
-  in this repository can submit a real application today.
-- **There is no captcha/login-wall detector wired in.** The graph handles
-  both wherever they are raised, and the page-guard hook is there, but no
-  production guard ships. Until one does, a challenged page is staged like
-  any other and the approval gate is what stands between it and a
-  submission.
+- **Only text, prose, and single-select controls are typed into.** File
+  uploads, password fields, checkboxes, radios, and multi-selects are left
+  for you, and an application needing one of them stops at the gate with
+  the field recorded as unfilled. This is a refusal, not a gap in the
+  implementation: a résumé is not text, and a tick-box is a statement made
+  in your name.
+- **A form whose final control is only labelled `Apply` is not submitted.**
+  See [what approving actually does](#what-approving-actually-does) — the
+  word is ambiguous with starting an application, and the ambiguity is
+  resolved by leaving it to you.
+- **The captcha and login-wall guard reads structure, never prose.** A
+  visible reCAPTCHA, hCaptcha, Turnstile, or Arkose widget and a visible
+  password field are what it matches. A page that *says* "please verify" or
+  carries a "Sign in" link in its header is not treated as challenged,
+  because those words are on an enormous number of perfectly fillable
+  application pages and abandoning those would be a silent loss.
 - **`data/` is not pruned.** Screenshots and rows accumulate.

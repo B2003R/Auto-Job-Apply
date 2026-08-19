@@ -144,17 +144,50 @@ class TestTheWarnings:
     paragraph, which is what it is for.
     """
 
-    def test_the_build_says_it_cannot_submit(self) -> None:
+    def test_the_build_says_that_approving_submits(self) -> None:
+        """The old warning said the opposite, and the code changed under it.
+
+        An operator who read "approving does not submit" and still believes
+        it is the worst possible reader of this build: they would approve
+        things to see what staging looks like.
+        """
         text = README.read_text()
-        assert "ComponentNotWired" in text
-        assert "does not submit it" in text
+        assert "ComponentNotWired" not in text
+        assert "does not submit it" not in text
+        assert "Approving submits the application" in text
 
     def test_the_warning_sits_where_approval_is_explained(self) -> None:
         """Buried at the bottom it would be read after the surprise."""
         text = README.read_text()
         approving = text.index("## Approving and rejecting")
         exporting = text.index("## Exporting the log")
-        assert approving < text.index("ComponentNotWired") < exporting
+        assert approving < text.index("Approving submits the application") < exporting
+
+    def test_the_submit_limitations_are_documented(self) -> None:
+        """What will and will not be clicked, in the operator's own terms.
+
+        Each of these is a case where the agent stops rather than guesses,
+        and an operator who does not know about it reads the resulting
+        `failed` row as a malfunction.
+        """
+        text = README.read_text()
+        assert "Submit application" in text
+        assert "`Apply`" in text
+        assert "Next" in text and "Continue" in text
+        assert "unconfirmed" in text
+
+    def test_the_three_success_signals_are_documented(self) -> None:
+        text = README.read_text()
+        submitting = text.index("Approving submits the application")
+        section = text[submitting : text.index("## The HTTP API")]
+        assert "navigat" in section
+        assert "confirmation" in section
+        assert "disappear" in section or "no longer" in section
+
+    def test_the_readme_says_the_click_never_happens_twice(self) -> None:
+        """The one thing worse than an unconfirmed submission is two."""
+        text = README.read_text()
+        assert "never clicked a second time" in text
 
     def test_queueing_is_documented_as_not_idempotent(self) -> None:
         text = README.read_text()
@@ -253,6 +286,7 @@ class TestTheCommands:
             ".env.example",
             "tests/test_fixture_server.py",
             "tests/test_stub_extension_contract.py",
+            "tests/integration/test_stub_extension.py",
             "tests/test_api.py",
             "tests/scripts/test_cli.py",
         ):
