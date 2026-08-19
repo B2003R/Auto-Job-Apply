@@ -200,6 +200,9 @@ class SkipKind(str, Enum):
     #: The thread was picked up by a worker that does not hold the in-memory
     #: artefacts the previous attempt staged.
     STAGING_LOST = "staging_artefacts_lost"
+    #: A decision was recorded but its thread can no longer be resumed, so
+    #: the decision can never be applied to the form it was made about.
+    STALE_APPROVAL = "stale_approval"
 
 
 class BlockingReason(str, Enum):
@@ -1252,6 +1255,10 @@ class ApplicationRunner:
 
         config = _config(thread_id)
         state = await self._graph.aget_state(config)
+        if state.created_at is None and application is not None:
+            stale = self._abandon_stale_approval(thread_id, item, application)
+            if stale is not None:
+                return stale
         if state.created_at is not None:
             if state.interrupts or not state.next:
                 return self._from_state(thread_id, queue_id, state)
@@ -1326,7 +1333,16 @@ class ApplicationRunner:
 
         state = await self._graph.aget_state(config)
         if not state.interrupts:
-            self._require_matching_approval(thread_id, application, decision)
+            existing = self._require_matching_approval(thread_id, application, decision)
+            if state.created_at is None:
+                stale = self._abandon_stale_approval(
+                    thread_id,
+                    self._deps.db.get_queue_item(application.queue_id),
+                    application,
+                    approval=existing,
+                )
+                if stale is not None:
+                    return stale
             return self._from_state(thread_id, application.queue_id, state)
 
         outcome = self._service.decide(decision, thread_id=thread_id)
@@ -1347,6 +1363,44 @@ class ApplicationRunner:
             self._deps.db.release_resume_claim(application.id)
             raise
         return self._from_values(thread_id, application.queue_id, values)
+
+    def _abandon_stale_approval(
+        self,
+        thread_id: str,
+        item: QueueItem | None,
+        application: ApplicationRecord,
+        approval: ApprovalRecord | None = None,
+    ) -> RunResult | None:
+        """End an application whose decision can no longer be applied.
+
+        A recorded decision with no checkpoint left to resume is the one
+        state where doing nothing is worse than giving up. Staging the
+        listing again would produce a freshly scanned form, and the recorded
+        approval would then release *that* form — answers the reviewer never
+        saw, submitted in their name. Leaving it alone instead parks the
+        application at a gate no decision can ever get through.
+
+        So it is abandoned, with a reason on the queue row. The listing can
+        be queued again, which opens a new thread and asks for a decision of
+        its own.
+        """
+        recorded = approval or self._service.recorded(application.id)
+        if recorded is None:
+            return None
+
+        reason = SkipKind.STALE_APPROVAL.value
+        self._deps.db.update_application(
+            application.id, status=ApplicationStatus.SKIPPED
+        )
+        self._deps.db.update_queue_state(
+            application.queue_id, QueueState.SKIPPED, reason
+        )
+        return _recorded_result(
+            thread_id,
+            self._deps.db.get_queue_item(application.queue_id) or item,
+            self._deps.db.get_application(application.id),
+            recorded,
+        )
 
     def _require_matching_approval(
         self,

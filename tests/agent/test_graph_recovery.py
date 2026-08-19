@@ -357,6 +357,81 @@ class TestFinishedRecordsAreNotRestaged:
         assert result.reason == "apply_failed"
         assert world.adapter.opened == []
 
+    async def test_a_decision_whose_checkpoint_is_gone_is_not_replayed_onto_a_new_form(
+        self, world: World
+    ) -> None:
+        """The dangerous middle state: decided, not submitted, unresumable.
+
+        Restaging would click Apply again and reach the gate with a freshly
+        scanned form — and the recorded approval would then release *that*
+        form, which nobody has looked at. The reviewer approved a specific
+        set of answers, so the application is abandoned instead and the
+        listing has to be queued again to get a decision of its own.
+        """
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.service().decide(approve(staged.application_id))
+
+        elsewhere = world.tmp_path / "fresh" / "checkpoints.sqlite"
+        async with world.runner(elsewhere) as amnesiac:
+            result = await amnesiac.run_application(queue_id)
+
+        assert result.status is RunStatus.SKIPPED
+        assert result.reason == SkipKind.STALE_APPROVAL.value
+        assert world.adapter.started == 1
+        assert world.submitter.calls == 0
+
+        item = world.db.get_queue_item(queue_id)
+        assert item is not None
+        assert item.error_reason == SkipKind.STALE_APPROVAL.value
+
+    async def test_resuming_a_decision_whose_checkpoint_is_gone_abandons_it(
+        self, world: World
+    ) -> None:
+        """The same state, reached from the gate instead of the queue.
+
+        The decision was recorded and the worker died before applying it.
+        Reporting "no outcome" would leave the application awaiting a
+        decision it has already been given, forever.
+        """
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.service().decide(approve(staged.application_id))
+
+        elsewhere = world.tmp_path / "fresh" / "checkpoints.sqlite"
+        async with world.runner(elsewhere) as amnesiac:
+            result = await amnesiac.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert result.status is RunStatus.SKIPPED
+        assert result.reason == SkipKind.STALE_APPROVAL.value
+        assert world.submitter.calls == 0
+
+        application = world.db.get_application_by_thread(staged.thread_id)
+        assert application is not None
+        assert application.status is ApplicationStatus.SKIPPED
+
+    async def test_an_undecided_application_with_no_checkpoint_starts_again(
+        self, world: World
+    ) -> None:
+        """Nothing was decided and nothing was submitted, so restaging is fine."""
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            await runner.run_application(queue_id)
+
+        elsewhere = world.tmp_path / "fresh" / "checkpoints.sqlite"
+        async with world.runner(elsewhere) as amnesiac:
+            result = await amnesiac.run_application(queue_id)
+
+        assert result.awaiting_approval
+        assert world.adapter.started == 2
+
     async def test_a_pending_item_is_still_staged_normally(
         self, world: World
     ) -> None:
