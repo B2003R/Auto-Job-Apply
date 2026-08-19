@@ -1586,7 +1586,7 @@ class PlaywrightSubmitter:
         # each is only ever compared with its own reading. See `PageState`.
         baselines = await self._baselines(page, frame)
         await self._click_the_only_submit(page, frame, name, permit)
-        return await self._await_confirmation(page, baselines)
+        return await self._await_confirmation(page, baselines, authorization)
 
     async def _baselines(self, page: Any, frame: Any) -> list[tuple[Any, PageState]]:
         """Read every target that will be asked about the outcome.
@@ -1793,7 +1793,10 @@ class PlaywrightSubmitter:
         )
 
     async def _await_confirmation(
-        self, page: Any, baselines: Sequence[tuple[Any, PageState]]
+        self,
+        page: Any,
+        baselines: Sequence[tuple[Any, PageState]],
+        authorization: SubmitAuthorization,
     ) -> SubmitOutcome:
         """Wait for the page to say what became of the application.
 
@@ -1827,7 +1830,7 @@ class PlaywrightSubmitter:
                     return SubmitOutcome(
                         submitted=True,
                         reason=verdict.signal,
-                        screenshot_path=await self._capture(page, "submitted"),
+                        screenshot_path=await self._capture(page, authorization, "submitted"),
                     )
                 if verdict.refusal:
                     return SubmitOutcome(
@@ -1837,7 +1840,7 @@ class PlaywrightSubmitter:
                             f"{verdict.refusal}. It is not clicked again; check "
                             "the screenshot and the application by hand."
                         ),
-                        screenshot_path=await self._capture(page, "refused"),
+                        screenshot_path=await self._capture(page, authorization, "refused"),
                     )
             if self._clock() >= deadline:
                 return SubmitOutcome(
@@ -1851,15 +1854,26 @@ class PlaywrightSubmitter:
                         "clicked again; check the screenshot and the application "
                         "by hand."
                     ),
-                    screenshot_path=await self._capture(page, "unconfirmed"),
+                    screenshot_path=await self._capture(page, authorization, "unconfirmed"),
                 )
             await self._sleep(poll_s)
 
-    async def _capture(self, page: Any, name: str) -> str | None:
+    async def _capture(
+        self, page: Any, authorization: SubmitAuthorization, name: str
+    ) -> str | None:
+        """Photograph this outcome, named after the application it is of.
+
+        An image called `unconfirmed.png` is an image of somebody's
+        application, and which somebody is the only thing an operator needs
+        from it. Naming it after the thread matches every other artifact
+        this run writes.
+        """
         if self._screenshots is None:
             return None
         try:
-            return await self._screenshots.capture(page, name)
+            return await self._screenshots.capture(
+                page, f"{authorization.thread_id}-{name}"
+            )
         except Exception:  # noqa: BLE001 - a diagnostic never changes an outcome
             return None
 

@@ -35,6 +35,7 @@ from app.agent.graph import (
 from app.config import Settings
 from app.main import (
     ApplicationWorker,
+    ArtifactScreenshotter,
     WorkerNotReady,
     build_dependencies,
     create_app,
@@ -1087,6 +1088,76 @@ class TestTheShippedWiring:
     def test_the_wiring_needs_no_browser_to_be_inspected(self, tmp_path: Path) -> None:
         """Guards the tests above: they would be vacuous if this raised."""
         assert self._dependencies(tmp_path) is not None
+
+
+class TestTheScreenshotsAnOperatorHasToLookAt:
+    """Two applications, two images. This used to be one image.
+
+    Every diagnostic was written to `{name}.png`, and the names are the
+    handful of outcomes the graph and the submitter photograph — so the
+    second application to be refused overwrote the evidence for the first,
+    and the row telling an operator to check a screenshot pointed at
+    somebody else's page.
+    """
+
+    class Photographable:
+        """A page that records where it was asked to write."""
+
+        def __init__(self) -> None:
+            self.paths: list[str] = []
+
+        async def screenshot(self, path: str) -> None:
+            self.paths.append(path)
+            Path(path).write_bytes(b"png")
+
+    async def test_two_captures_of_one_name_are_two_files(
+        self, tmp_path: Path
+    ) -> None:
+        shots = ArtifactScreenshotter(tmp_path / "artifacts")
+        page = self.Photographable()
+
+        first = await shots.capture(page, "application-1-unconfirmed")
+        second = await shots.capture(page, "application-2-unconfirmed")
+
+        assert first != second
+        assert len(list((tmp_path / "artifacts").glob("*.png"))) == 2
+
+    async def test_the_same_application_photographed_twice_keeps_both(
+        self, tmp_path: Path
+    ) -> None:
+        """A retried application's first attempt is the interesting one."""
+        shots = ArtifactScreenshotter(tmp_path / "artifacts")
+        page = self.Photographable()
+
+        first = await shots.capture(page, "application-1-refused")
+        second = await shots.capture(page, "application-1-refused")
+
+        assert first != second
+        assert Path(first).exists()
+        assert Path(second).exists()
+
+    async def test_the_file_still_says_which_application_and_outcome(
+        self, tmp_path: Path
+    ) -> None:
+        shots = ArtifactScreenshotter(tmp_path / "artifacts")
+
+        saved = await shots.capture(self.Photographable(), "application-7-refused")
+
+        assert saved is not None
+        assert Path(saved).name.startswith("application-7-refused")
+        assert Path(saved).suffix == ".png"
+
+    async def test_a_name_that_looks_like_a_path_stays_in_the_directory(
+        self, tmp_path: Path
+    ) -> None:
+        """The name comes from a thread id, which comes out of the database."""
+        artifacts = tmp_path / "artifacts"
+        shots = ArtifactScreenshotter(artifacts)
+
+        saved = await shots.capture(self.Photographable(), "../../etc/passwd")
+
+        assert saved is not None
+        assert Path(saved).parent == artifacts
 
 
 def _unspendable_permit() -> SubmitPermit:

@@ -2203,7 +2203,8 @@ class TestSubmissionScreenshots:
 
         outcome = await submitter(screenshots=shots).submit(FakePage(frame), APPROVED, permit())
 
-        assert outcome.screenshot_path == "/artifacts/submitted.png"
+        assert outcome.screenshot_path is not None
+        assert "submitted" in shots.names[0]
 
     async def test_an_unconfirmed_submission_is_photographed_too(self) -> None:
         """This is the screenshot an operator most needs to look at."""
@@ -2214,7 +2215,24 @@ class TestSubmissionScreenshots:
             FakePage(frame), APPROVED, permit()
         )
 
-        assert outcome.screenshot_path == "/artifacts/unconfirmed.png"
+        assert outcome.screenshot_path is not None
+        assert "unconfirmed" in shots.names[0]
+
+    async def test_the_photograph_names_the_application_it_is_of(self) -> None:
+        """An image called `unconfirmed.png` is an image of somebody.
+
+        Which somebody is the only thing an operator needs from it, and with
+        every application photographed under the same three names the answer
+        was "whichever one ran last".
+        """
+        shots = self.Shots()
+        frame = submitting_frame(after=(state(),))
+
+        await submitter(confirm_timeout_ms=400, screenshots=shots).submit(
+            FakePage(frame), APPROVED, permit()
+        )
+
+        assert shots.names == [f"{APPROVED.thread_id}-unconfirmed"]
 
     async def test_a_failed_screenshot_does_not_change_the_outcome(self) -> None:
         class Broken:

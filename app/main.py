@@ -38,6 +38,7 @@ import hashlib
 import hmac
 import ipaddress
 import logging
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -470,17 +471,43 @@ class ContextPageBroker:
         await page.close()
 
 
+#: Everything a caller's name is allowed to contribute to a filename. The
+#: names are built from thread ids, which come out of the database, and a
+#: name is never allowed to decide *where* an artifact is written.
+_UNSAFE_IN_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
 class ArtifactScreenshotter:
-    """Writes diagnostic screenshots under the configured artifacts path."""
+    """Writes diagnostic screenshots under the configured artifacts path.
+
+    Every filename is unique. A screenshot is the only evidence an operator
+    has for a submission nobody could confirm, and while the caller's name
+    said which application and which outcome, two applications reaching the
+    same outcome — or one application photographed on two attempts — wrote
+    to the same path, so the queue row pointed at a picture of a different
+    page than the one it was about.
+    """
 
     def __init__(self, directory: Path) -> None:
         self._directory = directory
 
     async def capture(self, page: Any, name: str) -> str | None:
         self._directory.mkdir(parents=True, exist_ok=True)
-        target = self._directory / f"{name}.png"
+        target = self._unique_path(name)
         await page.screenshot(path=str(target))
         return str(target)
+
+    def _unique_path(self, name: str) -> Path:
+        safe = _UNSAFE_IN_FILENAME.sub("-", name).strip("-.") or "screenshot"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")
+        candidate = self._directory / f"{safe}-{stamp}.png"
+        # Two captures inside one microsecond is not a thing that happens,
+        # and overwriting evidence because it did is not a thing to allow.
+        attempt = 1
+        while candidate.exists():
+            candidate = self._directory / f"{safe}-{stamp}-{attempt}.png"
+            attempt += 1
+        return candidate
 
 
 def build_dependencies(
