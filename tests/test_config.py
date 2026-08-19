@@ -112,3 +112,69 @@ class TestNumericBounds:
         settings = Settings(_env_file=None)
         assert settings.linkedin_daily_cap == 0
         assert settings.routine_input_price == Decimal("0")
+
+
+class TestControlPlaneDefaults:
+    """The API's reach is a safety default, so it is pinned like one.
+
+    The control plane can submit applications in the operator's name. Its
+    default address is therefore part of the security story rather than a
+    convenience, and "loopback unless told otherwise" has to be true of the
+    shipped defaults and stated in the file operators actually copy.
+    """
+
+    def test_the_api_binds_loopback_and_carries_no_token_by_default(self) -> None:
+        settings = Settings(_env_file=None)
+        assert settings.api_host == "127.0.0.1"
+        assert settings.api_token.get_secret_value() == ""
+        assert settings.api_actor == ""
+
+    def test_a_zero_poll_interval_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Zero would not mean "never poll", it would mean a busy loop."""
+        monkeypatch.setenv("WORKER_POLL_INTERVAL_S", "0")
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+
+    def test_a_port_outside_the_range_is_rejected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("API_PORT", "70000")
+        with pytest.raises(ValidationError):
+            Settings(_env_file=None)
+
+    def test_env_example_documents_the_control_plane(self) -> None:
+        """An operator copying `.env.example` gets the loopback default.
+
+        The variables are useless if nobody knows they exist, and `API_HOST`
+        in particular is the one an operator is most likely to widen without
+        realising a token is what makes that safe.
+        """
+        example = Path(__file__).resolve().parents[1] / ".env.example"
+        text = example.read_text()
+
+        assert "API_HOST=127.0.0.1" in text
+        for variable in ("API_PORT", "API_TOKEN", "API_ACTOR", "WORKER_POLL_INTERVAL_S"):
+            assert f"\n{variable}=" in text, variable
+
+    def test_env_example_covers_every_setting(self) -> None:
+        """No setting is reachable only by reading the source.
+
+        This is the check that keeps the example file from drifting behind
+        the model as fields are added, which is how a `.env` file quietly
+        stops being a complete description of a deployment.
+        """
+        example = Path(__file__).resolve().parents[1] / ".env.example"
+        documented = {
+            line.split("=", 1)[0].strip()
+            for line in example.read_text().splitlines()
+            if "=" in line and not line.lstrip().startswith("#")
+        }
+
+        missing = sorted(
+            name.upper()
+            for name in Settings.model_fields
+            if name.upper() not in documented
+        )
+        assert missing == []

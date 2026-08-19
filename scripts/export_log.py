@@ -18,6 +18,7 @@ import argparse
 import csv
 import io
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -205,7 +206,7 @@ def main(
         print(
             "--include-values had no effect: LOG_FIELD_VALUES is disabled, so "
             "answer text stays redacted.",
-            file=__import__("sys").stderr,
+            file=sys.stderr,
         )
 
     db = Database(resolved)

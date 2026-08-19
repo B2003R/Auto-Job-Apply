@@ -652,6 +652,25 @@ class TestExportLog:
         assert code == 0
         assert console.json()["applications"][0]["fields"][0]["value"] is None
 
+    def test_a_flag_that_did_nothing_says_so_without_spoiling_the_output(
+        self, exported: Settings, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Silence here reads as "there were no values", which is a lie.
+
+        The notice goes to stderr rather than through the writer so that a
+        JSON export stays a parseable JSON document when it is piped.
+        """
+        console = Console()
+
+        export_log.main(
+            ["--format", "json", "--fields", "--include-values"],
+            settings=exported,
+            writer=console.write,
+        )
+
+        assert "had no effect" in capsys.readouterr().err
+        assert console.json()["applications"] != []
+
     def test_values_are_exported_when_logging_is_enabled(
         self, exported: Settings
     ) -> None:
