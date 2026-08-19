@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -168,6 +169,28 @@ class TestTheCommands:
         for module in modules:
             path = Path(*module.split(".")).with_suffix(".py")
             assert (README.parent / path).exists(), module
+
+    def test_every_documented_tool_is_a_declared_dev_dependency(self) -> None:
+        """`pip install -e '.[dev]'` must be enough to run what is documented.
+
+        The README's own checks section says to run mypy, and `types-PyYAML`
+        was in the dev extras — a stub package for a type checker nobody was
+        told to install. Someone following the README got
+        `No module named mypy` and no clue whether that was their mistake.
+        """
+        extras = tomllib.loads((REPO / "pyproject.toml").read_text())["project"][
+            "optional-dependencies"
+        ]["dev"]
+        declared = {re.split(r"[<>=!\[ ]", spec)[0].lower() for spec in extras}
+
+        third_party = {
+            module
+            for module in re.findall(r"python -m ([\w.]+)", README.read_text())
+            if module.split(".")[0] not in {"app", "scripts", "tests"}
+        }
+        assert third_party, "the README stopped documenting any tool at all"
+        for module in third_party:
+            assert module.split(".")[0].lower() in declared, module
 
     def test_no_documented_path_is_missing(self) -> None:
         """Paths the README points at — fixtures, selectors, examples."""

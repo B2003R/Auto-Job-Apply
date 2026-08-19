@@ -20,12 +20,16 @@ from fastapi.testclient import TestClient
 
 from app.agent.graph import ApplicationRunner, RunStatus, thread_id_for
 from app.config import Settings
+from app.agent.errors import BrowserError
 from app.main import (
     ApplicationWorker,
+    ComponentNotWired,
     WorkerNotReady,
+    build_dependencies,
     create_app,
     insecure_binding_reason,
 )
+from app.storage.db import Database
 from app.storage.models import (
     ApplicationStatus,
     ApprovalDecision,
@@ -944,6 +948,81 @@ class TestWorkerLoop:
             assert isinstance(worker.runner, ApplicationRunner)
         finally:
             await worker.stop()
+
+
+class TestTheShippedWiring:
+    """What `build_dependencies` actually hands the graph in production.
+
+    Every other test in this file replaces the browser-facing components
+    with fakes, which is what makes them fast and safe — and also means
+    none of them ever look at the wiring a real run would get. This one
+    does, without a browser: `build_dependencies` takes the context as an
+    opaque object, so a stand-in is enough to inspect what comes back.
+
+    The two deliberate holes are the field writer and the submitter. If
+    someone wires a real submitter, or replaces these with something that
+    returns a value instead of raising, this build starts submitting
+    applications in someone's name — and it must not be possible to do
+    that without editing this test.
+    """
+
+    def _dependencies(self, tmp_path: Path) -> Any:
+        settings = Settings(
+            _env_file=None,
+            sqlite_path=tmp_path / "jobs.db",
+            artifacts_path=tmp_path / "artifacts",
+        )
+        db = Database(settings)
+        db.initialize()
+        return build_dependencies(settings, db, object())
+
+    async def test_the_submitter_refuses_rather_than_reporting_a_submission(
+        self, tmp_path: Path
+    ) -> None:
+        deps = self._dependencies(tmp_path)
+
+        with pytest.raises(ComponentNotWired) as raised:
+            await deps.submitter.submit(object())
+
+        assert raised.value.component == "submitter"
+        assert "Nothing was typed and nothing was submitted" in str(raised.value)
+
+    async def test_the_field_writer_refuses_rather_than_reporting_a_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """`False` would read as "the value did not land", which is not this."""
+        deps = self._dependencies(tmp_path)
+
+        with pytest.raises(ComponentNotWired):
+            await deps.writer.write(object(), "frame|input|email", "Ada")
+
+    def test_the_unwired_components_are_the_only_ones_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """Otherwise this test would pass on a build that does nothing at all."""
+        deps = self._dependencies(tmp_path)
+
+        assert deps.logger is not None
+        assert deps.rate_limiter is not None
+        assert deps.pages is not None
+        assert deps.trigger is not None
+        assert deps.gap_filler is not None
+        assert deps.screenshots is not None
+
+    def test_the_wiring_needs_no_browser_to_be_inspected(self, tmp_path: Path) -> None:
+        """Guards the tests above: they would be vacuous if this raised."""
+        assert self._dependencies(tmp_path) is not None
+
+    def test_a_refusal_to_submit_is_contained_as_a_failed_application(
+        self,
+    ) -> None:
+        """The refusal must not escape as an unhandled error.
+
+        `ComponentNotWired` is a `BrowserError`, which is what the graph's
+        classifier routes into a recorded failure naming the component
+        rather than a crashed worker.
+        """
+        assert issubclass(ComponentNotWired, BrowserError)
 
 
 class TestUnexpectedFailures:
