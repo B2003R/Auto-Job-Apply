@@ -18,6 +18,7 @@ import pytest
 from app.agent.errors import FormSettleTimeout, SnapshotScannerMismatch
 from app.agent.form_scanner import (
     DEFAULT_FIRST_CHANGE_TIMEOUT_MS,
+    FIELD_IDENTITY_JS,
     FIELD_SCAN_SCRIPT,
     MUTATION_PROBE_SCRIPT,
     FieldChange,
@@ -260,6 +261,122 @@ class TestStableFieldKeys:
 
         assert len({field.key for field in two.fields}) == 2
         assert two.fields[0].key == one.fields[0].key
+
+
+class TestReproducibleKeyDerivation:
+    """The key derivation is reachable from outside `snapshot`.
+
+    A field writer resolves a control from the metadata on a `FormField` and
+    then has to prove the control it found is the one that field's key
+    names — otherwise "the answer was typed into `key`" is a claim about a
+    control nobody checked. That check needs the same derivation `snapshot`
+    uses, not a second implementation of it.
+    """
+
+    def _key_of(self, scanner: FormScanner, field: FormField, ordinal: int = 0) -> str:
+        return scanner.stable_key(
+            frame_chain=field.frame_chain,
+            frame_url=field.frame_url,
+            shadow_path=field.shadow_path,
+            shadow_depth=field.shadow_depth,
+            form=field.form,
+            control_id=field.control_id,
+            name=field.name,
+            field_type=field.field_type,
+            label=field.label,
+            ordinal=ordinal,
+        )
+
+    async def test_it_reproduces_the_key_a_snapshot_assigned(self) -> None:
+        scanner = FormScanner()
+        field = (await snapshot_of([raw_field()], scanner=scanner)).fields[0]
+
+        assert self._key_of(scanner, field) == field.key
+
+    async def test_it_reproduces_a_shadow_root_fields_key(self) -> None:
+        scanner = FormScanner()
+        field = (
+            await snapshot_of(
+                [raw_field(shadowPath="jobright-host#0>form#apply", shadowDepth=2)],
+                scanner=scanner,
+            )
+        ).fields[0]
+
+        assert self._key_of(scanner, field) == field.key
+
+    async def test_it_folds_the_label_the_way_a_snapshot_does(self) -> None:
+        """The caller passes the label the page renders, not a folded one."""
+        scanner = FormScanner()
+        field = (
+            await snapshot_of([raw_field(label="First name")], scanner=scanner)
+        ).fields[0]
+        decorated = dataclasses.replace(field, label="  FIRST NAME *  ")
+
+        assert self._key_of(scanner, decorated) == field.key
+
+    async def test_it_ignores_the_url_fragment_the_way_a_snapshot_does(self) -> None:
+        scanner = FormScanner()
+        field = (await snapshot_of([raw_field()], scanner=scanner)).fields[0]
+        routed = dataclasses.replace(field, frame_url=f"{MAIN_URL}#step-2")
+
+        assert self._key_of(scanner, routed) == field.key
+
+    async def test_an_indistinguishable_duplicate_needs_its_ordinal(self) -> None:
+        """Which is why a writer that cannot tell two apart must refuse.
+
+        Two controls with no name, id, label, or form share one identity and
+        are told apart only by the order they were scanned in. Re-deriving
+        the second one's key from its metadata alone is impossible, so this
+        is the case where "exactly one match" is the only safe rule.
+        """
+        scanner = FormScanner()
+        duplicate = raw_field(name="", id="", label="", form="")
+        fields = (
+            await snapshot_of([dict(duplicate), dict(duplicate)], scanner=scanner)
+        ).fields
+
+        assert self._key_of(scanner, fields[0]) == fields[0].key
+        assert self._key_of(scanner, fields[1]) != fields[1].key
+        assert self._key_of(scanner, fields[1], ordinal=1) == fields[1].key
+
+    async def test_a_different_scanner_derives_the_same_key(self) -> None:
+        """Keys are identity, not secrets: only digests are per-scanner."""
+        scanner = FormScanner()
+        field = (await snapshot_of([raw_field()], scanner=scanner)).fields[0]
+
+        assert self._key_of(FormScanner(), field) == field.key
+
+
+class TestSharedInPageIdentity:
+    """One in-page notion of what a control is, used by every script.
+
+    The scan script decides a control's label, form, id, type, visibility,
+    and shadow path, and those six things *are* its stable key. Anything
+    else that has to find the same control again — the field writer — must
+    ask the same questions in the same way, or it will resolve a control
+    whose key it then cannot reproduce.
+    """
+
+    def test_the_scan_script_is_built_from_the_shared_helper(self) -> None:
+        assert FIELD_IDENTITY_JS in FIELD_SCAN_SCRIPT
+
+    @pytest.mark.parametrize(
+        "helper",
+        [
+            "collectRoots",
+            "controlIdentity",
+            "controlType",
+            "formIdentity",
+            "isVisible",
+            "labelText",
+        ],
+    )
+    def test_the_helper_owns_every_component_of_a_key(self, helper: str) -> None:
+        assert f"const {helper} = " in FIELD_IDENTITY_JS
+
+    def test_the_helper_is_not_a_callable_expression_of_its_own(self) -> None:
+        """It is spliced into a script body, not evaluated on its own."""
+        assert not FIELD_IDENTITY_JS.strip().startswith("(")
 
 
 class TestFrameChainIdentity:

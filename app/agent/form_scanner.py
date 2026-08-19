@@ -73,74 +73,37 @@ _VALUE_DIGEST_CHARS = 32
 _MAX_FRAME_CHAIN_DEPTH = 16
 
 
-#: Collects every visible form control reachable from a frame's document,
-#: descending through *open* shadow roots (a closed root exposes a null
-#: `shadowRoot`, so it is silently — and necessarily — invisible here).
+#: Everything the page has to decide about a control before it has an
+#: identity: which roots exist and what their paths are called, what a
+#: control's type, id, form, and accessible label are, and whether it is
+#: visible or filled.
 #:
-#: Takes `{captureValues, digestKey}`. Values are digested **in the page**
-#: with an HMAC keyed by the caller's random per-scanner key, so plaintext
-#: never crosses CDP unless `captureValues` is explicitly true. When
-#: `crypto.subtle` is unavailable (a non-secure context), it degrades to a
-#: keyed non-cryptographic hash — still salted, still value-hiding against
-#: casual inspection, but not collision-resistant; change detection keeps
-#: working either way.
-FIELD_SCAN_SCRIPT = """
-(async (options) => {
-  const opts = options || {};
-  const captureValues = opts.captureValues === true;
-  const keyHex = String(opts.digestKey || '');
+#: Spliced into `FIELD_SCAN_SCRIPT` and into the field writer's own scripts
+#: (`app.agent.browser_actions`) rather than reimplemented in each, because
+#: these six answers *are* the stable key: a writer that resolved a control
+#: by asking any of them differently would be typing into a control whose
+#: key it cannot reproduce, and "the answer was typed into `key`" would be a
+#: statement about a control nobody checked.
+#:
+#: Not a callable expression: it is a sequence of `const` declarations meant
+#: to be pasted inside a script body.
+FIELD_IDENTITY_JS = """
   const CONTROL_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
   const MAX_ROOT_DEPTH = 8;
-  const MAX_FIELDS = 500;
   const PLACEHOLDER_SELECT = /^(please\\s+)?(select|choose|pick)\\b|^-{1,2}$|^n\\/?a$|^none$/i;
 
-  const keyBytes = new Uint8Array((keyHex.match(/../g) || []).map((pair) => parseInt(pair, 16)));
-  const subtle = (globalThis.crypto && globalThis.crypto.subtle) || null;
-  let cryptoKey = null;
-  if (subtle && keyBytes.length) {
-    try {
-      cryptoKey = await subtle.importKey(
-        'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-      );
-    } catch (error) {
-      cryptoKey = null;
-    }
-  }
+  const text = (value) => (value == null ? '' : String(value)).trim();
 
-  const fallbackDigest = (value) => {
-    let hash = 0x811c9dc5;
-    const material = keyHex + '\\u0000' + value;
-    for (let index = 0; index < material.length; index += 1) {
-      hash ^= material.charCodeAt(index);
-      hash = Math.imul(hash, 0x01000193) >>> 0;
-    }
-    return ('00000000' + hash.toString(16)).slice(-8).repeat(4);
-  };
-
-  const digestValue = async (value) => {
-    if (!cryptoKey) {
-      return fallbackDigest(value);
-    }
-    const signature = await subtle.sign(
-      'HMAC', cryptoKey, new TextEncoder().encode(value),
-    );
-    return Array.from(new Uint8Array(signature))
-      .map((byte) => byte.toString(16).padStart(2, '0'))
-      .join('')
-      .slice(0, 32);
-  };
-
-  const roots = [];
-  const collectRoots = (root, depth, path) => {
+  const collectRoots = (root, depth, path, roots) => {
     roots.push({ root, depth, path });
     if (depth >= MAX_ROOT_DEPTH) {
-      return;
+      return roots;
     }
     let hosts = [];
     try {
       hosts = root.querySelectorAll('*');
     } catch (error) {
-      return;
+      return roots;
     }
     let hostIndex = 0;
     for (const host of hosts) {
@@ -148,14 +111,12 @@ FIELD_SCAN_SCRIPT = """
         const tag = host.tagName.toLowerCase();
         const identity = host.getAttribute('id') || String(hostIndex);
         const childPath = path ? path + '>' + tag + '#' + identity : tag + '#' + identity;
-        collectRoots(host.shadowRoot, depth + 1, childPath);
+        collectRoots(host.shadowRoot, depth + 1, childPath, roots);
         hostIndex += 1;
       }
     }
+    return roots;
   };
-  collectRoots(document, 0, '');
-
-  const text = (value) => (value == null ? '' : String(value)).trim();
 
   const isVisible = (el) => {
     if (el.type === 'hidden') {
@@ -310,6 +271,67 @@ FIELD_SCAN_SCRIPT = """
     return text(el.getAttribute('aria-required')).toLowerCase() === 'true';
   };
 
+  const isDisabled = (el) => el.disabled === true
+    || text(el.getAttribute('aria-disabled')).toLowerCase() === 'true';
+"""
+
+
+#: Collects every visible form control reachable from a frame's document,
+#: descending through *open* shadow roots (a closed root exposes a null
+#: `shadowRoot`, so it is silently — and necessarily — invisible here).
+#:
+#: Takes `{captureValues, digestKey}`. Values are digested **in the page**
+#: with an HMAC keyed by the caller's random per-scanner key, so plaintext
+#: never crosses CDP unless `captureValues` is explicitly true. When
+#: `crypto.subtle` is unavailable (a non-secure context), it degrades to a
+#: keyed non-cryptographic hash — still salted, still value-hiding against
+#: casual inspection, but not collision-resistant; change detection keeps
+#: working either way.
+FIELD_SCAN_SCRIPT = ("""
+(async (options) => {
+  const opts = options || {};
+  const captureValues = opts.captureValues === true;
+  const keyHex = String(opts.digestKey || '');
+  const MAX_FIELDS = 500;
+""" + FIELD_IDENTITY_JS + """
+  const keyBytes = new Uint8Array((keyHex.match(/../g) || []).map((pair) => parseInt(pair, 16)));
+  const subtle = (globalThis.crypto && globalThis.crypto.subtle) || null;
+  let cryptoKey = null;
+  if (subtle && keyBytes.length) {
+    try {
+      cryptoKey = await subtle.importKey(
+        'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
+      );
+    } catch (error) {
+      cryptoKey = null;
+    }
+  }
+
+  const fallbackDigest = (value) => {
+    let hash = 0x811c9dc5;
+    const material = keyHex + '\\u0000' + value;
+    for (let index = 0; index < material.length; index += 1) {
+      hash ^= material.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return ('00000000' + hash.toString(16)).slice(-8).repeat(4);
+  };
+
+  const digestValue = async (value) => {
+    if (!cryptoKey) {
+      return fallbackDigest(value);
+    }
+    const signature = await subtle.sign(
+      'HMAC', cryptoKey, new TextEncoder().encode(value),
+    );
+    return Array.from(new Uint8Array(signature))
+      .map((byte) => byte.toString(16).padStart(2, '0'))
+      .join('')
+      .slice(0, 32);
+  };
+
+  const roots = collectRoots(document, 0, '', []);
+
   const records = [];
   for (const entry of roots) {
     let controls = [];
@@ -336,8 +358,7 @@ FIELD_SCAN_SCRIPT = """
         label: labelText(el),
         form: formIdentity(el),
         required: isRequired(el),
-        disabled: el.disabled === true
-          || text(el.getAttribute('aria-disabled')).toLowerCase() === 'true',
+        disabled: isDisabled(el),
         visible: isVisible(el),
         filled: isFilled(el),
         valueDigest: await digestValue(value),
@@ -353,7 +374,7 @@ FIELD_SCAN_SCRIPT = """
   }
   return records;
 })
-""".strip()
+""").strip()
 
 
 #: Installs (once per frame) a mutation counter covering the document and every
@@ -859,6 +880,63 @@ class FormScanner:
         """Identity stamped on snapshots to keep digests comparable."""
         return self._scanner_id
 
+    @property
+    def digest_key_hex(self) -> str:
+        """The key `FIELD_SCAN_SCRIPT` digests values with, in the page.
+
+        Exposed so another in-page script can produce a digest this
+        scanner's snapshots are comparable with. It is already handed to
+        every frame this scanner scans, so exposing it here reveals nothing
+        a page does not already hold; it stays random per instance so
+        digests cannot be correlated across runs.
+        """
+        return self._digest_key.hex()
+
+    def digest(self, value: str) -> str:
+        """This scanner's keyed digest of `value`, as the page computes it."""
+        return compute_value_digest(self._digest_key, value)
+
+    def stable_key(
+        self,
+        *,
+        frame_chain: str,
+        frame_url: str,
+        shadow_path: str,
+        shadow_depth: int,
+        form: str,
+        control_id: str,
+        name: str,
+        field_type: str,
+        label: str,
+        ordinal: int = 0,
+    ) -> str:
+        """The key `snapshot` would give a control with this identity.
+
+        The derivation `snapshot` uses, reachable from outside it: anything
+        that resolves a control by its metadata and then wants to prove it
+        found the control a `FormField.key` names needs this rather than a
+        second implementation of it. Components are passed raw — the label
+        as the page renders it, the URL with whatever fragment it carries —
+        because the folding is part of the derivation.
+
+        `ordinal` is only ever non-zero for controls that are genuinely
+        indistinguishable (no name, id, label, or form), which are told
+        apart by scan order alone and therefore cannot be re-identified
+        from their metadata at all.
+        """
+        identity = (
+            frame_chain,
+            _normalize_frame_url(frame_url),
+            shadow_path,
+            str(shadow_depth),
+            form,
+            control_id,
+            name,
+            field_type,
+            _normalize_label(label),
+        )
+        return self._field_key(identity, ordinal)
+
     async def snapshot(self, page: Any) -> FormSnapshot:
         """Scan every same-origin frame, including open shadow roots."""
         fields: list[FormField] = []
@@ -1055,6 +1133,18 @@ class FormScanner:
         )
         ordinal = seen_identities.get(identity, 0)
         seen_identities[identity] = ordinal + 1
+        key = self.stable_key(
+            frame_chain=chain,
+            frame_url=frame_url,
+            shadow_path=shadow_path,
+            shadow_depth=shadow_depth,
+            form=form,
+            control_id=control_id,
+            name=name,
+            field_type=field_type,
+            label=label,
+            ordinal=ordinal,
+        )
 
         digest = _as_text(record.get("valueDigest"))
         if not digest:
@@ -1074,7 +1164,7 @@ class FormScanner:
             )
 
         return FormField(
-            key=self._field_key(identity, ordinal),
+            key=key,
             frame_url=frame_url,
             form=form,
             control_id=control_id,
