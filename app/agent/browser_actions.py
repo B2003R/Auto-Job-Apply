@@ -60,6 +60,7 @@ from app.agent.errors import (
     FieldWriteNotVerified,
     FieldWriteRefused,
     FinalSubmitControlAmbiguous,
+    FinalSubmitControlNotActionable,
     FinalSubmitControlNotFound,
     LoginWallEncountered,
     SubmitNotAuthorized,
@@ -1321,6 +1322,12 @@ DEFAULT_CONFIRM_POLL_MS = 200
 #: nobody can act on.
 DEFAULT_SUBMIT_FRAME_TIMEOUT_MS = 3_000
 
+#: How long the driver is given to satisfy itself that the control can be
+#: clicked, and then to click it. Actionability is retried internally until
+#: this elapses, which is what lets a banner finish animating out of the way
+#: rather than turning a transient overlay into a refusal.
+DEFAULT_CLICK_TIMEOUT_MS = 5_000
+
 
 class PlaywrightSubmitter:
     """Performs the last click, and only says it worked when the page does."""
@@ -1332,6 +1339,7 @@ class PlaywrightSubmitter:
         confirm_timeout_ms: int = DEFAULT_CONFIRM_TIMEOUT_MS,
         poll_interval_ms: int = DEFAULT_CONFIRM_POLL_MS,
         frame_timeout_ms: int = DEFAULT_SUBMIT_FRAME_TIMEOUT_MS,
+        click_timeout_ms: int = DEFAULT_CLICK_TIMEOUT_MS,
         sleep: Sleeper = asyncio.sleep,
         clock: Clock = time.monotonic,
         rng: random.Random | None = None,
@@ -1343,6 +1351,7 @@ class PlaywrightSubmitter:
         self._confirm_timeout_ms = confirm_timeout_ms
         self._poll_interval_ms = max(1, poll_interval_ms)
         self._frame_timeout_s = max(0.001, frame_timeout_ms / 1000)
+        self._click_timeout_ms = click_timeout_ms
         self._sleep = sleep
         self._clock = clock
         self._rng = rng if rng is not None else random.Random(seed)
@@ -1367,7 +1376,7 @@ class PlaywrightSubmitter:
                 authorization.application_id, authorization.refusal()
             )
 
-        frame = await self._sole_submit_frame(page)
+        frame, name = await self._sole_submit_frame(page)
         try:
             before = _mapping(await self._ask(frame, SUBMIT_TARGET_SCRIPT))
         except Exception:  # noqa: BLE001 - a timeout arrives here too
@@ -1384,7 +1393,7 @@ class PlaywrightSubmitter:
         # Every target that will be watched afterwards is read *now*, and
         # each is only ever compared with its own reading. See `PageState`.
         baselines = await self._baselines(page, frame)
-        await self._click_the_only_submit(page, frame)
+        await self._click_the_only_submit(page, frame, name)
         return await self._await_confirmation(page, baselines)
 
     async def _baselines(self, page: Any, frame: Any) -> list[tuple[Any, PageState]]:
@@ -1433,7 +1442,7 @@ class PlaywrightSubmitter:
             limit = max(0.001, min(limit, budget))
         return await asyncio.wait_for(_evaluate(target, script, argument), limit)
 
-    async def _sole_submit_frame(self, page: Any) -> Any:
+    async def _sole_submit_frame(self, page: Any) -> tuple[Any, str]:
         """The one same-origin frame holding the one final-submit control.
 
         A frame that cannot be read contributes nothing rather than
@@ -1464,9 +1473,9 @@ class PlaywrightSubmitter:
             raise FinalSubmitControlAmbiguous(accepted)
         if not accepted:
             raise FinalSubmitControlNotFound(rejected)
-        return holders[0]
+        return holders[0], accepted[0]
 
-    async def _click_the_only_submit(self, page: Any, frame: Any) -> None:
+    async def _click_the_only_submit(self, page: Any, frame: Any, name: str) -> None:
         try:
             handle = await asyncio.wait_for(
                 frame.evaluate_handle(SUBMIT_RESOLVE_SCRIPT), self._frame_timeout_s
@@ -1489,11 +1498,26 @@ class PlaywrightSubmitter:
                 (("", "the counted submit control could not be resolved again"),)
             )
         try:
-            await self._press(page, element)
+            await self._press(page, element, name)
         finally:
             await _dispose_quietly(element)
 
-    async def _press(self, page: Any, element: Any) -> None:
+    async def _press(self, page: Any, element: Any, name: str) -> None:
+        """Verify the control can be clicked, then let the driver click it.
+
+        The press itself is the driver's own trusted click rather than a
+        pointer event at the box's remembered centre, because between
+        resolving a control and pressing it a cookie banner can animate in
+        over it, a sticky footer can cover it, or the node can detach — and
+        a coordinate press lands on whatever is actually there. The driver
+        will not fire until the element is visible, stable, enabled, and the
+        thing that genuinely receives an event at that point.
+
+        The check runs first with the press withheld (`trial=True`), so
+        every reason not to click is found before anything is spent on this
+        application. The pointer still travels there first, because that
+        movement is what a page's own listeners see.
+        """
         scroll = getattr(element, "scroll_into_view_if_needed", None)
         if scroll is not None:
             try:
@@ -1501,19 +1525,41 @@ class PlaywrightSubmitter:
             except Exception:  # noqa: BLE001 - scrolling is best effort
                 pass
 
-        box = await element.bounding_box()
+        box = await self._bounded(element.bounding_box())
         if not box:
             raise FinalSubmitControlNotFound(
                 (("", "the submit control has no bounding box, so it is not on screen"),)
             )
         self._reject_oversized(page, box)
 
+        await self._verify_actionable(element, name)
+
         mouse = getattr(page, "mouse", None)
-        if mouse is None:  # pragma: no cover - every real page has one
-            raise FinalSubmitControlNotFound(
-                (("", "the page exposes no mouse, so nothing can be clicked"),)
-            )
-        await self._humanizer.move_and_click(mouse, box)
+        if mouse is not None:
+            try:
+                await self._humanizer.move_to(mouse, box)
+            except Exception:  # noqa: BLE001 - the travel is realism, not the click
+                pass
+
+        try:
+            await element.click(timeout=self._click_timeout_ms)
+        except Exception as error:  # noqa: BLE001
+            # After the press was made, so it may have landed. Never a
+            # second attempt.
+            raise FinalSubmitControlNotActionable(
+                name, f"the click did not complete ({error})", pressed=True
+            ) from error
+
+    async def _verify_actionable(self, element: Any, name: str) -> None:
+        """Run the driver's actionability and hit-target checks, unclicked."""
+        try:
+            await element.click(trial=True, timeout=self._click_timeout_ms)
+        except Exception as error:  # noqa: BLE001
+            raise FinalSubmitControlNotActionable(name, str(error)) from error
+
+    async def _bounded(self, awaitable: Awaitable[Any]) -> Any:
+        """One driver call, under the per-frame deadline."""
+        return await asyncio.wait_for(awaitable, self._frame_timeout_s)
 
     def _reject_oversized(self, page: Any, box: Mapping[str, float]) -> None:
         """Refuse to press the centre of something page-sized.

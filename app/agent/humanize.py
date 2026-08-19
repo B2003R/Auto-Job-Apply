@@ -191,15 +191,21 @@ class Humanizer:
             target[1] - self._rng.uniform(*_APPROACH_Y_RANGE),
         )
 
-    async def move_and_click(
+    async def move_to(
         self,
         mouse: Any,
         box: Mapping[str, float],
     ) -> MousePath:
-        """Travel to a point inside `box` and press once.
+        """Travel to a point inside `box`, without pressing anything.
 
-        `mouse` is duck-typed (`move`/`down`/`up`), so this drives a
-        Playwright mouse, a frame's mouse, or a test double identically.
+        Separate from `move_and_click` because the safest way to click a
+        control is to let the driver do it, after its own actionability and
+        hit-target checks — and that leaves the approach as the only part
+        worth humanising. A page's own pointer listeners see the same
+        movement either way.
+
+        `mouse` is duck-typed (`move`), so this drives a Playwright mouse, a
+        frame's mouse, or a test double identically.
         """
         target = self.click_point(box)
         travelled = self.path(self.approach_point(target), target)
@@ -207,7 +213,21 @@ class Humanizer:
         for point in travelled.points:
             await mouse.move(point[0], point[1])
             await self._sleep(self._rng.uniform(*_STEP_PAUSE_RANGE))
+        return travelled
 
+    async def move_and_click(
+        self,
+        mouse: Any,
+        box: Mapping[str, float],
+    ) -> MousePath:
+        """Travel to a point inside `box` and press once, with the pointer.
+
+        For controls where an untrusted-but-realistic pointer press is the
+        point — an extension's own sidebar button, which listens for pointer
+        events. The final submit control is *not* one of those: see
+        `PlaywrightSubmitter._press`.
+        """
+        travelled = await self.move_to(mouse, box)
         await mouse.down()
         await self._sleep(self._rng.uniform(*_PRESS_RANGE))
         await mouse.up()

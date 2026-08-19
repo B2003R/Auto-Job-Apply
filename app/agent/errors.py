@@ -491,6 +491,38 @@ class FinalSubmitControlNotFound(SubmitRefused):
         )
 
 
+class FinalSubmitControlNotActionable(SubmitRefused):
+    """Raised when the control is there but cannot be trusted to be clicked.
+
+    Between resolving a control and pressing it, a cookie banner can
+    animate in over it, a sticky footer can cover it, a chat widget can take
+    the corner, or the node can detach entirely. A pointer press at the
+    box's remembered centre lands on whichever of those is actually under
+    the pointer — and this is the press that sends somebody's application.
+
+    So the driver's own actionability and hit-target verification runs
+    first, with the press withheld, and this is what a failure of that
+    check is called. Nothing was clicked. If it is raised *after* the
+    press — a page that went away mid-click — then something may have been,
+    which is why it is never followed by a second attempt.
+    """
+
+    def __init__(self, name: str, detail: str, *, pressed: bool = False) -> None:
+        self.name = name
+        self.detail = detail
+        self.pressed = pressed
+        super().__init__(
+            f"The final submit control {name!r} could not be clicked safely: "
+            f"{detail}. "
+            + (
+                "The press had already been made, so it is not repeated; check "
+                "this application in the ATS by hand."
+                if pressed
+                else "Nothing was clicked; the form is left filled for the applicant."
+            )
+        )
+
+
 class FinalSubmitControlAmbiguous(SubmitRefused):
     """Raised when several controls could each be the last click.
 

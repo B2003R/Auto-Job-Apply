@@ -544,6 +544,47 @@ class TestAStagedApplicationThatIsThenApproved:
         assert await page.locator("#fixture-submit-confirmation").count() == 0
         assert await page.locator("#application-form").count() == 1
 
+    async def test_a_control_something_is_covering_is_not_clicked_blindly(
+        self, runner: ApplicationRunner, database: Database, fixture_server: str, page: Any
+    ) -> None:
+        """A cookie banner over the button, in a real browser.
+
+        This is why the press is the driver's own click rather than a
+        pointer event at the box's remembered centre: the control is still
+        there, still visible, still enabled, and still exactly where it was
+        counted — and a coordinate press would land on the overlay instead.
+        Whatever that overlay is, the application did not go anywhere, and
+        the run must not say it did.
+        """
+        queue_id = _queue(database, fixture_server)
+        staged = await runner.run_application(queue_id)
+        await page.evaluate(
+            """
+            () => {
+              const banner = document.createElement('div');
+              banner.id = 'cookie-banner';
+              banner.style.position = 'fixed';
+              banner.style.inset = '0';
+              banner.style.zIndex = '2147483647';
+              banner.style.background = 'rgba(0, 0, 0, 0.01)';
+              document.body.appendChild(banner);
+            }
+            """
+        )
+
+        result = await runner.resume_application(
+            staged.thread_id,
+            _approval(staged.application_id or 0),
+        )
+
+        assert result.status is RunStatus.FAILED
+        # Named as a control that could not be reached, rather than as a
+        # press that went unconfirmed. The difference is what an operator
+        # does next: a refused click leaves nothing to check in the ATS.
+        assert result.reason == "FinalSubmitControlNotActionable"
+        assert await page.locator("#fixture-submit-confirmation").count() == 0
+        assert await page.locator("#application-form").count() == 1
+
     async def test_a_next_button_is_never_the_one_that_gets_clicked(
         self, runner: ApplicationRunner, database: Database, fixture_server: str, page: Any
     ) -> None:

@@ -62,6 +62,7 @@ from app.agent.errors import (
     FieldWriteNotVerified,
     FieldWriteRefused,
     FinalSubmitControlAmbiguous,
+    FinalSubmitControlNotActionable,
     FinalSubmitControlNotFound,
     LoginWallEncountered,
     SubmitNotAuthorized,
@@ -155,21 +156,52 @@ class FakeMouse:
 
 
 class FakeElement:
-    """A resolved control handle with a plausible bounding box."""
+    """A resolved control handle with a plausible bounding box.
 
-    def __init__(self, box: Mapping[str, float] | None = None) -> None:
+    `click` is the driver's own trusted click, which is where actionability
+    and hit-target verification happen; `trial=True` is that check with the
+    press withheld. Both are counted separately so a test can say the check
+    happened *and* that nothing was pressed.
+    """
+
+    def __init__(
+        self,
+        box: Mapping[str, float] | None = None,
+        *,
+        boxless: bool = False,
+        trial_error: BaseException | None = None,
+        click_error: BaseException | None = None,
+    ) -> None:
         self.box = dict(box or {"x": 10.0, "y": 20.0, "width": 120.0, "height": 36.0})
+        self.boxless = boxless
         self.disposed = False
         self.scrolled = False
+        self.trials = 0
+        self.presses = 0
+        self.order: list[str] = []
+        self._trial_error = trial_error
+        self._click_error = click_error
 
     def as_element(self) -> "FakeElement":
         return self
 
-    async def bounding_box(self) -> dict[str, float]:
-        return dict(self.box)
+    async def bounding_box(self) -> dict[str, float] | None:
+        return None if self.boxless else dict(self.box)
 
     async def scroll_into_view_if_needed(self) -> None:
         self.scrolled = True
+
+    async def click(self, *, trial: bool = False, **_kwargs: Any) -> None:
+        if trial:
+            self.trials += 1
+            self.order.append("trial")
+            if self._trial_error is not None:
+                raise self._trial_error
+            return
+        self.presses += 1
+        self.order.append("click")
+        if self._click_error is not None:
+            raise self._click_error
 
     async def dispose(self) -> None:
         self.disposed = True
@@ -1050,6 +1082,18 @@ def submitting_frame(
     )
 
 
+def submit_control(frame: FakeFrame) -> FakeElement:
+    """The control this frame would resolve, so a test can count its clicks."""
+    element = frame._responses.get(SUBMIT_RESOLVE_SCRIPT)
+    assert isinstance(element, FakeElement)
+    return element
+
+
+def presses(frame: FakeFrame) -> int:
+    """How many trusted clicks landed on this frame's submit control."""
+    return submit_control(frame).presses
+
+
 def submitter(**kwargs: Any) -> PlaywrightSubmitter:
     clock = StepClock()
     kwargs.setdefault("clock", clock)
@@ -1125,7 +1169,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         page = FakePage(frame)
 
         assert (await submitter().submit(page, APPROVED)).submitted
-        assert page.mouse.presses == 1
+        assert presses(frame) == 1
 
     async def test_no_control_is_a_refusal_and_no_click(self) -> None:
         frame = submitting_frame(
@@ -1137,7 +1181,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         with pytest.raises(FinalSubmitControlNotFound) as raised:
             await submitter().submit(page, APPROVED)
 
-        assert page.mouse.presses == 0
+        assert presses(frame) == 0
         assert "next" in str(raised.value)
 
     async def test_two_controls_in_one_frame_are_a_refusal_and_no_click(self) -> None:
@@ -1147,7 +1191,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         with pytest.raises(FinalSubmitControlAmbiguous):
             await submitter().submit(page, APPROVED)
 
-        assert page.mouse.presses == 0
+        assert presses(frame) == 0
 
     async def test_one_control_in_each_of_two_frames_is_a_refusal(self) -> None:
         main = FakeFrame(
@@ -1170,7 +1214,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         with pytest.raises(FinalSubmitControlAmbiguous):
             await submitter().submit(page, APPROVED)
 
-        assert page.mouse.presses == 0
+        assert main.times_run(SUBMIT_RESOLVE_SCRIPT) == 0
 
     async def test_a_cross_origin_frame_is_never_asked_for_a_submit_control(
         self,
@@ -1181,6 +1225,108 @@ class TestFindingExactlyOneFinalSubmitControl:
         await submitter().submit(FakePage(main, [foreign]), APPROVED)
 
         assert foreign.calls == []
+
+
+class TestThePressIsAVerifiedClickRatherThanACoordinate:
+    """A pointer press at a remembered centre lands on whatever is there.
+
+    Between resolving a control and pressing it, a cookie banner can
+    animate in over it, a sticky footer can cover it, a chat widget can
+    take the corner, or the node can detach entirely. A blind
+    `mouse.down()` at the box's centre lands on whichever of those is
+    actually under the pointer, and this is the press that sends somebody's
+    application somewhere.
+
+    So the press is the driver's own trusted click, which will not fire
+    until the element is visible, stable, enabled, and genuinely the thing
+    that receives an event at that point.
+    """
+
+    async def test_the_control_is_checked_before_it_is_pressed(self) -> None:
+        frame = submitting_frame()
+
+        await submitter().submit(FakePage(frame), APPROVED)
+
+        assert submit_control(frame).order == ["trial", "click"]
+
+    async def test_the_press_goes_through_the_driver_not_the_bare_pointer(
+        self,
+    ) -> None:
+        frame = submitting_frame()
+        page = FakePage(frame)
+
+        await submitter().submit(page, APPROVED)
+
+        assert presses(frame) == 1
+        assert page.mouse.presses == 0
+
+    async def test_the_pointer_still_travels_there_first(self) -> None:
+        """The movement is what an extension's own listeners see."""
+        frame = submitting_frame()
+        page = FakePage(frame)
+
+        await submitter().submit(page, APPROVED)
+
+        assert len(page.mouse.moves) > 1
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            TimeoutError("element is not receiving pointer events"),
+            RuntimeError("element is outside of the viewport"),
+            RuntimeError("Element is not attached to the DOM"),
+        ],
+    )
+    async def test_a_control_that_cannot_be_reached_is_refused_unpressed(
+        self, failure: BaseException
+    ) -> None:
+        frame = submitting_frame(element=FakeElement(trial_error=failure))
+        page = FakePage(frame)
+
+        with pytest.raises(FinalSubmitControlNotActionable) as raised:
+            await submitter().submit(page, APPROVED)
+
+        assert presses(frame) == 0
+        assert page.mouse.presses == 0
+        assert str(failure) in str(raised.value)
+
+    async def test_a_press_that_fails_after_the_check_is_never_a_submission(
+        self,
+    ) -> None:
+        """Half a click is not a submission, and is not two clicks either."""
+        frame = submitting_frame(
+            element=FakeElement(click_error=TimeoutError("the page went away"))
+        )
+
+        with pytest.raises(FinalSubmitControlNotActionable):
+            await submitter().submit(FakePage(frame), APPROVED)
+
+        assert presses(frame) == 1
+
+    async def test_a_control_the_size_of_the_page_is_refused(self) -> None:
+        """Hit-target verification is happy to click a full-page container.
+
+        It only asks whether the element receives the event, and a wrapper
+        that covers the viewport does. What is underneath it could be any
+        link on the page.
+        """
+        frame = submitting_frame(
+            element=FakeElement({"x": 0.0, "y": 0.0, "width": 1280.0, "height": 900.0})
+        )
+
+        with pytest.raises(FinalSubmitControlNotFound) as raised:
+            await submitter().submit(FakePage(frame), APPROVED)
+
+        assert presses(frame) == 0
+        assert "container" in str(raised.value)
+
+    async def test_a_control_with_no_box_at_all_is_refused(self) -> None:
+        frame = submitting_frame(element=FakeElement(boxless=True))
+
+        with pytest.raises(FinalSubmitControlNotFound):
+            await submitter().submit(FakePage(frame), APPROVED)
+
+        assert presses(frame) == 0
 
 
 class TestReportingASubmission:
@@ -1231,7 +1377,7 @@ class TestReportingASubmission:
 
         await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
 
-        assert page.mouse.presses == 1
+        assert presses(frame) == 1
 
     async def test_the_unconfirmed_reason_says_what_was_looked_for(self) -> None:
         frame = submitting_frame(after=(state(),))
@@ -1481,7 +1627,7 @@ class TestThePageSayingItRefusedTheSubmission:
 
         assert outcome.submitted is False
         assert "Last name is required" in outcome.reason
-        assert page.mouse.presses == 1
+        assert presses(frame) == 1
 
     async def test_a_blocker_that_was_already_there_is_not_a_refusal(self) -> None:
         """A form with a standing "required field" hint is an ordinary form."""
@@ -1575,7 +1721,7 @@ class TestNoFrameCanHoldTheSubmitter:
         )
 
         assert outcome.submitted is False
-        assert page.mouse.presses == 1
+        assert presses(inner) == 1
 
     async def test_the_deadline_still_ends_a_wait_in_which_nothing_answers(
         self,
@@ -1611,7 +1757,7 @@ class TestNoFrameCanHoldTheSubmitter:
                 submitter(frame_timeout_ms=20).submit(page, APPROVED), timeout=5
             )
 
-        assert page.mouse.presses == 0
+        assert presses(main) == 0
 
 
 class TestSubmissionScreenshots:
