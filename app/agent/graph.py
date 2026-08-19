@@ -1278,9 +1278,7 @@ class ApplicationRunner:
     async def pending_approval(self, thread_id: str) -> dict[str, Any] | None:
         """The interrupt payload a thread is paused on, if it is paused."""
         state = await self._graph.aget_state(_config(thread_id))
-        if not state.interrupts:
-            return None
-        return dict(state.interrupts[0].value)
+        return _interrupt_payload(state.interrupts)
 
     async def resume_application(
         self, thread_id: str, decision: ApprovalRequest
@@ -1324,17 +1322,7 @@ class ApplicationRunner:
             # decision reads the outcome it already caused; a different one
             # is still a conflict, because arriving late does not make it
             # agree with what was decided.
-            existing = self._require_matching_approval(thread_id, application, decision)
-            recorded = _recorded_result(
-                thread_id,
-                self._deps.db.get_queue_item(application.queue_id),
-                application,
-                existing,
-            )
-            if recorded is not None:
-                return recorded
-            state = await self._graph.aget_state(config)
-            return self._from_state(thread_id, application.queue_id, state)
+            return self._finished_resume(thread_id, application, decision)
 
         state = await self._graph.aget_state(config)
         if not state.interrupts:
@@ -1399,16 +1387,31 @@ class ApplicationRunner:
         allowed anywhere near the submitter.
         """
         if current is not None and current.status in TERMINAL_APPLICATION_STATUSES:
-            existing = self._require_matching_approval(thread_id, current, decision)
-            recorded = _recorded_result(
-                thread_id,
-                self._deps.db.get_queue_item(current.queue_id),
-                current,
-                existing,
-            )
-            if recorded is not None:
-                return recorded
+            return self._finished_resume(thread_id, current, decision)
         raise ResumeInProgress(thread_id, application_id)
+
+    def _finished_resume(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        decision: ApprovalRequest,
+    ) -> RunResult:
+        """The recorded outcome of an application that is already over.
+
+        Read from storage rather than the checkpoint, so it is still the
+        right answer when the checkpoint file is missing — which is the case
+        where getting it wrong would restage a submitted application.
+        """
+        existing = self._require_matching_approval(thread_id, application, decision)
+        recorded = _recorded_result(
+            thread_id,
+            self._deps.db.get_queue_item(application.queue_id),
+            application,
+            existing,
+        )
+        if recorded is None:  # pragma: no cover - callers check the status first
+            raise ThreadNotAwaitingApproval(thread_id, application.id)
+        return recorded
 
     def _from_state(self, thread_id: str, queue_id: int, state: Any) -> RunResult:
         payload = _interrupt_payload(state.interrupts)
