@@ -29,6 +29,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from langgraph.errors import GraphInterrupt
+from langgraph.types import Interrupt
 
 from app.agent.approval import ApprovalConflict, ApprovalRequest
 from app.agent.errors import PageUnavailable
@@ -55,6 +57,7 @@ from app.storage.models import (
 )
 from tests.agent.support import (
     Crash,
+    FakeAdapter,
     World,
     build_world,
     cover_letter_gap,
@@ -632,6 +635,33 @@ class TestSubmitFailuresAreExplained:
         item = world.db.get_queue_item(queue_id)
         assert item is not None
         assert item.error_reason == SkipKind.STAGED_PAGE_LOST.value
+
+
+class TestLangGraphSignalsAreNotFailures:
+    async def test_an_interrupt_raised_inside_a_node_is_not_swallowed(
+        self, tmp_path: Path
+    ) -> None:
+        """LangGraph's control flow travels as an exception.
+
+        An `interrupt()` anywhere below a node — in a dependency that asks
+        for a credential, say — raises `GraphInterrupt` on its way out.
+        Catching it as a node failure would convert a request for a human
+        into a permanently failed application that nobody was ever asked
+        about, and the run would report a malfunction that never happened.
+        """
+        adapter = FakeAdapter(open_error=GraphInterrupt((Interrupt(value="who?"),)))
+        world = build_world(tmp_path, adapter=adapter)
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            result = await runner.run_application(queue_id)
+
+        assert result.status is RunStatus.AWAITING_APPROVAL
+        assert result.interrupt == {"value": "who?"}
+
+        item = world.db.get_queue_item(queue_id)
+        assert item is not None
+        assert item.state is QueueState.RUNNING
 
 
 class TestTheCheckpointHoldsNoReviewer:

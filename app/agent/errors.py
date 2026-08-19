@@ -303,8 +303,13 @@ class PageUnavailable(BrowserError):
 
     A staged application lives in a specific tab: the form is filled, the
     approval gate is what stands between it and the submit button. The
-    checkpoint survives a restart but the tab does not, so a resume that
-    finds no page must fail loudly rather than "submit" against nothing.
+    checkpoint survives a restart but the tab does not, so a run that finds
+    no page must stop rather than "submit" against nothing.
+
+    What stopping means depends on when it happens. Mid-staging it is a
+    skip: nothing was submitted and the listing can be staged again. After a
+    decision it is a failure, because someone approved a submission that is
+    now not going to happen and should be told so.
     """
 
     def __init__(self, thread_id: str) -> None:

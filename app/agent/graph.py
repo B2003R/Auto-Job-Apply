@@ -27,11 +27,23 @@ Only genuinely unexpected errors reach the `fail` node, and they are
 contained the same way.
 
 **Transient browser objects never enter the checkpoint.** State holds ints,
-strings, and plain dicts only. The baseline snapshot and the trigger result
-live in an in-memory cache scoped to one `build_graph` call and are only
-needed *within* one uninterrupted invocation; the staged page itself is held
-by the injected `PageBroker`. A resume that finds no staged page fails
-loudly (`PageUnavailable`) rather than "submitting" against nothing.
+strings, and plain dicts only — not even the reviewer's name, which belongs
+to the approvals table. The baseline snapshot and the trigger result live in
+an in-memory cache scoped to one `build_graph` call and are only needed
+*within* one uninterrupted invocation; the staged page itself is held by the
+injected `PageBroker`. Losing either mid-staging ends the application as a
+typed skip, because nothing was submitted and the listing can be staged
+afresh; losing the page after a decision has been taken is a failure, because
+somebody is waiting on a submission that will not happen.
+
+**Nothing here runs only once.** A crash, a retry, or a replayed checkpoint
+re-executes a node body against a database that already holds the previous
+attempt's writes, so provenance is upserted rather than appended, model spend
+is added rather than assigned and recorded before the fallible part of the
+node, and every terminal write is refused by storage once the record has
+finished. Resumes for a thread are serialised in-process and claimed in the
+database, so one approval means at most one submission even with two workers
+on one queue.
 
 **Every dependency is injected.** The browser, the adapter registry, the
 trigger, the gap filler, the field writer, the submitter, the page guard,
@@ -1119,6 +1131,21 @@ def _recorded_result(
     )
 
 
+def _interrupt_payload(interrupts: Sequence[Any]) -> dict[str, Any] | None:
+    """The value a paused thread is waiting on, as a mapping.
+
+    This graph's own gate always interrupts with one, but an `interrupt()`
+    raised from somewhere below a node need not, and coercing that blindly
+    would turn a paused application into a `ValueError` out of the runner —
+    taking the rest of the batch with it. An unrecognised value is wrapped
+    rather than dropped, because whatever asked for it is still waiting.
+    """
+    if not interrupts:
+        return None
+    value = interrupts[0].value
+    return dict(value) if isinstance(value, Mapping) else {"value": value}
+
+
 def _finished_result(
     thread_id: str,
     item: QueueItem,
@@ -1384,14 +1411,13 @@ class ApplicationRunner:
         raise ResumeInProgress(thread_id, application_id)
 
     def _from_state(self, thread_id: str, queue_id: int, state: Any) -> RunResult:
-        payload = dict(state.interrupts[0].value) if state.interrupts else None
+        payload = _interrupt_payload(state.interrupts)
         return self._result(thread_id, queue_id, dict(state.values), payload)
 
     def _from_values(
         self, thread_id: str, queue_id: int, values: Mapping[str, Any]
     ) -> RunResult:
-        interrupts = values.get("__interrupt__") or ()
-        payload = dict(interrupts[0].value) if interrupts else None
+        payload = _interrupt_payload(values.get("__interrupt__") or ())
         return self._result(thread_id, queue_id, values, payload)
 
     def _result(
