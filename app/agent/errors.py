@@ -322,6 +322,166 @@ class PageUnavailable(BrowserError):
         )
 
 
+class FieldWriteRefused(BrowserError):
+    """Base class for "the answer was not typed, and this is why".
+
+    Every subclass names a control by its stable key and never carries the
+    value: these messages reach logs and tracebacks, and the value is
+    somebody's address, salary, or cover letter.
+
+    A refusal is not a malfunction. The graph records the gap as unfilled,
+    which puts `unwritten_answer` in the blocking reasons and therefore
+    keeps the approval gate in play even under `AUTO_SUBMIT` — so the
+    outcome of every refusal below is that a human looks at the form.
+    """
+
+    def __init__(self, key: str, reason: str) -> None:
+        self.key = key
+        self.reason = reason
+        super().__init__(f"Refusing to type an answer into {key!r}: {reason}")
+
+
+class UnsupportedFieldControl(FieldWriteRefused):
+    """Raised for a control the applicant has to operate themselves.
+
+    A file input cannot be satisfied by text at all. A password field would
+    take a credential out of a plaintext answers file and put it into a
+    page. A checkbox, a radio, and a multi-select are consents and choices,
+    and a writer that "just ticked the box" would be agreeing to something
+    on somebody's behalf.
+    """
+
+    def __init__(self, key: str, tag: str, field_type: str) -> None:
+        self.tag = tag
+        self.field_type = field_type
+        super().__init__(
+            key,
+            f"a <{tag}> of type {field_type!r} is not something this writer will "
+            "type into; it is left for the applicant",
+        )
+
+
+class FieldNotUniquelyResolved(FieldWriteRefused):
+    """Raised when the page holds no such control, or more than one.
+
+    "Type this answer into the control this key names" is only a meaningful
+    instruction when exactly one control answers to that description. Two
+    matches means guessing which of someone's answers goes where; none means
+    the form on the page is not the form that was scanned.
+    """
+
+    def __init__(self, key: str, matches: int, detail: str = "") -> None:
+        self.matches = matches
+        found = (
+            "no visible, enabled control matches the metadata it was scanned with"
+            if matches == 0
+            else f"{matches} visible controls match the metadata it was scanned with"
+        )
+        super().__init__(key, f"{found}{f' ({detail})' if detail else ''}")
+
+
+class FieldProvenanceMismatch(FieldWriteRefused):
+    """Raised when the resolved control is not the one the key was made from.
+
+    Every audit row says "this answer went into this stable key". Resolving
+    a control from metadata is a different question from "is this the
+    control that key was derived from", so the key is re-derived from what
+    was actually found and a mismatch stops the write.
+    """
+
+    def __init__(self, key: str, resolved_key: str) -> None:
+        self.resolved_key = resolved_key
+        super().__init__(
+            key,
+            "the control found on the page derives the stable key "
+            f"{resolved_key!r}, so typing into it would record an answer "
+            "against a control it did not go into",
+        )
+
+
+class FieldWriteNotVerified(FieldWriteRefused):
+    """Raised when the control did not hold the value afterwards.
+
+    The comparison happens in the page and only a boolean comes back, so
+    neither the intended answer nor whatever the control actually holds
+    crosses the wire a second time. Nothing is retried: a second attempt
+    would be a second set of input events on a control that already refused
+    one.
+    """
+
+    def __init__(self, key: str, detail: str = "") -> None:
+        super().__init__(
+            key,
+            "the value was dispatched but the control did not hold it afterwards"
+            + (f" ({detail})" if detail else "")
+            + "; nothing is retried",
+        )
+
+
+class SubmitRefused(BrowserError):
+    """Base class for "no submission was attempted, and this is why".
+
+    Distinct from a `SubmitOutcome` reporting `submitted=False`, which means
+    a final-submit control *was* clicked and no success signal followed.
+    That distinction is the whole point of the type: one says nothing
+    happened, the other says something happened and cannot be confirmed.
+    """
+
+
+class SubmitNotAuthorized(SubmitRefused):
+    """Raised when a submission was asked for without a decision behind it.
+
+    The graph only routes to its submit node after an approval, or under
+    `AUTO_SUBMIT` for a form with nothing blocking it. This is the same
+    condition restated as a precondition the submitter enforces itself, so
+    that a retry path, a debugging script, or a new graph edge cannot submit
+    an application nobody released.
+    """
+
+    def __init__(self, application_id: int, detail: str) -> None:
+        self.application_id = application_id
+        super().__init__(
+            f"Refusing to submit application {application_id}: {detail}. Nothing "
+            "was clicked."
+        )
+
+
+class FinalSubmitControlNotFound(SubmitRefused):
+    """Raised when nothing on the page is recognisably the last click.
+
+    Carries what was rejected and why, because the usual cause is a form
+    whose final control is worded in a way the accessible-name rules do not
+    accept — and an operator can only tell that from the list.
+    """
+
+    def __init__(self, rejected: Sequence[tuple[str, str]]) -> None:
+        self.rejected = tuple(rejected)
+        listed = "; ".join(f"{name!r}: {reason}" for name, reason in self.rejected)
+        super().__init__(
+            "No visible control on this page is recognisably a final submit. "
+            + (f"Rejected: {listed}. " if listed else "")
+            + "Nothing was clicked; the form is left filled for the applicant."
+        )
+
+
+class FinalSubmitControlAmbiguous(SubmitRefused):
+    """Raised when several controls could each be the last click.
+
+    Clicking one of several would be a guess about which form is being
+    submitted, on a page that is about to send somebody's application
+    somewhere.
+    """
+
+    def __init__(self, accepted: Sequence[str]) -> None:
+        self.accepted = tuple(accepted)
+        listed = ", ".join(repr(name) for name in self.accepted)
+        super().__init__(
+            f"{len(self.accepted)} visible controls each look like a final submit "
+            f"({listed}), so which one submits this application is a guess. "
+            "Nothing was clicked."
+        )
+
+
 class SafetyError(Exception):
     """Base class for refusals that protect the account or the applicant.
 
