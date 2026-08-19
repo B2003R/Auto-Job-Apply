@@ -1122,3 +1122,166 @@ Every concern from the addendum above stands. New:
    when `CHROME_EXECUTABLE` is unset, about half a second — for a question
    whose answer is a filename. Caching it across sessions would need a file
    nobody has asked for.
+
+---
+
+# Task 9 addendum 3: the final blocking issue
+
+## Status
+
+DONE. Three changes, all in the same place: what a page has to do before
+this build will record an application as sent. `AUTO_SUBMIT` is still
+`false`, no blocker gate changed, and nothing here submits anything external.
+
+The blocking issue had two halves. An anonymous region that the page rebuilt
+was addressed by a token minted per node, so the identity rule fell back to
+something that was new on every reading — the same false success one fallback
+further down. And, more importantly, a *fresh confirmation was still accepted
+on its own*: every rule about which region spoke is a rule about text in the
+end, so a standing panel repainting itself beside a form that never moved
+could still confirm. It cannot now: a submission needs a structural fact
+about the target, and words are only ever corroboration.
+
+## Commits
+
+Three commits, on top of `467c948` (the addendum above), plus this report.
+
+| SHA | Message |
+|-----|---------|
+| `b93a3c4` | `fix(submit): let the URL's own denial outrank the word in its path` |
+| `af4e8c8` | `fix(submit): address a confirmation region by where it is, not by a token` |
+| `e073752` | `fix(submit): no confirmation counts until the form it is about is gone` |
+
+**Not pushed, no PR**, per the task instructions.
+
+## Files changed
+
+| File | Action |
+|------|--------|
+| `app/agent/browser_actions.py` | Modified — `submission_verdict` requires a structural fact; `SUBMIT_STATE_SCRIPT` derives a region's identity from its shadow root and its ancestor path; `SUBMIT_TARGET_SCRIPT` finds the enclosing form across shadow boundaries; `_query_claim` and `FALSEY_QUERY_VALUES` |
+| `README.md` | Modified — "nothing is confirmed on words alone", the query outranking the path, and the fixture's two new answers |
+| `tests/agent/test_browser_actions.py` | Modified — corroboration cases, the denied destination, the derived identity, the shadow-crossing form; the default post-click reading is now a page whose form went |
+| `tests/integration/test_stub_extension.py` | Modified — the combined anonymous-and-rebuilt panel, a confirmation beside a form that stayed, and the happy case with the form hidden |
+| `tests/fixtures/ats/live_status.html`, `live_status.js` | Modified — `ghost` and `announces` modes; the status region moved out of the form; `confirms` hides the form |
+| `tests/test_readme.py` | Modified — the words-alone rule is pinned in the prose |
+
+## Verification
+
+```bash
+python3 -m pytest -q                                    # 1886 passed (1872 before, +14)
+python3 -m pytest -q --ignore=tests/integration         # 1854 passed, no browser
+DISPLAY=:1 python3 -m pytest tests/integration -q       # 32 passed in 73s, real Chromium
+env -u DISPLAY python3 -m pytest tests/integration -q   # 32 passed — Xvfb started by the suite
+python3 -m mypy app                                     # Success: no issues found in 29 source files
+python3 -m compileall -q app tests scripts              # OK
+git diff --check 467c948..HEAD                          # clean
+```
+
+**Browser result: 32 passed** (30 before, +2).
+
+## Finding by finding
+
+### 1. A region's identity is derived, not invented
+
+The identity fallbacks were: a stamp this reader had written on the node, the
+page's own `id`, and failing both a random token. The third is not an
+identity — a second reading cannot arrive at it — so an anonymous region in a
+node the page rebuilds between polls was new every time, and a panel like
+that read as a stream of confirmations arriving.
+
+The last fallback is now a structural path: the shadow root the region lives
+in, then its position among same-tag siblings up its ancestor chain, with an
+`id` ending the walk because an `id` is the page's own name for a node. Two
+readings of the same place produce the same string. The stamp is kept as the
+*first* fallback, because it is what carries a region that **moves** while
+its path changes underneath — an insertion above it, for instance.
+
+`live_status.html` grew a `ghost` mode with nothing at all to fall back on:
+no `id`, a node thrown away and rebuilt every 60ms, and different wording
+each time. Only its position holds still.
+
+### 2. Words are corroboration, never evidence (the blocking one)
+
+`submission_verdict` accepted a fresh confirmation region on its own. Every
+narrowing so far has been about *which* text counts and *when* it counts as
+new, and all of it is still text: an optimistic framework filling a status
+region before its request is answered, a template rendering its success
+partial unconditionally, a rebuilt panel that slips past the identity rule —
+each of those is a page saying something, and a page will say anything.
+
+A submission now requires one of two structural facts about the target that
+was actually watched:
+
+* the marked form is **gone from it, or no longer visible in it** — the
+  script has always folded visibility into `marked`, so a form hidden rather
+  than removed is the same fact; or
+* it **navigated to an affirmative success destination**.
+
+Given either, a fresh confirmation beside it is a submission. Given both, they
+are a submission on their own. Given neither, a confirmation is a reason to
+keep waiting and then to record the application as unconfirmed, with a
+screenshot, for a human — which is the honest answer for a page that has
+said "thank you" and left the form in place.
+
+**The shadow-boundary consequence.** A control inside a shadow root is not
+form-associated with the form around its host, and `closest` stops at the
+boundary — so for a component-framework ATS nothing was ever marked, and with
+the form going now doing the corroborating, that whole shape would have become
+unconfirmable. `SUBMIT_TARGET_SCRIPT` now walks outwards through shadow hosts
+to find the enclosing form, which is checked in Chromium by the shadow-root
+suite: without the walk, the submission it proves is no longer confirmed.
+
+### 3. A URL's own denial outranks the word in its path
+
+`/thank-you?submitted=false` was a success destination: the path was checked
+first and the query never got a say. It is now the other way round — the query
+is the specific statement. An affirmative value makes the claim, an explicitly
+negative one refuses the URL outright however its path reads, and a value that
+is neither (`?confirmation_id=abc123`, a reference rather than a state) says
+nothing either way and leaves the path to speak for itself.
+
+## Mutation testing
+
+| Mutation | Caught by |
+|---|---|
+| Region identity minted as a random token again | the Chromium rebuild test and the combined anonymous-and-rebuilt test |
+| A fresh confirmation accepted without corroboration | 2 unit tests and the Chromium "confirmation beside a form that stayed" test |
+| The enclosing form not looked for past the shadow boundary | the Chromium shadow-root submission test |
+| The path checked before the query | 11 unit tests |
+
+The shadow-boundary mutation is the interesting one: it is caught by a test
+that *passes* on the old build, because it only fails once the form going is
+load-bearing. The two changes are separable in the diff and not in the
+behaviour.
+
+## Concerns
+
+Concerns from the addenda above stand, except the third in addendum 2 (a
+rebuilt anonymous region with new wording), which this closes. New:
+
+1. **An ATS that confirms without moving the form is now a failed row.**
+   A single-page board that shows "Your application was submitted" and leaves
+   the form on screen — disabled, or greyed out, but present and visible — is
+   recorded as **unconfirmed** with a screenshot. That is the direction to
+   err and it is the point of the change, but it is the likeliest new source
+   of rows a human has to check, and disabling a form rather than hiding it
+   is not a rare pattern.
+2. **`marked` is one boolean about the whole target.** "The form is gone or
+   hidden" cannot tell a form that was replaced by a confirmation from one
+   that was hidden while a wizard step swapped in. The corroboration is that
+   *this* form — the one the control belonged to, marked before the click —
+   is no longer visible, which is as specific as one attribute can be, but a
+   multi-step form that hides step one and shows a confirmation-shaped
+   heading for step two would satisfy both halves.
+3. **The structural path is positional, and positions shift.** A region
+   with no `id` that survives an insertion above it keeps its identity only
+   because of the stamp; a region with no `id` that is *rebuilt* after such
+   an insertion gets a new path and would read as fresh. It then still needs
+   the form to have gone, which is the layer this addendum adds — the two
+   rules are independent on purpose, and neither is asked to be sufficient.
+4. **Walking out through shadow hosts can mark a form the control does not
+   submit.** A component whose button posts by `fetch` while sitting inside
+   an unrelated `<form>` would have that form marked and watched. It is the
+   nearest enclosing form in the document, which is the best available
+   answer, and being wrong about it costs an unconfirmed row rather than a
+   false success.
