@@ -238,6 +238,43 @@ class TestRunStatus:
         assert all("answer" not in gap for gap in gaps)
         assert "Because the work matters." not in response.text
 
+    def test_a_thread_another_worker_is_running_offers_no_decision(
+        self, client: TestClient, harness: Harness
+    ) -> None:
+        """A leased thread reports that it is busy, and shows nothing.
+
+        `awaiting_decision` going false is not enough on its own. If the
+        gate payload were still rendered, a reviewer — or a UI polling this
+        route — would be looking at a decision they cannot make and would
+        be invited into a race the response gave them no way to see. The
+        payload comes back as soon as the lease lapses, which is what makes
+        a pending approval survive the death of the worker that asked for
+        it.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        queued = queue_one(client)
+        staged_application(harness, queued["queue_id"])
+        thread_id = thread_id_for(queued["queue_id"])
+        harness.db.acquire_lease(
+            thread_id,
+            "another-worker",
+            ttl=timedelta(seconds=120),
+            now=datetime.now(timezone.utc),
+        )
+
+        body = client.get(f"/runs/{queued['queue_id']}").json()
+
+        assert body["executing"] is True
+        assert body["awaiting_decision"] is False
+        assert body["interrupt"] is None
+        assert body["lease_expires_at"] is not None
+
+        harness.db.release_lease(thread_id, "another-worker")
+        after = client.get(f"/runs/{queued['queue_id']}").json()
+        assert after["awaiting_decision"] is True
+        assert after["interrupt"] is not None
+
     def test_a_drafted_answer_is_reported_when_logging_is_enabled(
         self, tmp_path: Path
     ) -> None:

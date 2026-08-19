@@ -368,6 +368,63 @@ class TestHttpBatch:
 class TestLocalBatch:
     """`--local` runs an in-process worker instead of talking to a server."""
 
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["--local", "approve", "1"],
+            ["--local", "reject", "1"],
+            ["--local", "status", "1"],
+            ["--local", "pending"],
+        ],
+    )
+    def test_only_a_batch_can_be_run_locally(
+        self, harness: Harness, argv: list[str]
+    ) -> None:
+        """A decision needs the process holding the staged tab.
+
+        `--local` starts a worker for one batch and stops it again, so by
+        the time a second command could run there is no tab to submit and
+        no worker to submit it. Accepting these would mean approving an
+        application against a browser that closed — and the honest failure
+        for that is `PageUnavailable` a long way from the mistake.
+        """
+        console = Console()
+
+        code = run_batch.main(
+            argv,
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 2
+        assert "needs the control plane" in console.text
+        assert harness.sessions == []
+
+    def test_prompting_over_http_is_refused_rather_than_ignored(
+        self, harness: Harness
+    ) -> None:
+        """A console prompt cannot decide a tab in the server's process.
+
+        Ignoring `--prompt` here would be worse than refusing it: the
+        operator asked to be consulted about each application, would be
+        shown nothing, and would reasonably read the silent success as
+        "there was nothing to decide".
+        """
+        console = Console()
+
+        code = run_batch.main(
+            ["run", LISTING_URL, "--board", "linkedin", "--prompt"],
+            settings=harness.settings,
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert code == 2
+        assert "--prompt needs --local" in console.text
+        assert harness.db.list_queue_items() == []
+
     def test_local_queues_and_stages_without_a_server(
         self, harness: Harness
     ) -> None:

@@ -238,6 +238,13 @@ def main(
         out("say what to do: queue, status, pending, run, approve, or reject")
         return 2
 
+    problem = _usage_problem(args)
+    if problem is not None:
+        # Before either mode is entered, so a mistyped command is answered
+        # without a server having to be reachable to say so.
+        out(problem)
+        return 2
+
     if args.local:
         return _local(args, resolved, worker_factory, out, reader)
 
@@ -255,6 +262,25 @@ def main(
     except ControlPlaneError as exc:
         out(str(exc))
         return 1
+
+
+def _usage_problem(args: argparse.Namespace) -> str | None:
+    """Why this invocation cannot be carried out, before anything is opened.
+
+    Both refusals are about a mode mismatch rather than about the world, so
+    neither should cost a connection or a browser to discover.
+    """
+    if args.command != "run":
+        return None
+    if args.urls and args.board is None:
+        return "--board is required when `run` is given listing URLs"
+    if args.prompt and not args.local:
+        return (
+            "--prompt needs --local: a decision has to be made where the "
+            "staged tab is, and over HTTP that is the server's process. Use "
+            "`approve`/`reject` against the API instead."
+        )
+    return None
 
 
 def _default_client_factory(api_url: str, token: str | None) -> httpx.Client:
@@ -287,14 +313,6 @@ def _remote(
         return _report(out, args.json, decided, _describe_decision)
 
     if args.command == "run":
-        if args.prompt:
-            out("--prompt needs --local: a decision has to be made where the "
-                "staged tab is, and over HTTP that is the server's process. "
-                "Use `approve`/`reject` against the API instead.")
-            return 2
-        if args.urls and args.board is None:
-            out("--board is required when `run` is given listing URLs")
-            return 2
         queued = [client.queue(url, args.board) for url in args.urls]
         watched = [
             _watch(client, item["queue_id"], args.timeout, DEFAULT_POLL_S)
@@ -337,9 +355,6 @@ def _local(
             "for one batch and stops it again, so there is nothing for a "
             "second command to talk to."
         )
-        return 2
-    if args.urls and args.board is None:
-        out("--board is required when `run` is given listing URLs")
         return 2
     return asyncio.run(_local_run(args, settings, worker_factory, out, reader))
 
