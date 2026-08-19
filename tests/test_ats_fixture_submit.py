@@ -25,11 +25,12 @@ from pathlib import Path
 import pytest
 
 from app.agent.browser_actions import is_confirmation_text
-from tests.fixture_server import ATS_FIXTURES, NESTED_FIXTURES
+from tests.fixture_server import ATS_FIXTURES, LIVE_REGION_FIXTURES, NESTED_FIXTURES
 
 ATS_DIR = Path(__file__).resolve().parent / "fixtures" / "ats"
 FAKE_SUBMIT_JS = ATS_DIR / "fake_submit.js"
 SHADOW_FORM_JS = ATS_DIR / "shadow_form.js"
+LIVE_STATUS_JS = ATS_DIR / "live_status.js"
 
 
 def _html(slug: str) -> str:
@@ -103,9 +104,9 @@ def test_the_form_still_validates_before_it_confirms(slug: str) -> None:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("slug", NESTED_FIXTURES)
+@pytest.mark.parametrize("slug", NESTED_FIXTURES + LIVE_REGION_FIXTURES)
 def test_a_nested_fixture_submits_nowhere_either(slug: str) -> None:
-    """The same promise as above, for the iframe and shadow-root pages."""
+    """The same promise as above, for every fixture outside the contract."""
     assert "action=" not in _html(slug)
 
 
@@ -134,6 +135,50 @@ def test_the_two_handlers_confirm_in_the_same_words() -> None:
     """
     assert _confirmation_wording(SHADOW_FORM_JS) == _confirmation_wording()
     assert is_confirmation_text(_confirmation_wording(SHADOW_FORM_JS))
+
+
+# --------------------------------------------------------------------------
+# The fixture whose confirmation-shaped text will not hold still
+# --------------------------------------------------------------------------
+
+
+def test_the_standing_panel_baits_the_bug_it_exists_for() -> None:
+    """A panel worded so the shipped predicate ignores it is not bait.
+
+    `live_status.html` only tests anything if its standing panel reads like
+    a confirmation *and* the wording it ticks to reads like a different one:
+    that pair is precisely what a text comparison called fresh.
+    """
+    panel = re.search(
+        r'id="applied-count"[^>]*>\s*([^<]+)', _html("live_status")
+    )
+    assert panel is not None
+    assert is_confirmation_text(panel.group(1).strip())
+
+    ticked = re.search(r"`Thank you for applying to \$\{count\}([^`]*)`", LIVE_STATUS_JS.read_text())
+    assert ticked is not None
+    assert is_confirmation_text(f"Thank you for applying to 4 roles{ticked.group(1)}")
+
+
+def test_the_standing_panel_never_stops_changing() -> None:
+    source = LIVE_STATUS_JS.read_text()
+
+    assert "setInterval" in source
+    assert "innerHTML" in source, "one mode has to rebuild the node, not edit it"
+    assert "preventDefault" in source
+    assert "fetch(" not in source
+    assert "XMLHttpRequest" not in source
+
+
+def test_the_panel_fixture_confirms_in_the_same_words() -> None:
+    assert _confirmation_wording(LIVE_STATUS_JS) == _confirmation_wording()
+
+
+def test_the_region_the_panel_fixture_confirms_into_starts_neutral() -> None:
+    """The happy case depends on it: a neutral region is not in the baseline."""
+    neutral = re.search(r'id="form-status"[^>]*>([^<]+)', _html("live_status"))
+    assert neutral is not None
+    assert not is_confirmation_text(neutral.group(1).strip())
 
 
 def test_the_iframe_host_baits_the_bug_it_exists_for() -> None:

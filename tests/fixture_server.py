@@ -22,6 +22,12 @@ ATS_FIXTURES = ("greenhouse", "lever", "workday", "unknown")
 #: where a scanned control and a submitted form are not in the top document.
 NESTED_FIXTURES = ("iframe_host", "iframe_form", "shadow_form")
 
+#: Fixtures whose confirmation-shaped text is *already* on the page and will
+#: not hold still: a standing thank-you panel that counts, and one that is
+#: rebuilt rather than edited. They exist so the browser suite can drive the
+#: page a text-comparison freshness rule confirmed on every poll.
+LIVE_REGION_FIXTURES = ("live_status",)
+
 
 def _pick_loopback_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

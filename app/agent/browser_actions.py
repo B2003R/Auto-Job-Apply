@@ -307,6 +307,22 @@ def is_refused_destination(url: str) -> bool:
 
 
 @dataclass(frozen=True)
+class ConfirmationRegion:
+    """One region of one target that reads like a confirmation.
+
+    `identity` is what makes a region *the same region* across two
+    readings, and it deliberately does not involve the words in it: a
+    standing thank-you panel that counts applications, cycles messages, or
+    animates its wording is one region whose text changes, and comparing
+    text alone made every one of its changes look like a confirmation
+    arriving. See `SUBMIT_STATE_SCRIPT` for how a region is addressed.
+    """
+
+    identity: str
+    text: str
+
+
+@dataclass(frozen=True)
 class PageState:
     """What one target looked like at one moment.
 
@@ -321,8 +337,9 @@ class PageState:
 
     #: `location.href` of this target.
     url: str = ""
-    #: The visible text of every region that reads like a confirmation.
-    confirmations: tuple[str, ...] = ()
+    #: Every region of this target that reads like a confirmation, each
+    #: addressed by an identity that survives its own text changing.
+    confirmations: tuple[ConfirmationRegion, ...] = ()
     #: Every reason to think the page refused the submission.
     blockers: tuple[str, ...] = ()
     #: Whether the form the submit control belonged to is in *this* target,
@@ -331,11 +348,22 @@ class PageState:
 
     @classmethod
     def from_report(cls, report: Mapping[str, Any]) -> "PageState":
+        """Build one reading, dropping anything that cannot be compared.
+
+        A region that arrives without both an identity and a text is not
+        read as a confirmation at all: an unjudgeable reading costs an
+        honest "not confirmed", and guessing at one costs an application.
+        """
+        regions: list[ConfirmationRegion] = []
+        for entry in report.get("confirmations") or ():
+            detail = _mapping(entry)
+            identity = _text(detail.get("identity"))
+            body = _text(detail.get("text"))
+            if identity and body:
+                regions.append(ConfirmationRegion(identity, body))
         return cls(
             url=_text(report.get("url")),
-            confirmations=tuple(
-                _text(entry) for entry in report.get("confirmations") or ()
-            ),
+            confirmations=tuple(regions),
             blockers=tuple(_text(entry) for entry in report.get("blockers") or ()),
             marked=bool(report.get("marked")),
         )
@@ -358,12 +386,38 @@ class SubmitVerdict:
         return bool(self.signal or self.refusal)
 
 
+def _fresh_confirmations(
+    before: PageState, after: PageState
+) -> tuple[ConfirmationRegion, ...]:
+    """The regions that became confirmations because of this click.
+
+    A region already reading like a confirmation before the click is not
+    one, however its wording changes afterwards, and a region whose wording
+    the target was already showing elsewhere is not one either however
+    newly it appeared. What is left is a region that was not shaped like a
+    confirmation and now is, saying something nobody was saying.
+    """
+    known_regions = {region.identity for region in before.confirmations}
+    known_words = {region.text for region in before.confirmations}
+    return tuple(
+        region
+        for region in after.confirmations
+        if region.identity not in known_regions and region.text not in known_words
+    )
+
+
 def submission_verdict(before: PageState, after: PageState) -> SubmitVerdict:
     """Judge one target against its own pre-click state.
 
     Only two things are accepted as a submission. A confirmation the page
     was *not* already showing, or a destination only a submission arrives
     at *together with* the form the control belonged to being gone.
+
+    A confirmation is new when a *region* that was not already shaped like
+    one now is, and it says something the target was not already saying.
+    Neither half is enough by itself: a counting panel is one region whose
+    text keeps changing, and a rebuilt banner is a new region carrying the
+    text it was already carrying.
 
     Navigation alone is not one of them, and neither is the form
     disappearing alone. Both were, and both are wrong in the same
@@ -394,14 +448,12 @@ def submission_verdict(before: PageState, after: PageState) -> SubmitVerdict:
             )
         )
 
-    fresh = tuple(
-        entry for entry in after.confirmations if entry not in before.confirmations
-    )
+    fresh = _fresh_confirmations(before, after)
     if fresh:
         return SubmitVerdict(
             signal=(
                 "the page showed a confirmation it was not showing before the "
-                f"click: {fresh[0]!r}"
+                f"click: {fresh[0].text!r}"
             )
         )
 
@@ -956,6 +1008,13 @@ SUBMIT_TARGET_SCRIPT = (
 #: Reports only readings. Whether a reading amounts to a submission is
 #: decided in Python, where it can be tested directly rather than through a
 #: substring of a script.
+#:
+#: Each confirmation-shaped region is reported with an identity as well as
+#: its text, and stamped with that identity so the next reading of the same
+#: node reports the same one. That is what stops a panel which counts,
+#: ticks, or cycles its wording from reading as a confirmation arriving on
+#: every poll: `_fresh_confirmations` asks which *regions* are new, and a
+#: counter is one region all along.
 SUBMIT_STATE_SCRIPT = (
     """
 (() => {
@@ -979,6 +1038,7 @@ SUBMIT_STATE_SCRIPT = (
   const VALIDATION_SELECTOR = __VALIDATION_REGION_SELECTORS__.join(', ');
   const VALIDATION_TEXT = new RegExp(__VALIDATION_TEXT__, 'i');
   const MAX_TEXT = 160;
+  const REGION_MARK = 'data-jobright-confirmation-region';
 
   const bodyText = (el) => String(el.textContent || '')
     .replace(/\\s+/g, ' ')
@@ -991,7 +1051,35 @@ SUBMIT_STATE_SCRIPT = (
     }
   };
 
+  // How a region is addressed across readings, in the order the addresses
+  // survive a repaint: one this reader has already stamped on the node, the
+  // page's own id, and failing both a token stamped on it now. The stamp is
+  // why a region rebuilt in place keeps its address while its wording
+  // changes underneath, which is the whole point of an identity.
+  const regionIdentity = (el, path) => {
+    let stamped = '';
+    try {
+      stamped = text(el.getAttribute(REGION_MARK));
+    } catch (error) {
+      stamped = '';
+    }
+    if (stamped) {
+      return stamped;
+    }
+    const own = text(el.getAttribute('id'));
+    const minted = (path ? path + '>>' : '')
+      + (own ? '#' + own : 'region-' + Math.random().toString(36).slice(2, 10));
+    try {
+      el.setAttribute(REGION_MARK, minted);
+    } catch (error) {
+      // A node that cannot be stamped is still addressable by whatever
+      // was minted for it; it just has to be minted again next reading.
+    }
+    return minted;
+  };
+
   const confirmations = [];
+  const identities = [];
   const blockers = [];
   let marked = false;
 
@@ -1002,7 +1090,11 @@ SUBMIT_STATE_SCRIPT = (
         continue;
       }
       if (CONFIRMATION_TEXT.test(body)) {
-        add(confirmations, body);
+        const identity = regionIdentity(el, entry.path);
+        if (identities.indexOf(identity) === -1) {
+          identities.push(identity);
+          confirmations.push({ identity, text: body });
+        }
       }
     }
 

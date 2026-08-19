@@ -447,7 +447,10 @@ Two things count:
 
 - a confirmation in a status, alert, or heading region ("application
   submitted", "thank you for applying", and similar) that the page **was
-  not already showing**, or
+  not already showing** — a *region* that was not shaped like a confirmation
+  before the click and now is, so a standing "you have applied to 4 roles
+  this month" panel that counts, cycles, or rebuilds itself is the same
+  panel it always was and confirms nothing, however its wording changes, or
 - a navigation to a destination only a submitted application arrives at
   (`/thank-you`, `/confirmation`, `?submitted=true`) **together with** the
   form the button belonged to having disappeared.

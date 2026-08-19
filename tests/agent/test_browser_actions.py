@@ -47,6 +47,7 @@ from app.agent.browser_actions import (
     VALIDATION_TEXT,
     WRITE_COUNT_SCRIPT,
     WRITE_SCRIPT,
+    ConfirmationRegion,
     PageState,
     PlaywrightFieldWriter,
     PlaywrightPageGuard,
@@ -1020,17 +1021,30 @@ APPROVED = SubmitAuthorization(
 CONFIRMED = "Your application was submitted. Thank you for applying."
 
 
+def region(text: str, identity: str = "") -> dict[str, str]:
+    """One confirmation-shaped region, as the state script reports one.
+
+    `identity` is what makes two readings the *same* region; when a test
+    does not care, the text stands in for it, which is the case where a
+    region's text never changes and identity and text agree.
+    """
+    return {"identity": identity or f"#{text}", "text": text}
+
+
 def state(
     *,
     url: str = MAIN_URL,
-    confirmations: Sequence[str] = (),
+    confirmations: Sequence[str | Mapping[str, str]] = (),
     blockers: Sequence[str] = (),
     marked: bool = True,
 ) -> dict[str, Any]:
     """One reading of one target: what a state script reports."""
     return {
         "url": url,
-        "confirmations": list(confirmations),
+        "confirmations": [
+            dict(entry) if isinstance(entry, Mapping) else region(entry)
+            for entry in confirmations
+        ],
         "blockers": list(blockers),
         "marked": marked,
     }
@@ -1642,6 +1656,148 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
         assert frame.times_run(SUBMIT_STATE_SCRIPT) >= 2
 
 
+TICKING = "Thank you for applying — {count} applications this month"
+
+
+class TestWhatMakesAConfirmationANewOne:
+    """A region is the same region when its text changes, not a new one.
+
+    Comparing the *text* of confirmation-shaped regions was the whole
+    freshness rule, and a careers page with a standing thank-you panel that
+    counts, ticks, cycles, or animates its wording produces a text nobody
+    was showing before the click on the very first poll — every time,
+    within a fifth of a second, whatever the click did. That is a submitted
+    application recorded against a form that never went anywhere.
+
+    So freshness is a property of the region, addressed by an identity that
+    survives its text changing. The regions already reading like a
+    confirmation are the baseline; a confirmation is new when a region that
+    was not one of them is now shaped like one.
+    """
+
+    def test_a_region_whose_wording_ticks_is_still_the_same_region(self) -> None:
+        verdict = submission_verdict(
+            PageState(
+                url=MAIN_URL,
+                marked=True,
+                confirmations=(
+                    ConfirmationRegion("#applied-count", TICKING.format(count=11)),
+                ),
+            ),
+            PageState(
+                url=MAIN_URL,
+                marked=True,
+                confirmations=(
+                    ConfirmationRegion("#applied-count", TICKING.format(count=12)),
+                ),
+            ),
+        )
+
+        assert not verdict.signal
+
+    async def test_a_counting_panel_never_confirms_however_long_it_counts(
+        self,
+    ) -> None:
+        standing = state(
+            confirmations=[region(TICKING.format(count=3), "#applied-count")]
+        )
+        frame = submitting_frame(
+            baseline=standing,
+            after=tuple(
+                state(confirmations=[region(TICKING.format(count=n), "#applied-count")])
+                for n in range(4, 12)
+            ),
+        )
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(
+            FakePage(frame), APPROVED, permit()
+        )
+
+        assert outcome.submitted is False
+        assert presses(frame) == 1
+
+    async def test_a_neutral_status_region_that_becomes_a_confirmation_confirms(
+        self,
+    ) -> None:
+        """The common case, and the one an identity rule must not break.
+
+        Almost every ATS has one empty `role="status"` region that the click
+        fills in. It is not in the confirmation baseline — nothing that is
+        not already shaped like a confirmation ever is — so the moment it
+        reads like one, it is a new confirmation.
+        """
+        frame = submitting_frame(
+            baseline=state(confirmations=[]),
+            after=(state(confirmations=[region(CONFIRMED, "#form-status")]),),
+        )
+
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
+
+        assert outcome.submitted
+        assert CONFIRMED in outcome.reason
+
+    async def test_a_confirmation_beside_a_counting_panel_still_confirms(self) -> None:
+        """The counter keeps ticking; the real banner still arrives."""
+        frame = submitting_frame(
+            baseline=state(
+                confirmations=[region(TICKING.format(count=3), "#applied-count")]
+            ),
+            after=(
+                state(
+                    confirmations=[
+                        region(TICKING.format(count=4), "#applied-count"),
+                        region(CONFIRMED, "#form-status"),
+                    ]
+                ),
+            ),
+        )
+
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
+
+        assert outcome.submitted
+        assert CONFIRMED in outcome.reason
+
+    def test_the_standing_wording_reappearing_in_a_new_node_is_not_a_second_one(
+        self,
+    ) -> None:
+        """The other half of the rule, and the other way a page repaints.
+
+        A framework that rebuilds its banner rather than editing its text
+        leaves a region with no history, and identity alone would read that
+        as a confirmation arriving. The wording it arrived with is the
+        wording the page was already showing, so it is not one.
+        """
+        verdict = submission_verdict(
+            PageState(
+                url=MAIN_URL,
+                marked=True,
+                confirmations=(ConfirmationRegion("#banner", CONFIRMED),),
+            ),
+            PageState(
+                url=MAIN_URL,
+                marked=True,
+                confirmations=(ConfirmationRegion("#banner-rebuilt", CONFIRMED),),
+            ),
+        )
+
+        assert not verdict.signal
+
+    def test_a_region_that_cannot_be_identified_confirms_nothing(self) -> None:
+        """Silence from the reading, not a submission on an unjudgeable one."""
+        state_with_anonymous_region = PageState.from_report(
+            {
+                "url": MAIN_URL,
+                "marked": True,
+                "confirmations": [{"text": CONFIRMED}, CONFIRMED, {"identity": "#a"}],
+            }
+        )
+
+        assert state_with_anonymous_region.confirmations == ()
+        assert not submission_verdict(
+            PageState(url=MAIN_URL, marked=True), state_with_anonymous_region
+        ).signal
+
+
 class TestNavigationAloneNeverConfirms:
     """The weakest of the old signals, and the one most often wrong.
 
@@ -1729,7 +1885,7 @@ class TestNavigationAloneNeverConfirms:
             PageState(
                 url="https://ats.example.com/login",
                 marked=False,
-                confirmations=(CONFIRMED,),
+                confirmations=(ConfirmationRegion("#banner", CONFIRMED),),
             ),
         )
 
@@ -1768,10 +1924,10 @@ class TestThePageSayingItRefusedTheSubmission:
 
     async def test_a_blocker_that_was_already_there_is_not_a_refusal(self) -> None:
         """A form with a standing "required field" hint is an ordinary form."""
-        standing = state(blockers=['a validation message: "All fields are required"'])
+        blockers = ['a validation message: "All fields are required"']
         frame = submitting_frame(
-            baseline=standing,
-            after=(dict(standing, confirmations=[CONFIRMED]),),
+            baseline=state(blockers=blockers),
+            after=(state(blockers=blockers, confirmations=[CONFIRMED]),),
         )
 
         assert (await submitter().submit(FakePage(frame), APPROVED, permit())).submitted

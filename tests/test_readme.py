@@ -192,6 +192,9 @@ class TestTheWarnings:
         assert "disappear" in section or "no longer" in section
         assert "navigation on its own is not" in section
         assert "not already showing" in section
+        # The freshness rule an operator can act on: a panel that keeps
+        # changing its own wording is not a stream of confirmations.
+        assert "however its wording changes" in section
 
     def test_a_refusal_before_the_press_is_documented_as_costing_nothing(
         self,

@@ -259,6 +259,27 @@ async def shadow_page(context: Any, fixture_server: str) -> AsyncIterator[Any]:
     await opened.close()
 
 
+@pytest_asyncio.fixture(loop_scope="function")
+async def live_status_pages(
+    context: Any, fixture_server: str
+) -> AsyncIterator[Any]:
+    """Opens `live_status.html` in one of its modes, and closes what it opened."""
+    opened: list[Any] = []
+
+    async def open_in(mode: str) -> Any:
+        page = await context.new_page()
+        await page.goto(
+            loopback_only(f"{fixture_server}/ats/live_status.html?mode={mode}"),
+            wait_until="load",
+        )
+        opened.append(page)
+        return page
+
+    yield open_in
+    for page in opened:
+        await page.close()
+
+
 def _gap(snapshot: Any, name: str) -> Any:
     return next(field for field in snapshot.fields if field.name == name)
 
@@ -430,6 +451,120 @@ class TestAControlInAnOpenShadowRoot:
         assert claim.calls == 1
         assert await shadow_page.locator("#fixture-submit-confirmation").count() == 0
         assert await shadow_page.locator("#application-form").count() == 1
+
+
+class TestAConfirmationShapedPanelThatWillNotHoldStill:
+    """The page that confirmed every click, in a real browser.
+
+    Freshness was a comparison of the *text* of confirmation-shaped
+    regions, and a careers page with a standing "thank you for applying to
+    N roles this month" panel changes that text on a timer. Every poll after
+    every click therefore found a confirmation nobody had been showing, and
+    the submitter reported an application as sent within a fifth of a
+    second of pressing a button that did nothing at all.
+
+    Chromium is where this has to be proved: the identity that makes the
+    panel one region is stamped on a real node, and it has to survive both a
+    text change and the node being thrown away and rebuilt — which is what
+    a framework does to its own subtree, and what no double can imitate.
+    """
+
+    async def _press(self, page: Any, *, wait_ms: int) -> Any:
+        claim = _Claim()
+        outcome = await PlaywrightSubmitter(confirm_timeout_ms=wait_ms).submit(
+            page, APPROVED, SubmitPermit(1, claim)
+        )
+        # The press happened either way: an honest "not confirmed" is not a
+        # reason to press again.
+        assert claim.calls == 1
+        return outcome
+
+    async def _panel(self, page: Any) -> str:
+        return str(
+            await page.locator('#applied-count-wrapper [role="status"]').inner_text()
+        )
+
+    async def test_a_panel_that_counts_confirms_nothing(
+        self, live_status_pages: Any
+    ) -> None:
+        page = await live_status_pages("tick")
+        before = await self._panel(page)
+
+        outcome = await self._press(page, wait_ms=2_000)
+
+        assert await self._panel(page) != before, "the panel has to have ticked"
+        assert outcome.submitted is False
+        assert await page.locator("#application-form").count() == 1
+
+    async def test_a_panel_rebuilt_rather_than_edited_confirms_nothing(
+        self, live_status_pages: Any
+    ) -> None:
+        """The node is new every tick; the region is not.
+
+        This is the case an identity minted per node would get wrong, and
+        the reason the region's own id is what identifies it when the
+        stamp does not survive.
+        """
+        page = await live_status_pages("rebuild")
+        before = await self._panel(page)
+
+        outcome = await self._press(page, wait_ms=2_000)
+
+        assert await self._panel(page) != before
+        assert outcome.submitted is False
+
+    async def test_a_panel_with_no_id_of_its_own_confirms_nothing_either(
+        self, live_status_pages: Any
+    ) -> None:
+        """Nothing in the markup names this region.
+
+        Most live regions on the web are an anonymous `<div role="status">`,
+        so an identity that relied on the page providing one would be back
+        to comparing text on exactly the pages that count.
+        """
+        page = await live_status_pages("anonymous")
+        before = await self._panel(page)
+
+        outcome = await self._press(page, wait_ms=2_000)
+
+        assert await self._panel(page) != before
+        assert outcome.submitted is False
+
+    async def test_a_panel_that_counts_the_press_itself_confirms_nothing(
+        self, live_status_pages: Any
+    ) -> None:
+        """An optimistic counter is the page congratulating itself.
+
+        Nothing has accepted anything: the count went up because a button
+        was pressed, which is the one thing the submitter already knows.
+        """
+        page = await live_status_pages("optimistic")
+        before = await self._panel(page)
+
+        outcome = await self._press(page, wait_ms=2_000)
+
+        assert await self._panel(page) != before
+        assert outcome.submitted is False
+
+    async def test_a_neutral_status_region_becoming_a_confirmation_confirms(
+        self, live_status_pages: Any
+    ) -> None:
+        """The ordinary case, on the same restless page.
+
+        One empty `role="status"` region that the click fills in is how most
+        of the web confirms anything, and it is not in the confirmation
+        baseline because it was not shaped like one. The panel beside it
+        keeps counting throughout, and is still not what confirms.
+        """
+        page = await live_status_pages("confirms")
+        before = await self._panel(page)
+
+        outcome = await self._press(page, wait_ms=8_000)
+
+        assert outcome.submitted
+        assert "Your application was submitted" in outcome.reason
+        assert "this month" not in outcome.reason
+        assert await self._panel(page) != before
 
 
 async def _shadow_value(page: Any) -> str:
