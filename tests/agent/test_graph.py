@@ -1208,6 +1208,47 @@ class TestWhatTheWriterIsGiven:
         assert written.control_id == "cover_letter"
         assert written.field_type == "textarea"
 
+    async def test_each_answer_is_paired_with_its_own_control(
+        self, tmp_path: Path
+    ) -> None:
+        """Two gaps is where a lookup by anything else stops looking right.
+
+        With one gap on the form, handing the writer "the first scanned
+        control" and "the control this answer's key names" are the same
+        object, so nothing distinguishes them. Two gaps is the case that
+        does, and getting it wrong types one person's cover letter into the
+        box the other answer belonged in.
+        """
+        second = make_field(
+            "why_us",
+            label="Why this company?",
+            field_type="textarea",
+            tag="textarea",
+            required=True,
+            free_text=True,
+        )
+        world = build_world(
+            tmp_path,
+            with_router=True,
+            before=snapshot(cover_letter_gap(), second),
+            after=snapshot(cover_letter_gap(), second),
+        )
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            await runner.run_application(queue_id)
+
+        assert sorted(field.key for field in world.writer.fields) == [
+            "cover_letter",
+            "why_us",
+        ]
+        # Each control carries its own identity, so a field handed under the
+        # wrong key is visible even when both answers read the same.
+        assert {field.key: field.control_id for field in world.writer.fields} == {
+            "cover_letter": "cover_letter",
+            "why_us": "why_us",
+        }
+
     async def test_the_key_the_answer_is_recorded_against_is_the_fields_own(
         self, tmp_path: Path
     ) -> None:

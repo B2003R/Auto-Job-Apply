@@ -28,6 +28,7 @@ import pytest
 from app.agent.browser_actions import (
     CONFIRMATION_TEXT,
     FINAL_SUBMIT_PHRASES,
+    NEVER_SUBMIT_NAME,
     GUARD_SCRIPT,
     HUMAN_ONLY_FIELD_TYPES,
     SUBMIT_CANDIDATES_JS,
@@ -767,6 +768,10 @@ class TestTheGuardLetsAnOrdinaryPageThrough:
         real-world case: the driver waits for a context that never arrives.
         Left unbounded, the guard would hold a worker's tab, its lease, and
         the queue behind it, on a page nobody is looking at.
+
+        The deadline is enforced by this test rather than merely by the fake
+        never returning: a fake that eventually gives up would let a guard
+        with no timeout at all pass, just slowly.
         """
         main = guarding_frame()
         silent = FakeFrame(
@@ -775,7 +780,10 @@ class TestTheGuardLetsAnOrdinaryPageThrough:
             parent=main,
         )
 
-        await PlaywrightPageGuard(frame_timeout_ms=20).inspect(FakePage(main, [silent]))
+        await asyncio.wait_for(
+            PlaywrightPageGuard(frame_timeout_ms=20).inspect(FakePage(main, [silent])),
+            timeout=2,
+        )
 
     async def test_a_verdict_from_a_frame_that_did_answer_still_counts(self) -> None:
         """The timeout skips one frame, not the inspection."""
@@ -785,15 +793,22 @@ class TestTheGuardLetsAnOrdinaryPageThrough:
         )
 
         with pytest.raises(CaptchaEncountered):
-            await PlaywrightPageGuard(frame_timeout_ms=20).inspect(
-                FakePage(main, [answering])
+            await asyncio.wait_for(
+                PlaywrightPageGuard(frame_timeout_ms=20).inspect(
+                    FakePage(main, [answering])
+                ),
+                timeout=2,
             )
 
 
 async def _never_answers(argument: Any) -> Any:
-    """Stands in for a frame whose execution context never arrives."""
-    await asyncio.sleep(30)
-    raise AssertionError("the guard waited for a frame that was never going to answer")
+    """Stands in for a frame whose execution context never arrives.
+
+    Never returns and never raises. A fake that gave up after a while would
+    make an unbounded guard look merely slow instead of broken.
+    """
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable: this frame never answers")
 
 
 class TestTheGuardScript:
@@ -1213,6 +1228,38 @@ class TestWhichAccessibleNamesCountAsAFinalSubmit:
     def test_a_denied_word_wins_over_an_accepted_phrase(self) -> None:
         """Belt and braces: the allowlist is exact phrases already."""
         assert not is_final_submit_name("submit application and continue")
+
+    @pytest.mark.parametrize(
+        "word",
+        [
+            "next",
+            "continue",
+            "save",
+            "review",
+            "back",
+            "previous",
+            "draft",
+            "upload",
+            "attach",
+            "cancel",
+            "sign in",
+            "log in",
+            "register",
+            "preview",
+            "skip",
+        ],
+    )
+    def test_the_denylist_still_names_the_words_it_promises_to(self, word: str) -> None:
+        """The list itself, not its effect — because it has none yet.
+
+        No denied word can currently reach the allowlist: that is exact
+        phrases, so "Next" is refused by not being on it. Deleting the
+        denylist changes no outcome today, which is precisely why it needs
+        pinning here — it becomes load-bearing the moment somebody adds a
+        broader accepted phrase, and the README already promises these words
+        are never clicked.
+        """
+        assert NEVER_SUBMIT_NAME.search(word)
 
     @pytest.mark.parametrize(
         "raw,folded",
