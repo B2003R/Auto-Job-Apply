@@ -491,3 +491,399 @@ submitter, no guard — are **closed**. The new list:
    in an open shadow root. A real build that renders differently, or whose
    Autofill control is worded differently, is still only checked by
    `doctor` on the operator's own machine.
+
+---
+
+# Task 9 addendum: the review's Critical and Important findings
+
+## Status
+
+DONE. Seven findings, all closed, each with tests that fail without the fix.
+Six of the seven were **false successes or hangs in the submit path** — the
+one place in this project where being wrong costs somebody an application
+that was never sent, or one sent twice. `AUTO_SUBMIT` is still `false`, no
+blocker gate changed, and nothing here submits anything external.
+
+The one-line version of each: the submitter judged a child frame's press by
+looking at the top page; a navigation on its own counted as a submission; a
+pending `about:blank` frame could hang the node before or after the press;
+the guard called the markup a reCAPTCHA v3 key leaves a challenge; the press
+was a pointer event at a remembered coordinate; the application's one
+durable attempt was spent by refusals that clicked nothing; and no test
+drove a form in an iframe or a control in a shadow root in a real browser.
+
+## Commits
+
+Seven commits, on top of `95bf538` (the report above).
+
+| SHA | Message |
+|-----|---------|
+| `b026fe2` | `fix(browser): stop waiting on a frame that never answers the submitter` |
+| `4d5c256` | `fix(browser): tell a challenge apart from the markup a v3 site key leaves` |
+| `f0bf6e4` | `fix(browser): judge a submission against each target's own pre-click state` |
+| `7e2d278` | `fix(browser): let the driver verify and make the last click, not a coordinate` |
+| `956a803` | `fix(graph): hand the submitter the one press, claimed just before the click` |
+| `e201dfc` | `test(integration): drive the two places a form is not the top document` |
+| `8640399` | `docs: say what confirms a submission now, and what no longer does` |
+
+Head: **`8640399`**. **Not pushed, no PR**, per the task instructions.
+
+## Files changed
+
+| File | Action |
+|------|--------|
+| `app/agent/browser_actions.py` | Modified — `PageState`/`SubmitVerdict` and `submission_verdict`; `SUBMIT_STATE_SCRIPT` reports readings rather than verdicts; `ACTIVE_CAPTCHA_JS` shared by guard and submitter; per-frame deadlines on every question; trusted click with actionability verification; the permit claimed before the click |
+| `app/agent/errors.py` | Modified — `FinalSubmitControlNotActionable`, `SubmitPermitAlreadyUsed`, `SubmitPermitNotClaimed` |
+| `app/agent/graph.py` | Modified — `SubmitPermit`; `Submitter` takes one; the submit node builds it and verifies it was claimed |
+| `app/agent/humanize.py` | Modified — `move_to` (travel without a press); `move_and_click` built on it |
+| `README.md` | Modified — what confirms a submission and what no longer does; a refused press costs nothing; the guard's passive-markup exclusion; the two new fixtures |
+| `tests/agent/test_browser_actions.py` | Modified — +5 classes (baselines, navigation, page refusals, verified click, when the press is claimed) |
+| `tests/agent/test_graph.py` | Modified — `TestTheOnePressEachApplicationGets` |
+| `tests/agent/test_graph_recovery.py` | Modified — crash-before-claim and crash-after-claim are now distinct cases |
+| `tests/integration/test_stub_extension.py` | Modified — passive/active captcha in a browser, an overlaid control, and the iframe and shadow-root suites |
+| `tests/fixtures/ats/iframe_host.html`, `iframe_form.html` | Created — a form in a same-origin child frame, under a standing confirmation-shaped banner |
+| `tests/fixtures/ats/shadow_form.html`, `shadow_form.js` | Created — a field and a submit control in open shadow roots, answering their own press |
+| `tests/fixture_server.py` | Modified — `NESTED_FIXTURES` |
+| `tests/test_ats_fixture_submit.py` | Modified — offline checks that the new fixtures submit nowhere and bait the bug they exist for |
+| `tests/test_api.py`, `tests/agent/support.py` | Modified — the permit through the shipped wiring and the fakes |
+| `tests/test_readme.py` | Modified — the confirmation rules and the cost of a refusal are pinned |
+
+## Verification
+
+```bash
+python3 -m pytest -q                                    # 1835 passed (1748 before, +87)
+python3 -m pytest tests --ignore=tests/integration -q   # 1810 passed, no browser
+python3 -m pytest tests/integration -q                  # 25 passed in 50s, real Chromium
+env -u DISPLAY python3 -m pytest tests/integration -q   # 25 passed — Xvfb started by the suite
+CHROME_EXECUTABLE=/nonexistent python3 -m pytest tests/integration -q -rs
+                                                        # 1 passed, 24 skipped, reason names the variable
+python3 -m mypy app                                     # Success: no issues found in 29 source files
+python3 -m compileall -q app tests scripts              # OK
+git diff --check 95bf538..HEAD                          # clean
+python3 /tmp/mutate10.py                                # 12 mutations, 11 caught offline, 1 caught by the browser suite
+```
+
+**Browser result: 25 passed** (16 before, +9), three ways — under the
+inherited `DISPLAY=:1`, under an `Xvfb` the suite started itself with
+`DISPLAY` unset, and with a deliberately broken `CHROME_EXECUTABLE` to check
+that the skip still names the thing to fix.
+
+`mypy app tests` still reports the pre-existing `Settings(_env_file=None)`
+errors that every test module in this repository has; nothing added here
+contributes a new one, and `mypy app` is clean.
+
+## Finding by finding
+
+### 1 & 2. Confirmation: per-target baselines, and navigation is not enough
+
+These are one change, because they are one function. `SUBMIT_SIGNAL_SCRIPT`
+used to decide in the page whether a submission had happened and hand back a
+verdict; it is now `SUBMIT_STATE_SCRIPT`, which reports one target's
+*readings* — `location.href`, the visible text of every confirmation-shaped
+region, every reason to think the page refused, and whether the marked form
+is still in this document — as a frozen `PageState`. Python compares two of
+them.
+
+**Per-target baselines.** Every target that will be polled is read *before*
+the click, and only ever compared with its own reading. The targets are the
+submitting frame and the top document, deduplicated by identity so a form in
+the main frame is one target rather than two. The submitting frame's baseline
+is mandatory: a press whose outcome cannot be judged is not one to make, so
+a frame that cannot be read before the click is a refusal that clicks
+nothing.
+
+The bug this closes: for a form in a same-origin iframe, the frame's
+pre-click URL and form presence were compared against the *top page's*
+readings. Those differ by definition — the top document is at a different
+URL and never contained the marked form — so the first poll of every such
+submission reported both a navigation and a vanished form. It also means a
+"thank you for applying" panel the page was already showing can no longer
+succeed, because the comparison is against text that was already there.
+
+**Navigation is not enough.** `submission_verdict` accepts exactly two
+things: a confirmation that is *not* in the baseline, or a
+`SUCCESS_DESTINATION` together with the marked form being gone. It refuses
+outright on a `REFUSED_DESTINATION` (sign-in, auth, captcha, challenge,
+error, expired) and on any *fresh* blocker — a validation message, a
+password field that was not there, an active challenge — which ends the wait
+immediately rather than spending the whole timeout on a page that has
+already said no. A refusal outranks a confirmation on the same reading,
+because a sign-in page is not made trustworthy by the words on it.
+
+Ordering inside the function is deliberate and tested: fresh blockers, then
+a refused destination, then a new confirmation, then a success destination
+with the form gone.
+
+### 3. Every question the submitter asks a frame is bounded
+
+An `about:blank` child that is still notionally navigating has no execution
+context, and `frame.evaluate` waits for one indefinitely. Every submitter
+question now goes through one helper (`_ask`) with a per-frame deadline
+(three seconds by default), and during the confirmation poll that allowance
+is additionally narrowed to whatever is left of the overall deadline — so
+the sum of the per-frame waits cannot outlive the confirmation timeout. The
+`evaluate_handle` that resolves the control and the `bounding_box` call are
+bounded the same way.
+
+A frame that does not answer is treated as what it is in each position:
+skipped while counting candidates (the scanner already reports it as a
+coverage gap, which is a blocking reason at the gate), a refusal for the
+pre-click baseline, and silence — never a signal — while polling.
+
+### 4. A challenge, not the markup a v3 key leaves everywhere
+
+reCAPTCHA v3 scores visitors on an enormous number of ordinary pages and
+challenges almost none of them, leaving a corner badge and an `api2/anchor`
+iframe behind either way. Matching those (or a bare `data-sitekey`) abandoned
+perfectly fillable applications as `captcha_required` — a loss nobody can
+tell was wrong, because the operator sees the reason a real challenge
+produces.
+
+Active evidence is now required: the challenge frame (`api2/bframe`,
+hCaptcha's challenge frame, Turnstile, Arkose), an enforcement interstitial,
+a captcha inside an open `dialog`/`[role="dialog"]`, or a widget the page has
+actually rendered at a size a person could use. Markup that declares itself
+invisible is excluded even where the layout reserved a box for it. The rule
+lives in one `ACTIVE_CAPTCHA_JS` constant shared by the guard and the
+submitter, because the submitter needs the same answer after its click: a
+challenge that appears then is a submission that did not happen.
+
+Both directions are tested in a real browser: a v3 badge with its anchor
+frame and an invisible-sized widget in a reserved box passes the guard, and
+an `api2/bframe` served from the loopback fixture server does not.
+
+### 5. The press is the driver's own click
+
+The press was `mouse.move`/`down`/`up` at the bounding box's remembered
+centre. Between resolving a control and pressing it, a cookie banner can
+animate in over it, a sticky footer can cover it, or the node can detach —
+and a coordinate press lands on whatever is actually there, after which the
+run waits out its confirmation timeout for a signal that whatever was
+clicked was never going to produce.
+
+Now: `scroll_into_view_if_needed`, a bounding box (still rejected if it is
+page-sized, because hit-target verification is perfectly happy to click a
+full-viewport wrapper), then `click(trial=True)` — the driver's actionability
+and hit-target checks with the press withheld — then the humanized pointer
+travel, then `click()`. A failed check is
+`FinalSubmitControlNotActionable` with nothing clicked; a failure *after* the
+press carries `pressed=True` and is never followed by a second attempt.
+
+`Humanizer.move_to` is the travel without the press;
+`Humanizer.move_and_click` still exists for the extension sidebar button,
+which is not a form control and has no element handle, and is now built on
+`move_to`.
+
+In a browser: a full-viewport transparent overlay over the submit button
+produces `FinalSubmitControlNotActionable` rather than an eight-second wait
+ending in an unconfirmed application somebody has to check by hand.
+
+### 6. The one press, claimed immediately before it is made
+
+The durable claim never expires, so spending it spends the application's only
+attempt. It was taken as the submit node started, which meant every refusal
+that followed spent it: a control the accessible-name rules reject, two
+controls, a banner over the only one. Those click nothing, so the form was
+still perfectly submittable — and the operator who fixed the page found an
+application that could never be sent.
+
+`SubmitPermit` is a typed one-shot: `claim()` runs the durable claim exactly
+once, `claimed` is true only if the record was really written, and a claim
+the database *refuses* still spends the permit (a second try would race the
+first). The graph builds one per submit node and hands it to the submitter;
+the submitter resolves the control, checks the name rules, satisfies the
+driver that it can be clicked, and then claims, with nothing between the
+claim and `element.click()`. Afterwards the graph checks the permit really
+was claimed: returning a `SubmitOutcome` is a report that the control was
+pressed, and an unclaimed permit alongside one is `SubmitPermitNotClaimed`
+and a failure, because a press with no durable record leaves the next replay
+free to press again.
+
+The two recovery cases are now distinct tests rather than one shared helper:
+a crash *before* the claim leaves the application submittable and a
+successor presses it, and a crash *after* the claim leaves the successor's
+submitter refused at the claim with nothing pressed.
+
+This also narrows Task 9's concern 3 (a crash between the claim and the
+press being unrecoverable) as far as it can be narrowed without a second
+durable write: the ambiguous window is now the click itself rather than the
+whole submit node.
+
+### 7. The two places a form is not the top document
+
+Both false-success paths above live in shapes the offline Greenhouse fixture
+does not have, so both are fixtures now, driven by the real `FormScanner`,
+`PlaywrightFieldWriter`, and `PlaywrightSubmitter` in a real Chromium on
+loopback.
+
+- **`iframe_host.html`** holds the form in a same-origin child frame
+  (`iframe_form.html`) and shows, before anything is clicked, a
+  `role="status"` banner reading "Thank you for applying to two other roles
+  this month" — which is what a "you have applied to N roles" panel looks
+  like to a machine. Three tests: the writer crosses the frame boundary and
+  the key survives it; a press in the frame is confirmed by that frame's own
+  before-and-after; and when the frame swallows its own submit, the top
+  page's standing banner is **not** this application's confirmation.
+- **`shadow_form.html`** puts the last required field and the final submit
+  control in open shadow roots and answers its own press in
+  `shadow_form.js`, because neither native submission nor native constraint
+  validation crosses a shadow boundary. It refuses a press whose field was
+  never filled, which is what stops the submitter tests passing on a form
+  the writer got wrong. Three tests: the shadow path is built the same way
+  by the scanner and the writer, the control in the shadow root is what gets
+  pressed and confirmed, and a page that says it refused the press is not a
+  submission.
+
+Offline checks in `tests/test_ats_fixture_submit.py` guard the fixtures
+themselves: no `action=`, no `fetch`, no `XMLHttpRequest`, the two
+confirmation wordings are asserted *equal* (two scripts is one more than one)
+and both are run through the shipped `is_confirmation_text`, and the
+iframe host's banner is asserted to be text the shipped predicate really
+does recognise — a fixture whose bait the code ignores would pass whether or
+not the bug was fixed.
+
+## TDD
+
+Six red-green cycles, in the order the code depends on:
+
+1. **Bounded questions.** `TestNoFrameCanHoldTheSubmitter` first, with a fake
+   frame that never returns at all, each test bounded by `asyncio.wait_for`
+   so an unbounded submitter fails rather than hanging the suite.
+2. **The captcha rule.** `TestWhichCaptchaMarkupIsActuallyAChallenge` and two
+   browser tests (one false positive, one false negative) before the
+   selector split.
+3. **The confirmation rework.** `TestEachTargetIsJudgedAgainstItsOwnBaseline`,
+   `TestNavigationAloneNeverConfirms`, and
+   `TestThePageSayingItRefusedTheSubmission` — red on `ImportError` for
+   `PageState`/`submission_verdict`, which did not exist yet.
+4. **The verified click.** `TestThePressIsAVerifiedClickRatherThanACoordinate`
+   before `trial=True` existed, plus the overlay test in the browser.
+5. **The permit.** `TestTheOnePressEachApplicationGets` in the graph tests and
+   `TestWhenTheOnePressIsClaimed` in the browser-action tests, red on
+   `SubmitPermitAlreadyUsed` not existing.
+6. **The nested fixtures.** The offline fixture checks first, then the browser
+   suites.
+
+One test-shape decision worth recording. The double-based confirmation tests
+initially assumed "the first state reading is the baseline", which broke
+because `FakePage.evaluate` delegates to `main_frame`: a single-frame page was
+asked twice per poll. The right fix was not a smarter double but a smarter
+target list — `_confirmation_targets` compares the submitting frame with the
+page's *main frame* by identity, so one document is one target. The double
+now models real Playwright, and the code no longer asks the same document
+twice.
+
+## Mutation testing
+
+Twelve mutations, each applied by script to the real source, the focused
+suites re-run, the file restored; `git status` clean afterwards. Four were
+mis-aimed on the first pass (their anchors did not match, so they mutated
+nothing) and were re-aimed. **All twelve are caught** — eleven by the offline
+suites, one only by the browser suite, which is recorded below.
+
+| Mutation | Result |
+|---|---|
+| A bare navigation confirms a submission again | 1 failed |
+| A confirmation the page was already showing counts | 1 failed |
+| Every target is judged against the submitting frame's state | 1 failed |
+| A fresh rejection on the page is not a refusal | 1 failed |
+| A refused destination is accepted after all | 1 failed |
+| The submitter's questions are unbounded again | 1 failed |
+| The passive markup a v3 key leaves is an active challenge | offline: **0** — browser: 1 failed |
+| The press is a coordinate again, unverified | 1 failed |
+| The press is claimed before the control is checked | 1 failed |
+| The graph does not check the permit was claimed | 1 failed |
+| The graph claims the press before the submitter runs | 22 failed |
+| A permit can be claimed twice | 1 failed |
+
+Four are worth recording.
+
+**The passive-captcha exclusion is only provable in a browser.** The offline
+tests can assert which selectors are in which list and that both the guard
+and the submitter splice the same shared script, but "this widget is
+invisible" is a computed-style question only a real DOM answers. Removing the
+exclusion therefore survives the offline suite and is caught by
+`test_the_guard_ignores_the_markup_recaptcha_v3_leaves_everywhere`. That test
+was itself strengthened for exactly this reason: the invisible widget is
+given a *reserved box* (`304×78`), so the size check would call it active if
+the passive check were not doing the work.
+
+**A shared baseline is caught in the browser too, and by name.** With
+`_baselines` handing every target the submitting frame's reading, the iframe
+test fails with `submitted=True, reason="the page showed a confirmation it
+was not showing before the click: 'Thank you for applying to two other roles
+this month.'"` — the reported false success, in the exact words the fixed
+code would use for a real one.
+
+**Claiming the press before the submitter runs breaks twenty-two tests.**
+That is the old behaviour, and the size of the blast radius is the point: it
+is not one test guarding an edge case but the recovery suite, the failure
+paths, and the permit contract all disagreeing at once.
+
+**Deep traversal and cross-frame writing are load-bearing in the new
+fixtures.** Two extra probes confirmed the fixtures exercise what they are
+for rather than passing incidentally: restricting the submit-candidate search
+to `document` makes both shadow submitter tests fail with
+`FinalSubmitControlNotFound`, and restricting the writer to the main frame
+makes all three iframe tests fail with `FieldNotUniquelyResolved`. Perturbing
+the shadow path the writer sends fails the shadow parity test, which is the
+scanner/writer disagreement that test exists to catch.
+
+## Self-review notes
+
+- **`FakeSubmitter`'s unapproved branch contradicted the new protocol.** It
+  *returned* an outcome describing a refusal, where the real submitter
+  raises `SubmitNotAuthorized`. Under the permit contract a returned outcome
+  means "I pressed it", so the fake would have been reporting a press it
+  never claimed. It raises now, like the production object.
+- **The pointer travel happens before the claim, deliberately.** Moving a
+  pointer submits nothing, and the requirement is that the claim comes after
+  every check that could still refuse. Putting the claim before the travel
+  would spend the attempt on a page whose humanizer then threw.
+- **The README's own test pinned the wrong promise.** It asserted "the three
+  success signals are documented", which is exactly the sentence that made a
+  sign-in redirect a submitted application. Replaced with assertions that
+  the prose says a navigation on its own is *not* one, and that a refused
+  press costs nothing.
+
+## Concerns
+
+Task 9's concerns 1, 4, 5, 6, 7, 8, and 9 stand. Concern 2 (a pending frame
+costing three seconds per settle poll) stands and now applies to the
+submitter's confirmation poll as well, bounded by the same reasoning.
+Concern 3 is narrowed as described under finding 6. New:
+
+1. **A confirmation this build does not recognise is still a failed row.**
+   The accepted signals are narrower than before, on purpose: an ATS that
+   confirms only by, say, swapping a heading that does not match
+   `CONFIRMATION_TEXT`, without navigating anywhere, now records a **failed**
+   application that may well have been submitted. That is the direction to
+   err, and the screenshot and reason say so, but the narrowing does convert
+   some previously-"submitted" rows into rows a human has to check.
+2. **`SUCCESS_DESTINATION` and `REFUSED_DESTINATION` are word lists over a
+   URL.** `/verify` is in the refused list because an expired session lands
+   there, but a genuine "verify your email to finish" step after a
+   submission would be refused by it. Neither list is configurable, for the
+   same reason `FINAL_SUBMIT_PHRASES` is not.
+3. **Fresh-blocker detection can end a wait early on a page that was going
+   to confirm.** A form that shows "Please correct the highlighted field"
+   *and then* accepts the submission anyway would be recorded as refused.
+   The veto requires the marker to be new since the click and the text to
+   read like a rejection, which is as narrow as it can be made without
+   waiting out the clock on pages that have already said no.
+4. **The shadow fixture answers its own press in JavaScript.** It has to —
+   neither native submission nor native validation crosses a shadow
+   boundary — but that means its "the form validated" behaviour is the
+   fixture's own code rather than the browser's, unlike the four ATS
+   fixtures, which rely on real constraint validation.
+5. **The permit is one shot per submit-node invocation, not per
+   application.** The durable claim in `submit_attempts` is what makes it
+   per-application; the permit is the in-process handle to it. A future
+   caller that built two permits for one application would get the second
+   one's claim refused by the database, which is the right outcome, but the
+   type itself cannot express "there is only one of me".
+6. **`tests/integration` is now 50 seconds and nine tests longer.** Each
+   test still gets a fresh persistent context and profile, which is the safe
+   shape for a suite that observes what a page does, and the browser fixtures
+   for the two new pages open their own tab in that context rather than
+   sharing the Greenhouse one.
