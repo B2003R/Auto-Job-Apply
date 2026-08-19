@@ -984,6 +984,13 @@ class PlaywrightPageGuard:
 DEFAULT_CONFIRM_TIMEOUT_MS = 20_000
 DEFAULT_CONFIRM_POLL_MS = 200
 
+#: How long any one frame is given to answer any one question, before or
+#: after the press. Same defect as the guard's and the scanner's: a frame
+#: with no execution context never answers, and here the stuck worker is
+#: also holding a filled form, a lease nobody renews, and an approval
+#: nobody can act on.
+DEFAULT_SUBMIT_FRAME_TIMEOUT_MS = 3_000
+
 
 class PlaywrightSubmitter:
     """Performs the last click, and only says it worked when the page does."""
@@ -994,6 +1001,7 @@ class PlaywrightSubmitter:
         screenshots: Screenshotter | None = None,
         confirm_timeout_ms: int = DEFAULT_CONFIRM_TIMEOUT_MS,
         poll_interval_ms: int = DEFAULT_CONFIRM_POLL_MS,
+        frame_timeout_ms: int = DEFAULT_SUBMIT_FRAME_TIMEOUT_MS,
         sleep: Sleeper = asyncio.sleep,
         clock: Clock = time.monotonic,
         rng: random.Random | None = None,
@@ -1004,6 +1012,7 @@ class PlaywrightSubmitter:
         self._screenshots = screenshots
         self._confirm_timeout_ms = confirm_timeout_ms
         self._poll_interval_ms = max(1, poll_interval_ms)
+        self._frame_timeout_s = max(0.001, frame_timeout_ms / 1000)
         self._sleep = sleep
         self._clock = clock
         self._rng = rng if rng is not None else random.Random(seed)
@@ -1029,10 +1038,15 @@ class PlaywrightSubmitter:
             )
 
         frame = await self._sole_submit_frame(page)
-        before = _mapping(await _evaluate(frame, SUBMIT_TARGET_SCRIPT))
+        try:
+            before = _mapping(await self._ask(frame, SUBMIT_TARGET_SCRIPT))
+        except Exception:  # noqa: BLE001 - a timeout arrives here too
+            before = {}
         if not before.get("ok"):
-            # The page changed between counting and marking. Refusing is the
-            # only safe answer: whatever is there now was never counted.
+            # The page changed between counting and marking, or stopped
+            # answering. Refusing is the only safe answer: whatever is there
+            # now was never counted, and a press with no pre-click baseline
+            # has nothing to compare a signal against.
             raise FinalSubmitControlNotFound(
                 (("", "the submit control disappeared before it could be clicked"),)
             )
@@ -1040,14 +1054,41 @@ class PlaywrightSubmitter:
         await self._click_the_only_submit(page, frame)
         return await self._await_confirmation(page, frame, before)
 
+    async def _ask(
+        self, target: Any, script: str, argument: Any = None, *, budget: float | None = None
+    ) -> Any:
+        """Run one script against one target, under a deadline.
+
+        Every question this class asks a page goes through here, because
+        every one of them is asked of a frame that may have no execution
+        context. `budget` narrows the per-frame allowance when a caller has
+        an overall deadline of its own, so the sum of the per-frame waits
+        can never outlive it.
+        """
+        limit = self._frame_timeout_s
+        if budget is not None:
+            limit = max(0.001, min(limit, budget))
+        return await asyncio.wait_for(_evaluate(target, script, argument), limit)
+
     async def _sole_submit_frame(self, page: Any) -> Any:
-        """The one same-origin frame holding the one final-submit control."""
+        """The one same-origin frame holding the one final-submit control.
+
+        A frame that cannot be read contributes nothing rather than
+        refusing the submission outright, for the same reason the guard
+        tolerates one: a pending `about:blank` child is routine on ATS
+        pages, and the scanner already travels a skipped frame as a
+        coverage gap — which is a blocking reason at the approval gate, so
+        the human who released this application saw it.
+        """
         frames, _skipped = same_origin_frames(page)
         holders: list[Any] = []
         accepted: list[str] = []
         rejected: list[tuple[str, str]] = []
         for frame in frames:
-            report = _mapping(await _evaluate(frame, SUBMIT_COUNT_SCRIPT))
+            try:
+                report = _mapping(await self._ask(frame, SUBMIT_COUNT_SCRIPT))
+            except Exception:  # noqa: BLE001 - a timeout arrives here too
+                continue
             names = [_text(name) for name in report.get("accepted") or ()]
             accepted.extend(names)
             for entry in report.get("rejected") or ():
@@ -1063,7 +1104,20 @@ class PlaywrightSubmitter:
         return holders[0]
 
     async def _click_the_only_submit(self, page: Any, frame: Any) -> None:
-        handle = await frame.evaluate_handle(SUBMIT_RESOLVE_SCRIPT)
+        try:
+            handle = await asyncio.wait_for(
+                frame.evaluate_handle(SUBMIT_RESOLVE_SCRIPT), self._frame_timeout_s
+            )
+        except Exception as error:  # noqa: BLE001 - a timeout arrives here too
+            raise FinalSubmitControlNotFound(
+                (
+                    (
+                        "",
+                        "the frame holding the counted submit control stopped "
+                        f"answering before it could be resolved ({error!r})",
+                    ),
+                )
+            ) from error
         as_element = getattr(handle, "as_element", None)
         element = as_element() if as_element is not None else handle
         if element is None:
@@ -1141,9 +1195,20 @@ class PlaywrightSubmitter:
 
         while True:
             for target in _distinct((frame, page)):
-                signal = _describe_signal(
-                    _mapping(await _evaluate(target, SUBMIT_SIGNAL_SCRIPT, recorded))
-                )
+                try:
+                    report = _mapping(
+                        await self._ask(
+                            target,
+                            SUBMIT_SIGNAL_SCRIPT,
+                            recorded,
+                            budget=deadline - self._clock(),
+                        )
+                    )
+                except Exception:  # noqa: BLE001 - a timeout arrives here too
+                    # A target that stops answering is silence, and silence
+                    # is not a submission.
+                    report = {}
+                signal = _describe_signal(report)
                 if signal:
                     return SubmitOutcome(
                         submitted=True,

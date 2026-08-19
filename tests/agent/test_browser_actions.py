@@ -1112,6 +1112,84 @@ class TestReportingASubmission:
         assert "navigation" in outcome.reason
 
 
+class TestNoFrameCanHoldTheSubmitter:
+    """A frame with no execution context must cost a timeout, not a worker.
+
+    This is the same defect the guard and the scanner already had: an
+    `about:blank` iframe that is still notionally navigating never answers
+    an `evaluate` at all, and the driver waits for a context that is not
+    coming. Here it would hold a tab whose form has just been filled, in
+    the one node where a stuck worker also means a lease nobody renews and
+    an approval nobody can act on.
+    """
+
+    async def test_a_frame_that_never_answers_before_the_press_is_skipped(
+        self,
+    ) -> None:
+        main = submitting_frame()
+        silent = FakeFrame(
+            "https://ats.example.com/pending",
+            {SUBMIT_COUNT_SCRIPT: _never_answers},
+            parent=main,
+        )
+
+        outcome = await asyncio.wait_for(
+            submitter(frame_timeout_ms=20).submit(FakePage(main, [silent]), APPROVED),
+            timeout=5,
+        )
+
+        assert outcome.submitted
+
+    async def test_a_target_that_never_answers_after_the_press_is_not_a_signal(
+        self,
+    ) -> None:
+        """A stuck target is silence, and silence is not a submission."""
+        main = submitting_frame(signals=({},))
+        page = FakePage(main)
+        page.evaluate = _never_answers  # type: ignore[method-assign]
+
+        outcome = await asyncio.wait_for(
+            submitter(frame_timeout_ms=20, confirm_timeout_ms=400).submit(
+                page, APPROVED
+            ),
+            timeout=5,
+        )
+
+        assert outcome.submitted is False
+        assert page.mouse.presses == 1
+
+    async def test_the_deadline_still_ends_a_wait_in_which_nothing_answers(
+        self,
+    ) -> None:
+        """Every per-frame timeout together must not outlive the deadline."""
+        main = submitting_frame()
+        main._responses[SUBMIT_SIGNAL_SCRIPT] = _never_answers
+
+        outcome = await asyncio.wait_for(
+            submitter(frame_timeout_ms=20, confirm_timeout_ms=400).submit(
+                FakePage(main), APPROVED
+            ),
+            timeout=5,
+        )
+
+        assert outcome.submitted is False
+
+    async def test_a_frame_that_never_marks_the_form_is_refused_before_the_click(
+        self,
+    ) -> None:
+        """No pre-click baseline means nothing to compare a signal against."""
+        main = submitting_frame()
+        main._responses[SUBMIT_TARGET_SCRIPT] = _never_answers
+        page = FakePage(main)
+
+        with pytest.raises(FinalSubmitControlNotFound):
+            await asyncio.wait_for(
+                submitter(frame_timeout_ms=20).submit(page, APPROVED), timeout=5
+            )
+
+        assert page.mouse.presses == 0
+
+
 class TestSubmissionScreenshots:
     class Shots:
         def __init__(self) -> None:
