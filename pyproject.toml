@@ -36,5 +36,5 @@ testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 filterwarnings = [
-    "ignore:Using `httpx` with `starlette.testclient` is deprecated.*:DeprecationWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated.*:starlette.exceptions.StarletteDeprecationWarning",
 ]
