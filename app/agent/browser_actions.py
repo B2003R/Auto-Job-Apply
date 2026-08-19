@@ -1097,11 +1097,12 @@ SUBMIT_TARGET_SCRIPT = (
 #: substring of a script.
 #:
 #: Each confirmation-shaped region is reported with an identity as well as
-#: its text, and stamped with that identity so the next reading of the same
-#: node reports the same one. That is what stops a panel which counts,
-#: ticks, or cycles its wording from reading as a confirmation arriving on
-#: every poll: `_fresh_confirmations` asks which *regions* are new, and a
-#: counter is one region all along.
+#: its text: where the region is, derived from the shadow root it lives in
+#: and its position among its ancestors, and stamped on the node so a region
+#: that *moves* is still recognised. That is what stops a panel which counts,
+#: ticks, cycles its wording, or is thrown away and built again from reading
+#: as a confirmation arriving on every poll: `_fresh_confirmations` asks
+#: which *regions* are new, and a counter is one region all along.
 SUBMIT_STATE_SCRIPT = (
     """
 (() => {
@@ -1125,6 +1126,7 @@ SUBMIT_STATE_SCRIPT = (
   const VALIDATION_SELECTOR = __VALIDATION_REGION_SELECTORS__.join(', ');
   const VALIDATION_TEXT = new RegExp(__VALIDATION_TEXT__, 'i');
   const MAX_TEXT = 160;
+  const MAX_PATH_STEPS = 12;
   const REGION_MARK = 'data-jobright-confirmation-region';
 
   const bodyText = (el) => String(el.textContent || '')
@@ -1138,11 +1140,53 @@ SUBMIT_STATE_SCRIPT = (
     }
   };
 
+  // Where a region is, expressed so that a second reading of the same place
+  // arrives at the same answer. An id ends the walk, because an id is the
+  // page's own name for the node; otherwise each step is the tag and its
+  // position among same-tag siblings, up to the root of this tree.
+  const structuralPath = (el) => {
+    const steps = [];
+    let node = el;
+    while (node && node.nodeType === 1 && steps.length < MAX_PATH_STEPS) {
+      let own = '';
+      try {
+        own = text(node.getAttribute('id'));
+      } catch (error) {
+        own = '';
+      }
+      if (own) {
+        steps.push('#' + own);
+        break;
+      }
+      const tag = node.tagName.toLowerCase();
+      const parent = node.parentNode;
+      if (!parent || !parent.children) {
+        steps.push(tag);
+        break;
+      }
+      let index = 1;
+      for (const sibling of parent.children) {
+        if (sibling === node) {
+          break;
+        }
+        if (sibling.tagName === node.tagName) {
+          index += 1;
+        }
+      }
+      steps.push(tag + ':' + index);
+      node = parent.nodeType === 1 ? parent : null;
+    }
+    return steps.reverse().join('>');
+  };
+
   // How a region is addressed across readings, in the order the addresses
-  // survive a repaint: one this reader has already stamped on the node, the
-  // page's own id, and failing both a token stamped on it now. The stamp is
-  // why a region rebuilt in place keeps its address while its wording
-  // changes underneath, which is the whole point of an identity.
+  // survive a repaint: one this reader has already stamped on the node, and
+  // failing that where the region is. The stamp carries a region that moves;
+  // the path finds one whose node was thrown away and built again, which is
+  // what a framework does to its own subtree and which nothing on the node
+  // itself can survive. Neither is invented: a token minted per node would
+  // be a new identity on every reading, and a panel that rewrites itself
+  // would read as a stream of confirmations arriving.
   const regionIdentity = (el, path) => {
     let stamped = '';
     try {
@@ -1153,16 +1197,14 @@ SUBMIT_STATE_SCRIPT = (
     if (stamped) {
       return stamped;
     }
-    const own = text(el.getAttribute('id'));
-    const minted = (path ? path + '>>' : '')
-      + (own ? '#' + own : 'region-' + Math.random().toString(36).slice(2, 10));
+    const derived = (path ? path + '>>' : '') + structuralPath(el);
     try {
-      el.setAttribute(REGION_MARK, minted);
+      el.setAttribute(REGION_MARK, derived);
     } catch (error) {
-      // A node that cannot be stamped is still addressable by whatever
-      // was minted for it; it just has to be minted again next reading.
+      // A node that cannot be stamped is addressed by its path every
+      // reading, which is the same answer the stamp would have given.
     }
-    return minted;
+    return derived;
   };
 
   const confirmations = [];

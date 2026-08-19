@@ -12,6 +12,10 @@
 //   anonymous   the panel has no id of its own, and rewrites its text on a
 //               timer. Nothing about the markup identifies it, so whatever
 //               identity a reader gives it has to be one it can find again.
+//   ghost       both at once: no id, thrown away and rebuilt on a timer, and
+//               worded differently every time. Nothing about the node
+//               survives, so the only thing left to recognise it by is where
+//               in the document it is.
 //   optimistic  the panel counts this application the instant the button is
 //               pressed, before anybody has accepted it. Still swallowed.
 //   confirms    the panel ticks, and the press fills the neutral status
@@ -28,7 +32,7 @@
 
   let count = 1;
 
-  if (mode === "anonymous") {
+  if (mode === "anonymous" || mode === "ghost") {
     document.getElementById("applied-count").removeAttribute("id");
   }
 
@@ -50,7 +54,16 @@
       `<div id="applied-count" role="status" aria-live="polite">${wording()}</div>`;
   };
 
-  const repaint = mode === "rebuild" ? rebuilt : inPlace;
+  // And the same panel with nothing at all to recognise it by: no id, and a
+  // node that is new every time. Its position in the document is the only
+  // thing that holds still.
+  const ghosted = () => {
+    wrapper.innerHTML =
+      `<div role="status" aria-live="polite">${wording()}</div>`;
+  };
+
+  const repaint =
+    mode === "rebuild" ? rebuilt : mode === "ghost" ? ghosted : inPlace;
 
   const bump = () => {
     count += 1;

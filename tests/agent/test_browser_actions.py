@@ -2474,6 +2474,19 @@ class TestTheSubmitterScripts:
         assert json.dumps(list(VALIDATION_REGION_SELECTORS)) in SUBMIT_STATE_SCRIPT
         assert json.dumps(VALIDATION_TEXT.pattern) in SUBMIT_STATE_SCRIPT
 
+    def test_a_regions_identity_is_derived_rather_than_invented(self) -> None:
+        """A minted token is not an identity a second reading can arrive at.
+
+        A region with no id, in a node the page throws away between polls,
+        has to be recognisable by *where it is* — so the address is built
+        from the shadow root it is in and its position among its ancestors.
+        A random token would be new on every reading, which is precisely the
+        false success this rule exists to prevent.
+        """
+        assert "Math.random" not in SUBMIT_STATE_SCRIPT
+        for ingredient in ("parentNode", "tagName", "entry.path"):
+            assert ingredient in SUBMIT_STATE_SCRIPT
+
     def test_the_target_script_marks_the_form_it_is_watching(self) -> None:
         """"That form disappeared" needs a way to say *which* form."""
         assert "setAttribute" in SUBMIT_TARGET_SCRIPT

@@ -530,6 +530,24 @@ class TestAConfirmationShapedPanelThatWillNotHoldStill:
         assert await self._panel(page) != before
         assert outcome.submitted is False
 
+    async def test_a_panel_with_neither_an_id_nor_a_surviving_node_confirms_nothing(
+        self, live_status_pages: Any
+    ) -> None:
+        """Both at once, which is the case with nothing to fall back on.
+
+        No id to hold on to and no node that outlives a tick: an identity
+        minted per node would be new every reading, and the panel would read
+        as a stream of arriving confirmations. Where in the document it is,
+        is the one thing about it that holds still.
+        """
+        page = await live_status_pages("ghost")
+        before = await self._panel(page)
+
+        outcome = await self._press(page, wait_ms=2_000)
+
+        assert await self._panel(page) != before
+        assert outcome.submitted is False
+
     async def test_a_panel_that_counts_the_press_itself_confirms_nothing(
         self, live_status_pages: Any
     ) -> None:
