@@ -49,7 +49,9 @@ import logging
 import random
 import re
 import time
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence
+from urllib.parse import urlsplit
 
 from app.agent.errors import (
     CaptchaEncountered,
@@ -178,6 +180,10 @@ NEVER_SUBMIT_NAME = re.compile(
 #: has been clicked and only inside a status, alert, or heading region, which
 #: is why prose is acceptable here and not in the page guard: this decides
 #: whether something already done succeeded, not whether to act at all.
+#:
+#: Matching this is necessary but never sufficient: the text also has to be
+#: text the page was *not* already showing before the click. See
+#: `submission_verdict`.
 CONFIRMATION_TEXT = re.compile(
     r"application (was |has been |is )?(successfully )?(submitted|received|complete[d]?)"
     r"|your application (was |has been )?(submitted|received)"
@@ -217,6 +223,189 @@ def is_confirmation_text(text: str) -> bool:
     if re.search(r"\b(could not|cannot|failed|unable|before submitting)\b", text, re.IGNORECASE):
         return False
     return CONFIRMATION_TEXT.search(text) is not None
+
+
+# --------------------------------------------------------------------------
+# Where a submitted application ends up, and where it does not
+# --------------------------------------------------------------------------
+
+#: URLs that only a completed submission leads to. Matched against the path
+#: and the query, and never on its own: a navigation is the weakest thing a
+#: page can do in response to a click, so this has to be corroborated by the
+#: form the control belonged to being gone.
+SUCCESS_DESTINATION = re.compile(
+    r"(^|[/?&=_.-])"
+    r"(thank[-_]?you|thanks|confirmation|confirmed|submitted|success)"
+    r"([/?&=_.-]|$)",
+    re.IGNORECASE,
+)
+
+#: URLs a submission is never at the end of. A board that bounces an expired
+#: session to a sign-in page, a validation round trip that reloads with an
+#: error banner, and an enforcement challenge all navigate exactly like a
+#: success does, and the first of those is the common case on an application
+#: that sat at the approval gate overnight.
+REFUSED_DESTINATION = re.compile(
+    r"(^|[/?&=_.-])"
+    r"(log[-_]?in|sign[-_]?in|signin|signon|auth|authenticate|authwall|sso|"
+    r"register|captcha|challenge|verify|verification|error|errors|failed|"
+    r"failure|denied|forbidden|unauthori[sz]ed|expired|session[-_]?expired)"
+    r"([/?&=_.-]|$)",
+    re.IGNORECASE,
+)
+
+#: Regions a page puts a rejection in. Deliberately wide, because a false
+#: match here costs an honest "not confirmed" rather than a wrong
+#: "submitted" — and because the text still has to read like a rejection,
+#: and the whole marker still has to be one the page was not already
+#: showing before the click.
+VALIDATION_REGION_SELECTORS: tuple[str, ...] = (
+    '[role="alert"]',
+    '[class*="error" i]',
+    '[id*="error" i]',
+    '[class*="invalid" i]',
+    '[class*="validation" i]',
+)
+
+#: What a rejection reads like.
+VALIDATION_TEXT = re.compile(
+    r"\b(is required|are required|required field|this field is|"
+    r"please (enter|fill|select|choose|provide|correct|complete|review|try)|"
+    r"cannot be (blank|empty)|must be|is not valid|is invalid|invalid|"
+    r"something went wrong|an error occurred|there (was|were) (an |a )?error|"
+    r"could not be (submitted|saved|processed)|failed to submit|try again)\b",
+    re.IGNORECASE,
+)
+
+#: Structural evidence, as `(selector, what it means)`, that the page did
+#: not take the submission. A password field appearing where there was none
+#: is a session that expired between the approval and the click.
+SUBMISSION_BLOCKER_SELECTORS: tuple[tuple[str, str], ...] = (
+    ('input[type="password"]', "a sign-in prompt"),
+    ('[aria-invalid="true"]', "a control marked invalid"),
+)
+
+
+def is_success_destination(url: str) -> bool:
+    """Whether this URL is one only a submitted application arrives at."""
+    parts = urlsplit(url)
+    return bool(SUCCESS_DESTINATION.search(f"{parts.path}?{parts.query}"))
+
+
+def is_refused_destination(url: str) -> bool:
+    """Whether this URL says the click went somewhere other than through."""
+    parts = urlsplit(url)
+    return bool(REFUSED_DESTINATION.search(f"{parts.path}?{parts.query}"))
+
+
+@dataclass(frozen=True)
+class PageState:
+    """What one target looked like at one moment.
+
+    Read before the click and again while waiting, by the same script
+    against the same target, so that every comparison is like with like.
+    The bug this type exists to make impossible was comparing a child
+    frame's "before" with the top page's "after": the URLs differ by
+    definition and the form is in neither document, so the first poll
+    reported a navigation and a vanished form on a page where nothing had
+    happened at all.
+    """
+
+    #: `location.href` of this target.
+    url: str = ""
+    #: The visible text of every region that reads like a confirmation.
+    confirmations: tuple[str, ...] = ()
+    #: Every reason to think the page refused the submission.
+    blockers: tuple[str, ...] = ()
+    #: Whether the form the submit control belonged to is in *this* target,
+    #: and visible. False in a baseline means "not mine to watch".
+    marked: bool = False
+
+    @classmethod
+    def from_report(cls, report: Mapping[str, Any]) -> "PageState":
+        return cls(
+            url=_text(report.get("url")),
+            confirmations=tuple(
+                _text(entry) for entry in report.get("confirmations") or ()
+            ),
+            blockers=tuple(_text(entry) for entry in report.get("blockers") or ()),
+            marked=bool(report.get("marked")),
+        )
+
+
+@dataclass(frozen=True)
+class SubmitVerdict:
+    """What one target's before-and-after says about the submission.
+
+    Three outcomes, not two. `signal` is a concrete reason to believe the
+    application went through, `refusal` is a concrete reason to believe it
+    did not, and neither means "nothing has happened yet, keep waiting".
+    """
+
+    signal: str = ""
+    refusal: str = ""
+
+    @property
+    def decided(self) -> bool:
+        return bool(self.signal or self.refusal)
+
+
+def submission_verdict(before: PageState, after: PageState) -> SubmitVerdict:
+    """Judge one target against its own pre-click state.
+
+    Only two things are accepted as a submission. A confirmation the page
+    was *not* already showing, or a destination only a submission arrives
+    at *together with* the form the control belonged to being gone.
+
+    Navigation alone is not one of them, and neither is the form
+    disappearing alone. Both were, and both are wrong in the same
+    direction: a board that bounces an expired session to a sign-in page
+    navigates, a validation round trip navigates, and a single-page ATS
+    swapping in step two of three removes the form. Each of those was
+    recorded as a submitted application, which is the worst outcome this
+    project has — an approval spent, a queue row completed, and nothing
+    sent.
+    """
+    fresh_blockers = tuple(
+        blocker for blocker in after.blockers if blocker not in before.blockers
+    )
+    if fresh_blockers:
+        return SubmitVerdict(
+            refusal=(
+                f"the page answered the click with {fresh_blockers[0]}, so the "
+                "application was not accepted"
+            )
+        )
+
+    moved = _normalized(after.url) != _normalized(before.url)
+    if moved and is_refused_destination(after.url):
+        return SubmitVerdict(
+            refusal=(
+                f"the click led to {after.url}, which is not a destination a "
+                "submitted application arrives at"
+            )
+        )
+
+    fresh = tuple(
+        entry for entry in after.confirmations if entry not in before.confirmations
+    )
+    if fresh:
+        return SubmitVerdict(
+            signal=(
+                "the page showed a confirmation it was not showing before the "
+                f"click: {fresh[0]!r}"
+            )
+        )
+
+    if moved and not after.marked and before.marked and is_success_destination(after.url):
+        return SubmitVerdict(
+            signal=(
+                f"the page navigated to {after.url}, which only a submission "
+                "arrives at, and the form the submit control belonged to did "
+                "not come with it"
+            )
+        )
+    return SubmitVerdict()
 
 
 # --------------------------------------------------------------------------
@@ -727,9 +916,8 @@ SUBMIT_RESOLVE_SCRIPT = (
 ).strip()
 
 
-#: Records what the page looked like before the click and marks the form the
-#: submit control belongs to, so "that form disappeared" can name *which*
-#: form rather than "some form is missing".
+#: Marks the form the submit control belongs to, so "that form disappeared"
+#: can name *which* form rather than "some form is missing".
 SUBMIT_TARGET_SCRIPT = (
     """
 (() => {
@@ -739,27 +927,33 @@ SUBMIT_TARGET_SCRIPT = (
     + """
   const { accepted } = collectSubmitCandidates();
   if (accepted.length !== 1) {
-    return { ok: false, url: String(location.href), marked: false };
+    return { ok: false, marked: false };
   }
   const el = accepted[0].el;
   const form = el.form || (el.closest ? el.closest('form') : null);
   if (form) {
     form.setAttribute('data-jobright-submit-target', '1');
   }
-  return { ok: true, url: String(location.href), marked: Boolean(form) };
+  return { ok: true, marked: Boolean(form) };
 })
 """
 ).strip()
 
 
-#: Looks for the three concrete things a submitted application does to a
-#: page. Each is reported as the detail that was observed, or an empty
-#: string; nothing is inferred from the passage of time.
-SUBMIT_SIGNAL_SCRIPT = (
+#: Reads one target: where it is, what it is saying, and whether the marked
+#: form is still in it. Run once before the click and repeatedly after,
+#: against the same target each time, so the comparison in
+#: `submission_verdict` is always like with like.
+#:
+#: Reports only readings. Whether a reading amounts to a submission is
+#: decided in Python, where it can be tested directly rather than through a
+#: substring of a script.
+SUBMIT_STATE_SCRIPT = (
     """
-((before) => {
+(() => {
 """
     + PAGE_TRAVERSAL_JS
+    + ACTIVE_CAPTCHA_JS
     + """
   const CONFIRMATION_SELECTOR = [
     '[role="status"]',
@@ -773,66 +967,82 @@ SUBMIT_SIGNAL_SCRIPT = (
   ].join(', ');
   const CONFIRMATION_TEXT = new RegExp(__CONFIRMATION_TEXT__, 'i');
   const NOT_A_CONFIRMATION = /\\b(could not|cannot|failed|unable|before submitting)\\b/i;
+  const BLOCKER_SELECTORS = __BLOCKER_SELECTORS__;
+  const VALIDATION_SELECTOR = __VALIDATION_REGION_SELECTORS__.join(', ');
+  const VALIDATION_TEXT = new RegExp(__VALIDATION_TEXT__, 'i');
+  const MAX_TEXT = 160;
 
-  const stripFragment = (href) => String(href || '').split('#')[0];
+  const bodyText = (el) => String(el.textContent || '')
+    .replace(/\\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_TEXT);
 
-  const previous = (before && before.url) || '';
-  const navigated = stripFragment(location.href) !== stripFragment(previous)
-    ? String(location.href)
-    : '';
-
-  let confirmed = '';
-  let formGone = '';
-  const roots = collectRoots(document, 0, '', []);
-
-  for (const entry of roots) {
-    if (confirmed) {
-      break;
+  const add = (list, entry) => {
+    if (entry && list.indexOf(entry) === -1) {
+      list.push(entry);
     }
-    let found = [];
-    try {
-      found = entry.root.querySelectorAll(CONFIRMATION_SELECTOR);
-    } catch (error) {
-      continue;
-    }
-    for (const el of found) {
-      const body = String(el.textContent || '').replace(/\\s+/g, ' ').trim();
-      if (!body || !isVisible(el)) {
-        continue;
-      }
-      if (NOT_A_CONFIRMATION.test(body)) {
+  };
+
+  const confirmations = [];
+  const blockers = [];
+  let marked = false;
+
+  for (const entry of collectRoots(document, 0, '', [])) {
+    for (const el of queryAll(entry.root, CONFIRMATION_SELECTOR)) {
+      const body = bodyText(el);
+      if (!body || !isVisible(el) || NOT_A_CONFIRMATION.test(body)) {
         continue;
       }
       if (CONFIRMATION_TEXT.test(body)) {
-        confirmed = body.slice(0, 160);
-        break;
+        add(confirmations, body);
       }
+    }
+
+    for (const pair of BLOCKER_SELECTORS) {
+      for (const el of queryAll(entry.root, pair[0])) {
+        if (isVisible(el)) {
+          add(blockers, pair[1] + ' (' + pair[0] + ')');
+          break;
+        }
+      }
+    }
+
+    for (const el of queryAll(entry.root, VALIDATION_SELECTOR)) {
+      const body = bodyText(el);
+      if (body && isVisible(el) && VALIDATION_TEXT.test(body)) {
+        add(blockers, 'a validation message: ' + JSON.stringify(body));
+      }
+    }
+
+    const captcha = activeCaptcha(entry.root);
+    if (captcha) {
+      add(blockers, 'a human-verification challenge (' + captcha + ')');
+    }
+
+    if (!marked) {
+      const target = queryAll(entry.root, 'form[data-jobright-submit-target]')[0];
+      marked = Boolean(target) && isVisible(target);
     }
   }
 
-  if (before && before.marked) {
-    let target = null;
-    for (const entry of roots) {
-      try {
-        target = entry.root.querySelector('form[data-jobright-submit-target]');
-      } catch (error) {
-        target = null;
-      }
-      if (target) {
-        break;
-      }
-    }
-    if (!target) {
-      formGone = 'the form the submit control belonged to is no longer in the page';
-    } else if (!isVisible(target)) {
-      formGone = 'the form the submit control belonged to is no longer visible';
-    }
-  }
-
-  return { navigated, confirmed, formGone };
+  return { url: String(location.href), confirmations, blockers, marked };
 })
 """
-).replace("__CONFIRMATION_TEXT__", json.dumps(CONFIRMATION_TEXT.pattern)).strip()
+)
+SUBMIT_STATE_SCRIPT = (
+    SUBMIT_STATE_SCRIPT.replace(
+        "__CONFIRMATION_TEXT__", json.dumps(CONFIRMATION_TEXT.pattern)
+    )
+    .replace(
+        "__BLOCKER_SELECTORS__",
+        json.dumps([list(pair) for pair in SUBMISSION_BLOCKER_SELECTORS]),
+    )
+    .replace(
+        "__VALIDATION_REGION_SELECTORS__", json.dumps(list(VALIDATION_REGION_SELECTORS))
+    )
+    .replace("__VALIDATION_TEXT__", json.dumps(VALIDATION_TEXT.pattern))
+    .strip()
+)
 
 
 # --------------------------------------------------------------------------
@@ -1171,8 +1381,41 @@ class PlaywrightSubmitter:
                 (("", "the submit control disappeared before it could be clicked"),)
             )
 
+        # Every target that will be watched afterwards is read *now*, and
+        # each is only ever compared with its own reading. See `PageState`.
+        baselines = await self._baselines(page, frame)
         await self._click_the_only_submit(page, frame)
-        return await self._await_confirmation(page, frame, before)
+        return await self._await_confirmation(page, baselines)
+
+    async def _baselines(self, page: Any, frame: Any) -> list[tuple[Any, PageState]]:
+        """Read every target that will be asked about the outcome.
+
+        The submitting frame is required: with no pre-click reading of it
+        there is nothing a later reading could be compared against, and a
+        press whose outcome cannot be judged is not one to make. Any other
+        target that cannot be read is simply not watched.
+        """
+        captured: list[tuple[Any, PageState]] = []
+        for target in _confirmation_targets(page, frame):
+            try:
+                state = PageState.from_report(
+                    _mapping(await self._ask(target, SUBMIT_STATE_SCRIPT))
+                )
+            except Exception as error:  # noqa: BLE001 - a timeout arrives here too
+                if target is frame:
+                    raise FinalSubmitControlNotFound(
+                        (
+                            (
+                                "",
+                                "the frame holding the submit control could not "
+                                f"be read before the click ({error!r}), so the "
+                                "outcome of pressing it could not be judged",
+                            ),
+                        )
+                    ) from error
+                continue
+            captured.append((target, state))
+        return captured
 
     async def _ask(
         self, target: Any, script: str, argument: Any = None, *, budget: float | None = None
@@ -1300,51 +1543,63 @@ class PlaywrightSubmitter:
         )
 
     async def _await_confirmation(
-        self, page: Any, frame: Any, before: Mapping[str, Any]
+        self, page: Any, baselines: Sequence[tuple[Any, PageState]]
     ) -> SubmitOutcome:
-        """Wait for the page to say the application went through.
+        """Wait for the page to say what became of the application.
 
-        Polls until one of three concrete things is true, or until the
-        deadline. A deadline reached is *not* a submission and is *not*
-        another click: an application that may or may not have been filed is
-        recorded as unconfirmed, with a screenshot, for a human to check.
+        Polls each target against *its own* pre-click reading until one of
+        them is decided, or until the deadline. A deadline reached is not a
+        submission and is not another click: an application that may or may
+        not have been filed is recorded as unconfirmed, with a screenshot,
+        for a human to check.
         """
-        recorded = {"url": _text(before.get("url")), "marked": bool(before.get("marked"))}
         deadline = self._clock() + self._confirm_timeout_ms / 1000
         poll_s = self._poll_interval_ms / 1000
 
         while True:
-            for target in _distinct((frame, page)):
+            for target, before in baselines:
                 try:
-                    report = _mapping(
-                        await self._ask(
-                            target,
-                            SUBMIT_SIGNAL_SCRIPT,
-                            recorded,
-                            budget=deadline - self._clock(),
+                    after = PageState.from_report(
+                        _mapping(
+                            await self._ask(
+                                target,
+                                SUBMIT_STATE_SCRIPT,
+                                budget=deadline - self._clock(),
+                            )
                         )
                     )
                 except Exception:  # noqa: BLE001 - a timeout arrives here too
                     # A target that stops answering is silence, and silence
                     # is not a submission.
-                    report = {}
-                signal = _describe_signal(report)
-                if signal:
+                    continue
+                verdict = submission_verdict(before, after)
+                if verdict.signal:
                     return SubmitOutcome(
                         submitted=True,
-                        reason=signal,
+                        reason=verdict.signal,
                         screenshot_path=await self._capture(page, "submitted"),
+                    )
+                if verdict.refusal:
+                    return SubmitOutcome(
+                        submitted=False,
+                        reason=(
+                            f"the final submit control was clicked once and "
+                            f"{verdict.refusal}. It is not clicked again; check "
+                            "the screenshot and the application by hand."
+                        ),
+                        screenshot_path=await self._capture(page, "refused"),
                     )
             if self._clock() >= deadline:
                 return SubmitOutcome(
                     submitted=False,
                     reason=(
-                        "the final submit control was clicked once, and none of the "
-                        "three signals that would confirm a submission appeared "
-                        f"within {self._confirm_timeout_ms}ms: no navigation, no "
-                        "confirmation region, and the form is still on the page. "
-                        "It is not clicked again; check the screenshot and the "
-                        "application by hand."
+                        "the final submit control was clicked once, and nothing "
+                        "that would confirm a submission appeared within "
+                        f"{self._confirm_timeout_ms}ms: no confirmation the page "
+                        "was not already showing, and no navigation to a "
+                        "destination only a submission arrives at. It is not "
+                        "clicked again; check the screenshot and the application "
+                        "by hand."
                     ),
                     screenshot_path=await self._capture(page, "unconfirmed"),
                 )
@@ -1359,30 +1614,20 @@ class PlaywrightSubmitter:
             return None
 
 
-def _distinct(targets: Sequence[Any]) -> list[Any]:
-    """The given objects, without asking the same one twice.
+def _confirmation_targets(page: Any, frame: Any) -> list[Any]:
+    """The frames whose before-and-after decide this submission.
 
-    A single-frame page's main frame *is* the page for evaluation purposes
-    in some drivers and a separate object in others; either way the signal
-    script should run once per distinct target.
+    The frame that was clicked in, and the top document, which is where a
+    board that answers a submit with a whole-page redirect puts the answer.
+    Both are frames rather than one frame and one page, so that "these are
+    the same target" is an identity comparison: a page and its own main
+    frame evaluate against one document, and asking twice would mean
+    holding two baselines for one thing.
     """
+    main = getattr(page, "main_frame", None)
     seen: list[Any] = []
-    for target in targets:
+    for target in (frame, main if main is not None else page):
         if target is None or any(target is existing for existing in seen):
             continue
         seen.append(target)
     return seen
-
-
-def _describe_signal(report: Mapping[str, Any]) -> str:
-    """Which concrete success signal the page showed, if any."""
-    confirmed = _text(report.get("confirmed"))
-    if confirmed:
-        return f"the page showed a confirmation: {confirmed!r}"
-    navigated = _text(report.get("navigated"))
-    if navigated:
-        return f"the page navigated to {navigated} after the submit click"
-    gone = _text(report.get("formGone"))
-    if gone:
-        return gone
-    return ""

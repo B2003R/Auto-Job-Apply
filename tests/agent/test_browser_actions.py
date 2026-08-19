@@ -39,17 +39,21 @@ from app.agent.browser_actions import (
     SUBMIT_CANDIDATES_JS,
     SUBMIT_COUNT_SCRIPT,
     SUBMIT_RESOLVE_SCRIPT,
-    SUBMIT_SIGNAL_SCRIPT,
+    SUBMIT_STATE_SCRIPT,
     SUBMIT_TARGET_SCRIPT,
     SUPPORTED_FIELD_TYPES,
+    VALIDATION_REGION_SELECTORS,
+    VALIDATION_TEXT,
     WRITE_COUNT_SCRIPT,
     WRITE_SCRIPT,
+    PageState,
     PlaywrightFieldWriter,
     PlaywrightPageGuard,
     PlaywrightSubmitter,
     is_confirmation_text,
     is_final_submit_name,
     normalize_control_name,
+    submission_verdict,
 )
 from app.agent.errors import (
     CaptchaEncountered,
@@ -979,27 +983,52 @@ APPROVED = SubmitAuthorization(
 )
 
 
+CONFIRMED = "Your application was submitted. Thank you for applying."
+
+
+def state(
+    *,
+    url: str = MAIN_URL,
+    confirmations: Sequence[str] = (),
+    blockers: Sequence[str] = (),
+    marked: bool = True,
+) -> dict[str, Any]:
+    """One reading of one target: what a state script reports."""
+    return {
+        "url": url,
+        "confirmations": list(confirmations),
+        "blockers": list(blockers),
+        "marked": marked,
+    }
+
+
+def state_reader(
+    baseline: Mapping[str, Any], after: Sequence[Mapping[str, Any]]
+) -> Any:
+    """Answers the state script with the baseline first, then each reading.
+
+    The last reading repeats, so a test that means "and then nothing else
+    ever changed" does not have to say how many times it will be asked.
+    """
+    readings = [dict(baseline), *(dict(entry) for entry in after)]
+
+    def next_reading(_argument: Any) -> dict[str, Any]:
+        return readings[0] if len(readings) == 1 else readings.pop(0)
+
+    return next_reading
+
+
 def submitting_frame(
     *,
     accepted: Sequence[str] = ("Submit application",),
     rejected: Sequence[Mapping[str, str]] = (),
-    signals: Sequence[Mapping[str, Any]] = ({"confirmed": "role=status"},),
+    baseline: Mapping[str, Any] | None = None,
+    after: Sequence[Mapping[str, Any]] | None = None,
     url: str = MAIN_URL,
     parent: FakeFrame | None = None,
     element: FakeElement | None = None,
 ) -> FakeFrame:
-    """A frame with a submit control and a scripted sequence of signals."""
-    remaining = list(signals)
-
-    def next_signal(_argument: Any) -> dict[str, Any]:
-        current = remaining[0] if len(remaining) == 1 else remaining.pop(0)
-        return {
-            "navigated": "",
-            "confirmed": "",
-            "formGone": "",
-            **current,
-        }
-
+    """A frame with a submit control, a pre-click state, and what follows."""
     return FakeFrame(
         url,
         {
@@ -1009,8 +1038,13 @@ def submitting_frame(
                 "rejected": [dict(entry) for entry in rejected],
             },
             SUBMIT_RESOLVE_SCRIPT: element if element is not None else FakeElement(),
-            SUBMIT_TARGET_SCRIPT: {"ok": True, "url": url, "marked": True},
-            SUBMIT_SIGNAL_SCRIPT: next_signal,
+            SUBMIT_TARGET_SCRIPT: {"ok": True, "marked": True},
+            SUBMIT_STATE_SCRIPT: state_reader(
+                baseline if baseline is not None else state(url=url),
+                after
+                if after is not None
+                else (state(url=url, confirmations=[CONFIRMED]),),
+            ),
         },
         parent=parent,
     )
@@ -1152,34 +1186,36 @@ class TestFindingExactlyOneFinalSubmitControl:
 class TestReportingASubmission:
     """`submitted` is a claim about the page, never about the click."""
 
-    @pytest.mark.parametrize(
-        "signal,expected",
-        [
-            ({"confirmed": "role=status"}, "confirmation"),
-            ({"navigated": "https://ats.example.com/thanks"}, "navigat"),
-            ({"formGone": "the application form was removed"}, "form"),
-        ],
-    )
-    async def test_each_concrete_signal_is_enough(
-        self, signal: dict[str, Any], expected: str
-    ) -> None:
-        frame = submitting_frame(signals=(signal,))
+    async def test_a_confirmation_that_appears_after_the_click_is_enough(self) -> None:
+        frame = submitting_frame(after=(state(confirmations=[CONFIRMED]),))
 
         outcome = await submitter().submit(FakePage(frame), APPROVED)
 
         assert outcome.submitted
-        assert expected in outcome.reason
+        assert "confirmation" in outcome.reason
+
+    async def test_a_success_destination_the_form_did_not_survive_is_enough(
+        self,
+    ) -> None:
+        frame = submitting_frame(
+            after=(state(url="https://ats.example.com/thank-you", marked=False),)
+        )
+
+        outcome = await submitter().submit(FakePage(frame), APPROVED)
+
+        assert outcome.submitted
+        assert "thank-you" in outcome.reason
 
     async def test_a_signal_that_arrives_late_is_still_waited_for(self) -> None:
         frame = submitting_frame(
-            signals=({}, {}, {"confirmed": "role=status"}),
+            after=(state(), state(), state(confirmations=[CONFIRMED])),
         )
 
         assert (await submitter().submit(FakePage(frame), APPROVED)).submitted
-        assert frame.times_run(SUBMIT_SIGNAL_SCRIPT) >= 3
+        assert frame.times_run(SUBMIT_STATE_SCRIPT) >= 4
 
     async def test_no_signal_at_all_is_not_a_submission(self) -> None:
-        frame = submitting_frame(signals=({},))
+        frame = submitting_frame(after=(state(),))
 
         outcome = await submitter(confirm_timeout_ms=400).submit(
             FakePage(frame), APPROVED
@@ -1190,7 +1226,7 @@ class TestReportingASubmission:
 
     async def test_an_unconfirmed_outcome_is_never_clicked_a_second_time(self) -> None:
         """The one thing worse than an unconfirmed submission is two."""
-        frame = submitting_frame(signals=({},))
+        frame = submitting_frame(after=(state(),))
         page = FakePage(frame)
 
         await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
@@ -1198,7 +1234,7 @@ class TestReportingASubmission:
         assert page.mouse.presses == 1
 
     async def test_the_unconfirmed_reason_says_what_was_looked_for(self) -> None:
-        frame = submitting_frame(signals=({},))
+        frame = submitting_frame(after=(state(),))
 
         outcome = await submitter(confirm_timeout_ms=400).submit(
             FakePage(frame), APPROVED
@@ -1206,6 +1242,283 @@ class TestReportingASubmission:
 
         assert "confirmation" in outcome.reason
         assert "navigation" in outcome.reason
+
+
+class TestEachTargetIsJudgedAgainstItsOwnBaseline:
+    """A form in a child frame is where a shared baseline goes wrong.
+
+    The submitting frame's URL is not the top page's URL, and the form the
+    control belongs to is not in the top page's document at all. Comparing
+    one target's "before" against another target's "after" therefore reports
+    a navigation and a vanished form on the very first poll, on a page where
+    nothing whatsoever has happened — which is a submission recorded, an
+    approval consumed, and a queue row marked completed for a form that is
+    still sitting there filled in.
+    """
+
+    def _framed_page(
+        self,
+        *,
+        after: Sequence[Mapping[str, Any]],
+        top_baseline: Mapping[str, Any] | None = None,
+        top_after: Sequence[Mapping[str, Any]] | None = None,
+    ) -> tuple[FakePage, FakeFrame]:
+        """A top page with no form, and a child frame that holds one."""
+        top = state(url=MAIN_URL, marked=False)
+        main = FakeFrame(
+            MAIN_URL,
+            {
+                SUBMIT_COUNT_SCRIPT: {"count": 0, "accepted": [], "rejected": []},
+                SUBMIT_STATE_SCRIPT: state_reader(
+                    top_baseline if top_baseline is not None else top,
+                    top_after if top_after is not None else (top,),
+                ),
+            },
+        )
+        inner = submitting_frame(
+            url="https://ats.example.com/embedded-form",
+            baseline=state(url="https://ats.example.com/embedded-form"),
+            after=after,
+            parent=main,
+        )
+        return FakePage(main, [inner]), inner
+
+    async def test_a_top_page_that_never_held_the_form_cannot_report_it_gone(
+        self,
+    ) -> None:
+        page, _inner = self._framed_page(after=(state(url="https://ats.example.com/embedded-form"),))
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+
+        assert outcome.submitted is False
+
+    async def test_a_top_page_at_its_own_url_is_not_a_navigation(self) -> None:
+        """The child frame's URL differs from the top page's by definition."""
+        page, _inner = self._framed_page(after=(state(url="https://ats.example.com/embedded-form"),))
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+
+        assert outcome.submitted is False
+        assert "navigation" in outcome.reason
+
+    async def test_a_confirmation_the_top_page_was_already_showing_cannot_succeed(
+        self,
+    ) -> None:
+        """The wrapper page saying "thank you for applying" about last time.
+
+        A careers site that keeps a standing thank-you panel, or a page
+        that was reached from a previous application, already reads like a
+        confirmation before anything is clicked.
+        """
+        standing = state(url=MAIN_URL, marked=False, confirmations=[CONFIRMED])
+        page, _inner = self._framed_page(
+            after=(state(url="https://ats.example.com/embedded-form"),),
+            top_baseline=standing,
+            top_after=(standing,),
+        )
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+
+        assert outcome.submitted is False
+
+    async def test_a_confirmation_the_frame_was_already_showing_cannot_succeed(
+        self,
+    ) -> None:
+        standing = state(confirmations=[CONFIRMED])
+        frame = submitting_frame(baseline=standing, after=(standing,))
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(
+            FakePage(frame), APPROVED
+        )
+
+        assert outcome.submitted is False
+
+    async def test_a_second_confirmation_alongside_the_standing_one_does_succeed(
+        self,
+    ) -> None:
+        """Freshness, not absence: a page may confirm twice over."""
+        standing = state(confirmations=["Thank you for applying to our team"])
+        frame = submitting_frame(
+            baseline=standing,
+            after=(
+                state(confirmations=["Thank you for applying to our team", CONFIRMED]),
+            ),
+        )
+
+        outcome = await submitter().submit(FakePage(frame), APPROVED)
+
+        assert outcome.submitted
+        assert CONFIRMED in outcome.reason
+
+    async def test_the_frame_holding_the_form_is_asked_before_the_click(self) -> None:
+        frame = submitting_frame()
+        page = FakePage(frame)
+
+        await submitter().submit(page, APPROVED)
+
+        assert frame.times_run(SUBMIT_STATE_SCRIPT) >= 2
+
+
+class TestNavigationAloneNeverConfirms:
+    """The weakest of the old signals, and the one most often wrong.
+
+    An ATS that redirects an unauthenticated poster to a sign-in page, a
+    validation round trip that reloads with errors, and a submission that
+    genuinely succeeded all navigate. Accepting the navigation itself meant
+    the first two were recorded as submitted applications.
+    """
+
+    def test_a_bare_navigation_confirms_nothing(self) -> None:
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url="https://ats.example.com/apply/step-2", marked=True),
+        )
+
+        assert not verdict.signal
+        assert not verdict.refusal
+
+    def test_a_success_destination_the_form_survived_confirms_nothing(self) -> None:
+        """A wizard step called "complete" is still a form to fill in."""
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url="https://ats.example.com/apply/completed", marked=True),
+        )
+
+        assert not verdict.signal
+
+    def test_the_form_going_without_a_navigation_confirms_nothing(self) -> None:
+        """A single-page ATS swapping in step two removes the form too."""
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url=MAIN_URL, marked=False),
+        )
+
+        assert not verdict.signal
+
+    @pytest.mark.parametrize(
+        "destination",
+        [
+            "https://ats.example.com/thank-you",
+            "https://ats.example.com/thanks?job=42",
+            "https://ats.example.com/application/submitted",
+            "https://ats.example.com/confirmation",
+            "https://ats.example.com/apply?submitted=true",
+        ],
+    )
+    def test_a_success_destination_and_a_vanished_form_together_confirm(
+        self, destination: str
+    ) -> None:
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url=destination, marked=False),
+        )
+
+        assert verdict.signal
+        assert destination in verdict.signal
+
+    @pytest.mark.parametrize(
+        "destination",
+        [
+            "https://ats.example.com/login?next=/apply",
+            "https://ats.example.com/users/sign_in",
+            "https://ats.example.com/auth/callback",
+            "https://ats.example.com/error",
+            "https://ats.example.com/apply/failed",
+            "https://ats.example.com/session-expired",
+            "https://ats.example.com/challenge",
+        ],
+    )
+    def test_a_destination_no_submission_ends_at_is_a_refusal(
+        self, destination: str
+    ) -> None:
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url=destination, marked=False),
+        )
+
+        assert not verdict.signal
+        assert verdict.refusal
+
+    def test_a_refused_destination_outranks_a_confirmation_on_it(self) -> None:
+        """A sign-in page is not made trustworthy by the words on it."""
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(
+                url="https://ats.example.com/login",
+                marked=False,
+                confirmations=(CONFIRMED,),
+            ),
+        )
+
+        assert not verdict.signal
+        assert verdict.refusal
+
+    def test_a_url_fragment_is_not_a_navigation(self) -> None:
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(url=f"{MAIN_URL}#thank-you", marked=False),
+        )
+
+        assert not verdict.signal
+
+
+class TestThePageSayingItRefusedTheSubmission:
+    """A refusal ends the wait, and never with a second click.
+
+    Waiting out the full confirmation timeout on a page that has already
+    said "Last name is required" wastes the only minutes an operator has,
+    and reporting it as merely unconfirmed sends them to check an ATS that
+    has nothing in it.
+    """
+
+    async def test_a_validation_message_that_appears_ends_the_wait(self) -> None:
+        frame = submitting_frame(
+            after=(state(blockers=['a validation message: "Last name is required"']),)
+        )
+        page = FakePage(frame)
+
+        outcome = await submitter().submit(page, APPROVED)
+
+        assert outcome.submitted is False
+        assert "Last name is required" in outcome.reason
+        assert page.mouse.presses == 1
+
+    async def test_a_blocker_that_was_already_there_is_not_a_refusal(self) -> None:
+        """A form with a standing "required field" hint is an ordinary form."""
+        standing = state(blockers=['a validation message: "All fields are required"'])
+        frame = submitting_frame(
+            baseline=standing,
+            after=(dict(standing, confirmations=[CONFIRMED]),),
+        )
+
+        assert (await submitter().submit(FakePage(frame), APPROVED)).submitted
+
+    async def test_a_challenge_that_appears_after_the_click_is_not_a_submission(
+        self,
+    ) -> None:
+        frame = submitting_frame(
+            after=(
+                state(blockers=["a human-verification challenge (div.g-recaptcha)"]),
+            )
+        )
+
+        outcome = await submitter().submit(FakePage(frame), APPROVED)
+
+        assert outcome.submitted is False
+        assert "challenge" in outcome.reason
+
+    def test_a_fresh_blocker_outranks_a_success_destination(self) -> None:
+        verdict = submission_verdict(
+            PageState(url=MAIN_URL, marked=True),
+            PageState(
+                url="https://ats.example.com/thank-you",
+                marked=False,
+                blockers=("a sign-in prompt",),
+            ),
+        )
+
+        assert not verdict.signal
+        assert verdict.refusal
 
 
 class TestNoFrameCanHoldTheSubmitter:
@@ -1240,9 +1553,19 @@ class TestNoFrameCanHoldTheSubmitter:
         self,
     ) -> None:
         """A stuck target is silence, and silence is not a submission."""
-        main = submitting_frame(signals=({},))
-        page = FakePage(main)
-        page.evaluate = _never_answers  # type: ignore[method-assign]
+        main = FakeFrame(
+            MAIN_URL,
+            {
+                SUBMIT_COUNT_SCRIPT: {"count": 0, "accepted": [], "rejected": []},
+                SUBMIT_STATE_SCRIPT: _never_answers,
+            },
+        )
+        inner = submitting_frame(
+            url="https://ats.example.com/embedded-form",
+            after=(state(url="https://ats.example.com/embedded-form"),),
+            parent=main,
+        )
+        page = FakePage(main, [inner])
 
         outcome = await asyncio.wait_for(
             submitter(frame_timeout_ms=20, confirm_timeout_ms=400).submit(
@@ -1258,8 +1581,13 @@ class TestNoFrameCanHoldTheSubmitter:
         self,
     ) -> None:
         """Every per-frame timeout together must not outlive the deadline."""
+        readings = [state()]
+
+        def baseline_then_silence(argument: Any) -> Any:
+            return readings.pop() if readings else _never_answers(argument)
+
         main = submitting_frame()
-        main._responses[SUBMIT_SIGNAL_SCRIPT] = _never_answers
+        main._responses[SUBMIT_STATE_SCRIPT] = baseline_then_silence
 
         outcome = await asyncio.wait_for(
             submitter(frame_timeout_ms=20, confirm_timeout_ms=400).submit(
@@ -1306,7 +1634,7 @@ class TestSubmissionScreenshots:
     async def test_an_unconfirmed_submission_is_photographed_too(self) -> None:
         """This is the screenshot an operator most needs to look at."""
         shots = self.Shots()
-        frame = submitting_frame(signals=({},))
+        frame = submitting_frame(after=(state(),))
 
         outcome = await submitter(confirm_timeout_ms=400, screenshots=shots).submit(
             FakePage(frame), APPROVED
@@ -1483,13 +1811,13 @@ class TestWhatCountsAsAConfirmation:
         assert not is_confirmation_text(text)
 
     def test_the_pattern_is_shared_with_the_page(self) -> None:
-        assert CONFIRMATION_TEXT.pattern in SUBMIT_SIGNAL_SCRIPT
+        assert CONFIRMATION_TEXT.pattern in SUBMIT_STATE_SCRIPT
 
 
 class TestTheSubmitterScripts:
     @pytest.mark.parametrize(
         "script",
-        [SUBMIT_COUNT_SCRIPT, SUBMIT_RESOLVE_SCRIPT, SUBMIT_SIGNAL_SCRIPT],
+        [SUBMIT_COUNT_SCRIPT, SUBMIT_RESOLVE_SCRIPT, SUBMIT_STATE_SCRIPT],
     )
     def test_each_script_is_a_callable_javascript_expression(self, script: str) -> None:
         assert script.startswith("(")
@@ -1516,9 +1844,29 @@ class TestTheSubmitterScripts:
     def test_candidates_are_searched_through_open_shadow_roots(self) -> None:
         assert "collectRoots(" in SUBMIT_CANDIDATES_JS
 
-    def test_the_signal_script_looks_for_all_three_signals(self) -> None:
-        for signal in ("navigated", "confirmed", "formGone"):
-            assert signal in SUBMIT_SIGNAL_SCRIPT
+    def test_the_state_script_reports_facts_rather_than_verdicts(self) -> None:
+        """Only readings cross the wire; the rules are applied in Python.
+
+        Which readings count as a submission is the most consequential
+        decision this project makes, so it lives where it can be tested
+        directly rather than asserted about through a substring.
+        """
+        for reading in ("url", "confirmations", "blockers", "marked"):
+            assert reading in SUBMIT_STATE_SCRIPT
+        for verdict in ("navigated", "formGone"):
+            assert verdict not in SUBMIT_STATE_SCRIPT
+
+    def test_the_state_script_reads_the_same_page_before_and_after(self) -> None:
+        """One script, so a baseline and a reading cannot be different questions."""
+        assert SUBMIT_STATE_SCRIPT.count("confirmations") >= 1
+        assert "location.href" in SUBMIT_STATE_SCRIPT
+
+    def test_the_state_script_uses_the_shared_challenge_rule(self) -> None:
+        assert ACTIVE_CAPTCHA_JS in SUBMIT_STATE_SCRIPT
+
+    def test_the_blocker_rules_are_the_python_ones(self) -> None:
+        assert json.dumps(list(VALIDATION_REGION_SELECTORS)) in SUBMIT_STATE_SCRIPT
+        assert json.dumps(VALIDATION_TEXT.pattern) in SUBMIT_STATE_SCRIPT
 
     def test_the_target_script_marks_the_form_it_is_watching(self) -> None:
         """"That form disappeared" needs a way to say *which* form."""
