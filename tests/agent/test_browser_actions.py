@@ -22,6 +22,7 @@ import asyncio
 import dataclasses
 import inspect
 import json
+from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
 
 import pytest
@@ -65,6 +66,7 @@ from app.agent.errors import (
     FinalSubmitControlNotActionable,
     FinalSubmitControlNotFound,
     LoginWallEncountered,
+    SubmitAlreadyAttempted,
     SubmitNotAuthorized,
     UnsupportedFieldControl,
 )
@@ -74,7 +76,7 @@ from app.agent.form_scanner import (
     FormField,
     FormScanner,
 )
-from app.agent.graph import SubmitAuthorization
+from app.agent.graph import SubmitAuthorization, SubmitPermit
 from app.storage.models import ApprovalDecision
 
 MAIN_URL = "https://ats.example.com/apply"
@@ -1094,6 +1096,34 @@ def presses(frame: FakeFrame) -> int:
     return submit_control(frame).presses
 
 
+class RecordedClaim:
+    """A permit that remembers when it was claimed, relative to the click.
+
+    The real one is `SubmitPermit` and it is what these tests construct: the
+    substitute is only the durable claim behind it, which here appends to a
+    list instead of writing a row. What matters to every test below is the
+    order of that list against the control's own record of being checked and
+    pressed.
+    """
+
+    def __init__(
+        self, *, error: BaseException | None = None, log: list[str] | None = None
+    ) -> None:
+        self.error = error
+        self.log = log if log is not None else []
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+        self.log.append("claim")
+        if self.error is not None:
+            raise self.error
+
+
+def permit(claim: RecordedClaim | None = None) -> SubmitPermit:
+    return SubmitPermit(APPROVED.application_id, claim or RecordedClaim())
+
+
 def submitter(**kwargs: Any) -> PlaywrightSubmitter:
     clock = StepClock()
     kwargs.setdefault("clock", clock)
@@ -1132,12 +1162,12 @@ class TestNothingIsSubmittedWithoutAnApproval:
         self, authorization: SubmitAuthorization
     ) -> None:
         with pytest.raises(SubmitNotAuthorized):
-            await submitter().submit(ForbiddenPage(), authorization)
+            await submitter().submit(ForbiddenPage(), authorization, permit())
 
     async def test_an_approved_decision_is_carried_out(self) -> None:
         frame = submitting_frame()
 
-        outcome = await submitter().submit(FakePage(frame), APPROVED)
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.submitted
 
@@ -1147,7 +1177,9 @@ class TestNothingIsSubmittedWithoutAnApproval:
             APPROVED, decision="", gate="auto_submit", blocking_reasons=()
         )
 
-        assert (await submitter().submit(FakePage(frame), authorization)).submitted
+        assert (
+            await submitter().submit(FakePage(frame), authorization, permit())
+        ).submitted
 
     def test_the_authorization_says_why_it_permits_a_submission(self) -> None:
         assert APPROVED.approved
@@ -1168,7 +1200,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         frame = submitting_frame()
         page = FakePage(frame)
 
-        assert (await submitter().submit(page, APPROVED)).submitted
+        assert (await submitter().submit(page, APPROVED, permit())).submitted
         assert presses(frame) == 1
 
     async def test_no_control_is_a_refusal_and_no_click(self) -> None:
@@ -1179,7 +1211,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         page = FakePage(frame)
 
         with pytest.raises(FinalSubmitControlNotFound) as raised:
-            await submitter().submit(page, APPROVED)
+            await submitter().submit(page, APPROVED, permit())
 
         assert presses(frame) == 0
         assert "next" in str(raised.value)
@@ -1189,7 +1221,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         page = FakePage(frame)
 
         with pytest.raises(FinalSubmitControlAmbiguous):
-            await submitter().submit(page, APPROVED)
+            await submitter().submit(page, APPROVED, permit())
 
         assert presses(frame) == 0
 
@@ -1212,7 +1244,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         page = FakePage(main, [nested])
 
         with pytest.raises(FinalSubmitControlAmbiguous):
-            await submitter().submit(page, APPROVED)
+            await submitter().submit(page, APPROVED, permit())
 
         assert main.times_run(SUBMIT_RESOLVE_SCRIPT) == 0
 
@@ -1222,7 +1254,7 @@ class TestFindingExactlyOneFinalSubmitControl:
         main = submitting_frame()
         foreign = FakeFrame("https://third-party.example/ad", {}, parent=main)
 
-        await submitter().submit(FakePage(main, [foreign]), APPROVED)
+        await submitter().submit(FakePage(main, [foreign]), APPROVED, permit())
 
         assert foreign.calls == []
 
@@ -1245,7 +1277,7 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
     async def test_the_control_is_checked_before_it_is_pressed(self) -> None:
         frame = submitting_frame()
 
-        await submitter().submit(FakePage(frame), APPROVED)
+        await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert submit_control(frame).order == ["trial", "click"]
 
@@ -1255,7 +1287,7 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
         frame = submitting_frame()
         page = FakePage(frame)
 
-        await submitter().submit(page, APPROVED)
+        await submitter().submit(page, APPROVED, permit())
 
         assert presses(frame) == 1
         assert page.mouse.presses == 0
@@ -1265,7 +1297,7 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
         frame = submitting_frame()
         page = FakePage(frame)
 
-        await submitter().submit(page, APPROVED)
+        await submitter().submit(page, APPROVED, permit())
 
         assert len(page.mouse.moves) > 1
 
@@ -1284,7 +1316,7 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
         page = FakePage(frame)
 
         with pytest.raises(FinalSubmitControlNotActionable) as raised:
-            await submitter().submit(page, APPROVED)
+            await submitter().submit(page, APPROVED, permit())
 
         assert presses(frame) == 0
         assert page.mouse.presses == 0
@@ -1299,7 +1331,7 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
         )
 
         with pytest.raises(FinalSubmitControlNotActionable):
-            await submitter().submit(FakePage(frame), APPROVED)
+            await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert presses(frame) == 1
 
@@ -1315,7 +1347,7 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
         )
 
         with pytest.raises(FinalSubmitControlNotFound) as raised:
-            await submitter().submit(FakePage(frame), APPROVED)
+            await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert presses(frame) == 0
         assert "container" in str(raised.value)
@@ -1324,9 +1356,114 @@ class TestThePressIsAVerifiedClickRatherThanACoordinate:
         frame = submitting_frame(element=FakeElement(boxless=True))
 
         with pytest.raises(FinalSubmitControlNotFound):
-            await submitter().submit(FakePage(frame), APPROVED)
+            await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert presses(frame) == 0
+
+
+class TestWhenTheOnePressIsClaimed:
+    """Last thing before the click, and nothing between the two.
+
+    The claim is durable and never expires, so it is the application's one
+    attempt. Taken any earlier, every refusal that follows it — a control
+    worded so the accessible-name rules reject it, two controls, a cookie
+    banner that animated in over the one control — spends an attempt on a
+    page nothing was clicked on, and the operator who fixes that page finds
+    an application that can never be sent.
+
+    Taken any later, a worker killed between the claim and the press leaves
+    a thread that looks exactly like one that never pressed, and the replay
+    presses a second time. So the order is: resolve, check the rules, let
+    the driver confirm the control is really clickable, claim, click.
+    """
+
+    async def test_it_is_claimed_after_the_check_and_before_the_click(self) -> None:
+        claim = RecordedClaim()
+        element = FakeElement()
+        element.order = claim.log
+        frame = submitting_frame(element=element)
+
+        await submitter().submit(FakePage(frame), APPROVED, permit(claim))
+
+        assert claim.log == ["trial", "claim", "click"]
+
+    async def test_a_control_the_rules_reject_never_claims_it(self) -> None:
+        claim = RecordedClaim()
+        frame = submitting_frame(
+            accepted=(), rejected=({"name": "Next", "reason": "not a final submit"},)
+        )
+
+        with pytest.raises(FinalSubmitControlNotFound):
+            await submitter().submit(FakePage(frame), APPROVED, permit(claim))
+
+        assert claim.calls == 0
+
+    async def test_a_control_something_is_covering_never_claims_it(self) -> None:
+        claim = RecordedClaim()
+        frame = submitting_frame(
+            element=FakeElement(
+                trial_error=TimeoutError("element is not receiving pointer events")
+            )
+        )
+
+        with pytest.raises(FinalSubmitControlNotActionable):
+            await submitter().submit(FakePage(frame), APPROVED, permit(claim))
+
+        assert claim.calls == 0
+
+    async def test_an_unapproved_submission_never_claims_it(self) -> None:
+        claim = RecordedClaim()
+        frame = submitting_frame()
+
+        with pytest.raises(SubmitNotAuthorized):
+            await submitter().submit(
+                FakePage(frame),
+                dataclasses.replace(APPROVED, decision=""),
+                permit(claim),
+            )
+
+        assert claim.calls == 0
+
+    async def test_a_press_nothing_confirmed_still_claimed_it(self) -> None:
+        """The click landed. Whether the page said so is a separate question."""
+        claim = RecordedClaim()
+        frame = submitting_frame(after=(state(),))
+
+        outcome = await submitter(confirm_timeout_ms=400).submit(
+            FakePage(frame), APPROVED, permit(claim)
+        )
+
+        assert not outcome.submitted
+        assert claim.calls == 1
+
+    async def test_a_claim_the_record_refuses_stops_the_press(self) -> None:
+        """The replay case: another attempt already pressed this one.
+
+        The submitter gets no further than the claim, so the control is
+        never pressed a second time — and the refusal that comes back names
+        the earlier attempt rather than being reported as a fresh failure.
+        """
+        already = SubmitAlreadyAttempted(
+            APPROVED.application_id,
+            "worker-1",
+            datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        )
+        claim = RecordedClaim(error=already)
+        frame = submitting_frame()
+
+        with pytest.raises(SubmitAlreadyAttempted):
+            await submitter().submit(FakePage(frame), APPROVED, permit(claim))
+
+        assert presses(frame) == 0
+
+    async def test_the_permit_it_was_given_is_the_one_it_claims(self) -> None:
+        """Not a claim of its own: the graph checks this exact object."""
+        offered = permit()
+        frame = submitting_frame()
+
+        await submitter().submit(FakePage(frame), APPROVED, offered)
+
+        assert offered.claimed
 
 
 class TestReportingASubmission:
@@ -1335,7 +1472,7 @@ class TestReportingASubmission:
     async def test_a_confirmation_that_appears_after_the_click_is_enough(self) -> None:
         frame = submitting_frame(after=(state(confirmations=[CONFIRMED]),))
 
-        outcome = await submitter().submit(FakePage(frame), APPROVED)
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.submitted
         assert "confirmation" in outcome.reason
@@ -1347,7 +1484,7 @@ class TestReportingASubmission:
             after=(state(url="https://ats.example.com/thank-you", marked=False),)
         )
 
-        outcome = await submitter().submit(FakePage(frame), APPROVED)
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.submitted
         assert "thank-you" in outcome.reason
@@ -1357,14 +1494,14 @@ class TestReportingASubmission:
             after=(state(), state(), state(confirmations=[CONFIRMED])),
         )
 
-        assert (await submitter().submit(FakePage(frame), APPROVED)).submitted
+        assert (await submitter().submit(FakePage(frame), APPROVED, permit())).submitted
         assert frame.times_run(SUBMIT_STATE_SCRIPT) >= 4
 
     async def test_no_signal_at_all_is_not_a_submission(self) -> None:
         frame = submitting_frame(after=(state(),))
 
         outcome = await submitter(confirm_timeout_ms=400).submit(
-            FakePage(frame), APPROVED
+            FakePage(frame), APPROVED, permit()
         )
 
         assert outcome.submitted is False
@@ -1375,7 +1512,7 @@ class TestReportingASubmission:
         frame = submitting_frame(after=(state(),))
         page = FakePage(frame)
 
-        await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+        await submitter(confirm_timeout_ms=400).submit(page, APPROVED, permit())
 
         assert presses(frame) == 1
 
@@ -1383,7 +1520,7 @@ class TestReportingASubmission:
         frame = submitting_frame(after=(state(),))
 
         outcome = await submitter(confirm_timeout_ms=400).submit(
-            FakePage(frame), APPROVED
+            FakePage(frame), APPROVED, permit()
         )
 
         assert "confirmation" in outcome.reason
@@ -1434,7 +1571,7 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
     ) -> None:
         page, _inner = self._framed_page(after=(state(url="https://ats.example.com/embedded-form"),))
 
-        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED, permit())
 
         assert outcome.submitted is False
 
@@ -1442,7 +1579,7 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
         """The child frame's URL differs from the top page's by definition."""
         page, _inner = self._framed_page(after=(state(url="https://ats.example.com/embedded-form"),))
 
-        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED, permit())
 
         assert outcome.submitted is False
         assert "navigation" in outcome.reason
@@ -1463,7 +1600,7 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
             top_after=(standing,),
         )
 
-        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED)
+        outcome = await submitter(confirm_timeout_ms=400).submit(page, APPROVED, permit())
 
         assert outcome.submitted is False
 
@@ -1474,7 +1611,7 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
         frame = submitting_frame(baseline=standing, after=(standing,))
 
         outcome = await submitter(confirm_timeout_ms=400).submit(
-            FakePage(frame), APPROVED
+            FakePage(frame), APPROVED, permit()
         )
 
         assert outcome.submitted is False
@@ -1491,7 +1628,7 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
             ),
         )
 
-        outcome = await submitter().submit(FakePage(frame), APPROVED)
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.submitted
         assert CONFIRMED in outcome.reason
@@ -1500,7 +1637,7 @@ class TestEachTargetIsJudgedAgainstItsOwnBaseline:
         frame = submitting_frame()
         page = FakePage(frame)
 
-        await submitter().submit(page, APPROVED)
+        await submitter().submit(page, APPROVED, permit())
 
         assert frame.times_run(SUBMIT_STATE_SCRIPT) >= 2
 
@@ -1623,7 +1760,7 @@ class TestThePageSayingItRefusedTheSubmission:
         )
         page = FakePage(frame)
 
-        outcome = await submitter().submit(page, APPROVED)
+        outcome = await submitter().submit(page, APPROVED, permit())
 
         assert outcome.submitted is False
         assert "Last name is required" in outcome.reason
@@ -1637,7 +1774,7 @@ class TestThePageSayingItRefusedTheSubmission:
             after=(dict(standing, confirmations=[CONFIRMED]),),
         )
 
-        assert (await submitter().submit(FakePage(frame), APPROVED)).submitted
+        assert (await submitter().submit(FakePage(frame), APPROVED, permit())).submitted
 
     async def test_a_challenge_that_appears_after_the_click_is_not_a_submission(
         self,
@@ -1648,7 +1785,7 @@ class TestThePageSayingItRefusedTheSubmission:
             )
         )
 
-        outcome = await submitter().submit(FakePage(frame), APPROVED)
+        outcome = await submitter().submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.submitted is False
         assert "challenge" in outcome.reason
@@ -1689,7 +1826,7 @@ class TestNoFrameCanHoldTheSubmitter:
         )
 
         outcome = await asyncio.wait_for(
-            submitter(frame_timeout_ms=20).submit(FakePage(main, [silent]), APPROVED),
+            submitter(frame_timeout_ms=20).submit(FakePage(main, [silent]), APPROVED, permit()),
             timeout=5,
         )
 
@@ -1715,7 +1852,7 @@ class TestNoFrameCanHoldTheSubmitter:
 
         outcome = await asyncio.wait_for(
             submitter(frame_timeout_ms=20, confirm_timeout_ms=400).submit(
-                page, APPROVED
+                page, APPROVED, permit()
             ),
             timeout=5,
         )
@@ -1737,7 +1874,7 @@ class TestNoFrameCanHoldTheSubmitter:
 
         outcome = await asyncio.wait_for(
             submitter(frame_timeout_ms=20, confirm_timeout_ms=400).submit(
-                FakePage(main), APPROVED
+                FakePage(main), APPROVED, permit()
             ),
             timeout=5,
         )
@@ -1754,7 +1891,7 @@ class TestNoFrameCanHoldTheSubmitter:
 
         with pytest.raises(FinalSubmitControlNotFound):
             await asyncio.wait_for(
-                submitter(frame_timeout_ms=20).submit(page, APPROVED), timeout=5
+                submitter(frame_timeout_ms=20).submit(page, APPROVED, permit()), timeout=5
             )
 
         assert presses(main) == 0
@@ -1773,7 +1910,7 @@ class TestSubmissionScreenshots:
         shots = self.Shots()
         frame = submitting_frame()
 
-        outcome = await submitter(screenshots=shots).submit(FakePage(frame), APPROVED)
+        outcome = await submitter(screenshots=shots).submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.screenshot_path == "/artifacts/submitted.png"
 
@@ -1783,7 +1920,7 @@ class TestSubmissionScreenshots:
         frame = submitting_frame(after=(state(),))
 
         outcome = await submitter(confirm_timeout_ms=400, screenshots=shots).submit(
-            FakePage(frame), APPROVED
+            FakePage(frame), APPROVED, permit()
         )
 
         assert outcome.screenshot_path == "/artifacts/unconfirmed.png"
@@ -1795,7 +1932,7 @@ class TestSubmissionScreenshots:
 
         frame = submitting_frame()
 
-        outcome = await submitter(screenshots=Broken()).submit(FakePage(frame), APPROVED)
+        outcome = await submitter(screenshots=Broken()).submit(FakePage(frame), APPROVED, permit())
 
         assert outcome.submitted
         assert outcome.screenshot_path is None

@@ -28,6 +28,7 @@ The properties under test are the ones the whole design exists for:
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -46,7 +47,10 @@ from app.agent.approval import (
 from app.agent.errors import (
     CaptchaEncountered,
     ExtensionNotFoundError,
+    FinalSubmitControlNotFound,
     LoginWallEncountered,
+    SubmitAlreadyAttempted,
+    SubmitPermitAlreadyUsed,
     TriggerFailed,
 )
 from app.agent.gap_filler import GapFillItem, GapFillPlan, Resolution
@@ -57,6 +61,7 @@ from app.agent.graph import (
     SkipKind,
     SubmitAuthorization,
     SubmitOutcome,
+    SubmitPermit,
     ThreadNotAwaitingApproval,
     UnknownQueueItem,
     build_graph,
@@ -1318,6 +1323,139 @@ class _StrayPlanFiller:
                 ),
             ),
         )
+
+
+class TestTheOnePressEachApplicationGets:
+    """The permit, and why the claim moved to the last possible moment.
+
+    The claim is durable and never expires, so spending it is spending the
+    application's only attempt. It used to be taken as soon as the submit
+    node started, which meant every refusal that came afterwards — no
+    recognisable submit control, two of them, a control something was
+    covering — burned it. Those refusals click nothing, so the application
+    was still perfectly submittable, and the operator who fixed the page
+    found it permanently unsubmittable instead.
+
+    So the submitter is handed a one-shot permit and claims it itself,
+    after it has resolved the control, checked the accessible-name rules,
+    and satisfied the driver that the control can actually be clicked. The
+    graph then checks the permit really was claimed, because a submitter
+    that pressed without claiming would have undone the whole guarantee.
+    """
+
+    async def test_a_submission_claims_the_one_press(self, world: World) -> None:
+        queue_id = world.enqueue()
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            result = await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert result.status is RunStatus.SUBMITTED
+        attempt = world.db.get_submit_attempt(staged.application_id or 0)
+        assert attempt is not None
+
+    async def test_a_refusal_before_the_press_leaves_the_attempt_unspent(
+        self, world: World
+    ) -> None:
+        """The page was wrong, not the application. It stays submittable."""
+        queue_id = world.enqueue()
+
+        async def refuse_without_clicking(
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+        ) -> SubmitOutcome:
+            raise FinalSubmitControlNotFound((("Next", "never a final submit"),))
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.submitter.submit = refuse_without_clicking  # type: ignore[method-assign]
+            refused = await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert refused.status is RunStatus.FAILED
+        assert world.db.get_submit_attempt(staged.application_id or 0) is None
+
+    async def test_a_submitter_that_reports_a_press_it_never_claimed_fails(
+        self, world: World
+    ) -> None:
+        """The guarantee is only as good as the permit being used.
+
+        A submitter that clicked without claiming would leave the next
+        replay free to click again, so an unclaimed permit alongside a
+        reported outcome is treated as the failure it is — and the
+        application is not recorded as submitted on its word.
+        """
+        queue_id = world.enqueue()
+
+        async def press_without_claiming(
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+        ) -> SubmitOutcome:
+            return SubmitOutcome(submitted=True, reason="claimed nothing")
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.submitter.submit = press_without_claiming  # type: ignore[method-assign]
+            result = await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert result.status is RunStatus.FAILED
+        record = world.db.get_application(staged.application_id or 0)
+        assert record is not None
+        assert record.status is ApplicationStatus.FAILED
+
+    async def test_an_unconfirmed_press_still_spent_the_attempt(
+        self, world: World
+    ) -> None:
+        """A click that landed is a click, however it was reported."""
+        queue_id = world.enqueue()
+
+        async def click_and_shrug(
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+        ) -> SubmitOutcome:
+            permit.claim()
+            return SubmitOutcome(submitted=False, reason="nothing confirmed it")
+
+        async with world.runner() as runner:
+            staged = await runner.run_application(queue_id)
+            world.submitter.submit = click_and_shrug  # type: ignore[method-assign]
+            result = await runner.resume_application(
+                staged.thread_id, approve(staged.application_id)
+            )
+
+        assert result.status is RunStatus.FAILED
+        assert world.db.get_submit_attempt(staged.application_id or 0) is not None
+
+    async def test_a_permit_is_good_for_exactly_one_claim(self) -> None:
+        claims: list[int] = []
+        permit = SubmitPermit(7, lambda: claims.append(1))
+
+        assert permit.claimed is False
+        permit.claim()
+        assert permit.claimed is True
+
+        with pytest.raises(SubmitPermitAlreadyUsed):
+            permit.claim()
+        assert claims == [1]
+
+    async def test_a_permit_whose_claim_is_refused_is_not_claimed(self) -> None:
+        """And is still spent: a second try would race the first."""
+
+        def refuse() -> None:
+            raise SubmitAlreadyAttempted(
+                7, "another worker", datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+            )
+
+        permit = SubmitPermit(7, refuse)
+
+        with pytest.raises(SubmitAlreadyAttempted):
+            permit.claim()
+
+        assert permit.claimed is False
+        with pytest.raises(SubmitPermitAlreadyUsed):
+            permit.claim()
 
 
 class TestWhatAuthorizesASubmission:

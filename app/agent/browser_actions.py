@@ -75,7 +75,7 @@ from app.agent.form_scanner import (
     frame_chain,
     same_origin_frames,
 )
-from app.agent.graph import SubmitAuthorization, SubmitOutcome
+from app.agent.graph import SubmitAuthorization, SubmitOutcome, SubmitPermit
 from app.agent.humanize import Humanizer
 
 logger = logging.getLogger(__name__)
@@ -1369,8 +1369,16 @@ class PlaywrightSubmitter:
         return self._screenshots
 
     async def submit(
-        self, page: Any, authorization: SubmitAuthorization
+        self, page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
     ) -> SubmitOutcome:
+        """Resolve, check, claim, click — and only ever in that order.
+
+        Every reason not to press this page's control is found before the
+        permit is claimed, because the claim is durable and spending it on a
+        page nobody clicked leaves an application that can never be sent.
+        Once the driver has confirmed the control is genuinely clickable
+        there is nothing left between the claim and the pointer going down.
+        """
         if not authorization.approved:
             raise SubmitNotAuthorized(
                 authorization.application_id, authorization.refusal()
@@ -1393,7 +1401,7 @@ class PlaywrightSubmitter:
         # Every target that will be watched afterwards is read *now*, and
         # each is only ever compared with its own reading. See `PageState`.
         baselines = await self._baselines(page, frame)
-        await self._click_the_only_submit(page, frame, name)
+        await self._click_the_only_submit(page, frame, name, permit)
         return await self._await_confirmation(page, baselines)
 
     async def _baselines(self, page: Any, frame: Any) -> list[tuple[Any, PageState]]:
@@ -1475,7 +1483,9 @@ class PlaywrightSubmitter:
             raise FinalSubmitControlNotFound(rejected)
         return holders[0], accepted[0]
 
-    async def _click_the_only_submit(self, page: Any, frame: Any, name: str) -> None:
+    async def _click_the_only_submit(
+        self, page: Any, frame: Any, name: str, permit: SubmitPermit
+    ) -> None:
         try:
             handle = await asyncio.wait_for(
                 frame.evaluate_handle(SUBMIT_RESOLVE_SCRIPT), self._frame_timeout_s
@@ -1498,11 +1508,13 @@ class PlaywrightSubmitter:
                 (("", "the counted submit control could not be resolved again"),)
             )
         try:
-            await self._press(page, element, name)
+            await self._press(page, element, name, permit)
         finally:
             await _dispose_quietly(element)
 
-    async def _press(self, page: Any, element: Any, name: str) -> None:
+    async def _press(
+        self, page: Any, element: Any, name: str, permit: SubmitPermit
+    ) -> None:
         """Verify the control can be clicked, then let the driver click it.
 
         The press itself is the driver's own trusted click rather than a
@@ -1515,8 +1527,9 @@ class PlaywrightSubmitter:
 
         The check runs first with the press withheld (`trial=True`), so
         every reason not to click is found before anything is spent on this
-        application. The pointer still travels there first, because that
-        movement is what a page's own listeners see.
+        application — and only then is the permit claimed. The pointer
+        travels there before the claim, because moving a pointer submits
+        nothing and the movement is what a page's own listeners see.
         """
         scroll = getattr(element, "scroll_into_view_if_needed", None)
         if scroll is not None:
@@ -1541,6 +1554,10 @@ class PlaywrightSubmitter:
             except Exception:  # noqa: BLE001 - the travel is realism, not the click
                 pass
 
+        # The last thing before the click, and after every check that could
+        # still have refused. A crash between these two lines leaves the
+        # attempt recorded, which is what stops a replay pressing again.
+        permit.claim()
         try:
             await element.click(timeout=self._click_timeout_ms)
         except Exception as error:  # noqa: BLE001

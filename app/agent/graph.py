@@ -110,6 +110,8 @@ from app.agent.errors import (
     ServiceWorkerUnresponsiveError,
     StagingArtefactsLost,
     SubmitAlreadyAttempted,
+    SubmitPermitAlreadyUsed,
+    SubmitPermitNotClaimed,
     TriggerFailed,
     UnknownAtsLayout,
 )
@@ -450,6 +452,56 @@ class SubmitAuthorization:
         return f"the recorded decision is {self.decision!r}, not approved"
 
 
+class SubmitPermit:
+    """The one press this application is allowed, not yet taken.
+
+    The claim behind it is durable and never expires, so spending it spends
+    the application's only attempt. It used to be taken as the submit node
+    started, which meant every refusal that came afterwards — no
+    recognisable submit control, two of them, a control something had
+    animated in over — spent it. Those refusals click nothing, so the form
+    was still perfectly submittable, and the operator who fixed the page
+    found an application that could never be sent.
+
+    So the graph hands this down instead of claiming for itself, and the
+    submitter claims it once it has resolved the control, checked the
+    accessible-name rules against it, and satisfied the driver that it can
+    actually be clicked — immediately before the click, with nothing left
+    between the two that could refuse.
+
+    Claiming is strictly one-shot, and a claim the database refuses spends
+    the permit just the same: a second try would be a second press with the
+    first one's outcome still unknown. `claimed` is what the graph checks
+    afterwards, and it only becomes true when the durable record was really
+    written.
+    """
+
+    def __init__(self, application_id: int, claim: Callable[[], None]) -> None:
+        self.application_id = application_id
+        self._claim = claim
+        self._offered = False
+        self._claimed = False
+
+    @property
+    def claimed(self) -> bool:
+        """Whether the durable record of this press was actually written."""
+        return self._claimed
+
+    def claim(self) -> None:
+        """Record the press durably, or refuse to allow it.
+
+        Raises whatever the underlying claim raises — `SubmitAlreadyAttempted`
+        when a previous attempt already pressed — and `SubmitPermitAlreadyUsed`
+        if asked twice. Returning normally is the only thing that means "press
+        it now".
+        """
+        if self._offered:
+            raise SubmitPermitAlreadyUsed(self.application_id)
+        self._offered = True
+        self._claim()
+        self._claimed = True
+
+
 @dataclass(frozen=True)
 class RunResult:
     """The outcome of one `run_application` or `resume_application` call."""
@@ -577,10 +629,18 @@ class Submitter(Protocol):
     The authorization is passed rather than assumed so that an
     implementation can refuse an unreleased application itself instead of
     trusting whichever code path called it.
+
+    The permit is the press itself. An implementation must claim it
+    immediately before clicking and after every check that could still
+    refuse, and must not return an outcome without having claimed it: a
+    returned `SubmitOutcome` is a report that the control was pressed, and
+    the graph reads an unclaimed permit alongside one as the contradiction
+    it is. Refusing (by raising `SubmitRefused`) before any click leaves the
+    permit unspent, which is what keeps a fixable page submittable.
     """
 
     async def submit(
-        self, page: Any, authorization: SubmitAuthorization
+        self, page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
     ) -> SubmitOutcome: ...
 
 
@@ -958,11 +1018,12 @@ def build_graph(
     def claim_the_press(state: ApplicationState) -> None:
         """Take the one press this application is allowed, or refuse.
 
-        Claimed here rather than inside the submitter because the danger is
-        a *replay* of this node, and the submitter is a fresh object with no
-        memory of the attempt the last process made. The claim is recorded
-        by the worker holding the thread's lease — which is by definition
-        whoever is about to press — and outlives it.
+        Durable and never expiring, because the danger is a *replay* of this
+        node: the submitter is a fresh object with no memory of the attempt
+        the last process made, and a thread whose presser was killed
+        mid-submit looks exactly like one that never pressed. The claim is
+        recorded by the worker holding the thread's lease — which is by
+        definition whoever is about to press — and outlives it.
         """
         application_id = state["application_id"]
         lease = deps.db.get_lease(state["thread_id"])
@@ -974,16 +1035,25 @@ def build_graph(
             raise SubmitAlreadyAttempted(application_id, held.owner, held.attempted_at)
 
     async def submit(state: ApplicationState) -> dict[str, Any]:
+        # Handed down rather than claimed here: everything between this node
+        # starting and the pointer going down can still refuse, and a
+        # refusal that clicked nothing must leave the application
+        # submittable. See `SubmitPermit`.
+        permit = SubmitPermit(state["application_id"], lambda: claim_the_press(state))
         try:
             page = await require_page(state)
             # The last look at the page before the last click. A challenge
             # that appeared while the application sat at the gate is not
             # something to click Submit underneath.
             await guard(page)
-            # Then the press is claimed, in that order: a captcha found at
-            # the gate must not spend an application's one attempt.
-            claim_the_press(state)
-            outcome = await deps.submitter.submit(page, _authorization(state))
+            outcome = await deps.submitter.submit(page, _authorization(state), permit)
+            if not permit.claimed:
+                # An outcome means "I pressed it". Without the claim behind
+                # it, a replay of this node would press again.
+                raise SubmitPermitNotClaimed(
+                    state["application_id"],
+                    outcome.reason or f"submitted={outcome.submitted}",
+                )
         except GraphBubbleUp:
             raise
         except Exception as exc:  # noqa: BLE001 - contained like any other node

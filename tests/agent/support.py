@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator, Sequence
 import pytest
 
 from app.agent.approval import ApprovalService
+from app.agent.errors import SubmitNotAuthorized
 from app.agent.form_scanner import FormField, FormSnapshot, SettleResult
 from app.agent.gap_filler import AnswerBook, GapFiller
 from app.agent.graph import (
@@ -27,6 +28,7 @@ from app.agent.graph import (
     GraphDependencies,
     SubmitAuthorization,
     SubmitOutcome,
+    SubmitPermit,
     sqlite_checkpointer,
 )
 from app.agent.jobright_trigger import TierAttempt, TriggerResult, TriggerTier
@@ -239,17 +241,22 @@ class FakeSubmitter:
         )
         self.calls = 0
         self.authorizations: list[SubmitAuthorization] = []
+        self.permits: list[SubmitPermit] = []
 
     async def submit(
-        self, page: Any, authorization: SubmitAuthorization
+        self, page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
     ) -> SubmitOutcome:
         self.calls += 1
         self.authorizations.append(authorization)
+        self.permits.append(permit)
         if not authorization.approved:
-            return SubmitOutcome(
-                submitted=False,
-                reason=f"refused to submit because {authorization.refusal()}",
+            # Refused before anything was clicked, so the one press this
+            # application gets stays unspent — the order the real submitter
+            # checks in too.
+            raise SubmitNotAuthorized(
+                authorization.application_id, authorization.refusal()
             )
+        permit.claim()
         return self.outcome
 
 

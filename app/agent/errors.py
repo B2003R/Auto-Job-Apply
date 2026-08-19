@@ -473,6 +473,47 @@ class SubmitAlreadyAttempted(SubmitRefused):
         )
 
 
+class SubmitPermitAlreadyUsed(SubmitRefused):
+    """Raised when one application's permit is offered a second claim.
+
+    The permit exists so that the durable claim is taken once, at the last
+    moment before the press. Asking it twice means the caller either lost
+    track of whether it had already pressed, or is trying again after a
+    claim that failed — and both are how a duplicate application happens.
+    The second ask is refused rather than passed on to the database.
+    """
+
+    def __init__(self, application_id: int) -> None:
+        self.application_id = application_id
+        super().__init__(
+            f"The one press permitted for application {application_id} has "
+            "already been spent by this submitter; a permit is good for a "
+            "single claim and is never re-offered. Nothing further was clicked."
+        )
+
+
+class SubmitPermitNotClaimed(SubmitRefused):
+    """Raised when a submitter reports an attempt it never claimed.
+
+    "One press per application, ever" holds because the press is preceded
+    by a durable claim that no crash undoes. A submitter that returned an
+    outcome without claiming has either pressed without recording it —
+    leaving the next replay free to press again — or reported on a press it
+    never made. Neither is something to record as a submission on its word.
+    """
+
+    def __init__(self, application_id: int, reported: str) -> None:
+        self.application_id = application_id
+        self.reported = reported
+        super().__init__(
+            f"The submitter reported an outcome for application {application_id} "
+            f"({reported}) without claiming the press it was permitted, so "
+            "whether the final control was clicked is not recorded anywhere a "
+            "replay would see. It is treated as a failure: check this "
+            "application in the ATS by hand."
+        )
+
+
 class FinalSubmitControlNotFound(SubmitRefused):
     """Raised when nothing on the page is recognisably the last click.
 

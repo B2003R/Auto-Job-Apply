@@ -29,6 +29,7 @@ from app.agent.graph import (
     ApplicationRunner,
     RunStatus,
     SubmitAuthorization,
+    SubmitPermit,
     thread_id_for,
 )
 from app.config import Settings
@@ -1026,7 +1027,9 @@ class TestTheShippedWiring:
         )
 
         with pytest.raises(SubmitNotAuthorized):
-            await deps.submitter.submit(_UntouchablePage(), unreleased)
+            await deps.submitter.submit(
+                _UntouchablePage(), unreleased, _unspendable_permit()
+            )
 
     async def test_the_submitter_refuses_a_rejected_application(
         self, tmp_path: Path
@@ -1041,7 +1044,9 @@ class TestTheShippedWiring:
         )
 
         with pytest.raises(SubmitNotAuthorized):
-            await deps.submitter.submit(_UntouchablePage(), rejected)
+            await deps.submitter.submit(
+                _UntouchablePage(), rejected, _unspendable_permit()
+            )
 
     async def test_the_writer_refuses_a_control_the_applicant_must_operate(
         self, tmp_path: Path
@@ -1082,6 +1087,20 @@ class TestTheShippedWiring:
     def test_the_wiring_needs_no_browser_to_be_inspected(self, tmp_path: Path) -> None:
         """Guards the tests above: they would be vacuous if this raised."""
         assert self._dependencies(tmp_path) is not None
+
+
+def _unspendable_permit() -> SubmitPermit:
+    """The one press, which neither refusal above may spend.
+
+    An unreleased application is still submittable once somebody releases
+    it, so a refusal that claimed the press would leave it permanently
+    unsendable.
+    """
+
+    def claim() -> None:
+        raise AssertionError("the press was claimed, so a refusal spent it")
+
+    return SubmitPermit(1, claim)
 
 
 class _UntouchablePage:

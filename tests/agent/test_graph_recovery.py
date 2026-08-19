@@ -48,6 +48,7 @@ from app.agent.graph import (
     SkipKind,
     SubmitAuthorization,
     SubmitOutcome,
+    SubmitPermit,
     ThreadNotAwaitingApproval,
     _auto_submittable,
     _blocking,
@@ -248,7 +249,9 @@ class TestConcurrentResumes:
         """
         queue_id = world.enqueue()
 
-        async def explode(page: Any, authorization: SubmitAuthorization) -> SubmitOutcome:
+        async def explode(
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+        ) -> SubmitOutcome:
             raise Crash("the worker died mid-submit")
 
         async with world.runner() as runner:
@@ -417,9 +420,12 @@ class TestExecutionOwnership:
         submitting = asyncio.Event()
         finish = asyncio.Event()
 
-        async def slow(page: Any, authorization: SubmitAuthorization) -> SubmitOutcome:
+        async def slow(
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+        ) -> SubmitOutcome:
             submitting.set()
             await finish.wait()
+            permit.claim()
             return SubmitOutcome(submitted=True, reason="eventually")
 
         async with world.runner(
@@ -471,24 +477,30 @@ class TestMidFlightThreads:
     """
 
     async def _staged_then_died_in_submit(self, world: World, queue_id: int) -> str:
-        """Stage, decide, then die *before* anything was pressed.
+        """Stage, decide, then die inside the submitter, before the press.
 
-        The crash is put in the page guard, which the submit node runs
-        immediately before it claims its one press. That is what makes these
-        threads recoverable: the successor can see that no press was ever
-        claimed, and pressing is still the right thing to do. A crash on the
-        other side of that claim is a different situation with a different
+        The submitter is handed the one press this application gets and dies
+        while it is still working out whether the page can be pressed at
+        all — so it never claims it. That is what makes these threads
+        recoverable: the successor can see that no press was ever claimed,
+        and pressing is still the right thing to do. A crash on the other
+        side of that claim is a different situation with a different
         answer — see
         `test_a_click_a_crash_interrupted_is_not_sent_a_second_time`.
         """
+
+        async def die_before_claiming(
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
+        ) -> SubmitOutcome:
+            raise Crash("the worker died between approving and pressing")
+
         async with world.runner() as runner:
             staged = await runner.run_application(queue_id)
-            world.guard.error = Crash("the worker died between approving and submitting")
+            world.submitter.submit = die_before_claiming  # type: ignore[method-assign]
             with pytest.raises(Crash):
                 await runner.resume_application(
                     staged.thread_id, approve(staged.application_id)
                 )
-        world.guard.error = None
         return staged.thread_id
 
     async def test_a_resume_continues_it_and_returns_the_real_outcome(
@@ -526,18 +538,20 @@ class TestMidFlightThreads:
         this one — the page has already had the application, and a second
         press is a second application with somebody's name on it.
 
-        So the attempt is claimed before the click and the claim outlives
-        the process. The successor finds it, does not press anything, and
-        fails the application with an outcome nobody can confirm — which is
-        a person checking one ATS by hand, rather than a duplicate.
+        So the attempt is claimed immediately before the click and the claim
+        outlives the process. The successor's submitter gets as far as
+        asking for the press, is refused, and presses nothing — and the
+        application fails with an outcome nobody can confirm, which is a
+        person checking one ATS by hand rather than a duplicate.
         """
         world = build_world(tmp_path)
         queue_id = world.enqueue()
         clicked = {"count": 0}
 
         async def click_then_die(
-            page: Any, authorization: SubmitAuthorization
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
         ) -> SubmitOutcome:
+            permit.claim()
             clicked["count"] += 1
             raise Crash("the worker was killed after the submit click landed")
 
@@ -549,15 +563,13 @@ class TestMidFlightThreads:
                     staged.thread_id, approve(staged.application_id)
                 )
 
-        successor_submitter = FakeSubmitter()
-        world.submitter.submit = successor_submitter.submit  # type: ignore[method-assign]
+        world.submitter.submit = click_then_die  # type: ignore[method-assign]
         async with world.runner() as successor:
             result = await successor.resume_application(
                 staged.thread_id, approve(staged.application_id)
             )
 
         assert clicked["count"] == 1
-        assert successor_submitter.calls == 0
         assert result.status is RunStatus.FAILED
         record = world.db.get_application(staged.application_id or 0)
         assert record is not None
@@ -605,10 +617,11 @@ class TestMidFlightThreads:
         finish = asyncio.Event()
 
         async def slow(
-            page: Any, authorization: SubmitAuthorization
+            page: Any, authorization: SubmitAuthorization, permit: SubmitPermit
         ) -> SubmitOutcome:
             submitting.set()
             await finish.wait()
+            permit.claim()
             return SubmitOutcome(submitted=True, reason="filed after a long pause")
 
         async with world.runner(owner="the-real-worker") as winner:
