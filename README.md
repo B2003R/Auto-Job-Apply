@@ -319,12 +319,24 @@ exclusive — naming both would hide which one a run actually used. `--json`
 works in both modes.
 
 **Exit codes**, for anything scripting this: `0` means what you asked for
-happened, `1` means it did not, and `2` is a usage error. A `run` that
-reaches `--timeout` before its listings are ready for a decision exits `1`
-— they are still being worked on server-side, but nothing is waiting for
-you yet, and a batch script must not read "still staging" as "ready for
-review". Under `--json` that explanation goes to stderr so the document on
-stdout stays parseable.
+happened, `1` means it did not, `2` is a usage error, and `130` is Ctrl-C.
+A `run` that reaches `--timeout` before its listings are ready for a
+decision exits `1` — they are still being worked on server-side, but
+nothing is waiting for you yet, and a batch script must not read "still
+staging" as "ready for review".
+
+**Under `--json`, stdout is the document and nothing else.** Everything
+else the command has to say — what it queued, what failed, what it is
+asking you at the gate — goes to stderr, so `run_batch --json ... | jq`
+works and you still see the narration in a terminal. When a run fails
+before it has anything to report, stdout is *empty* rather than an empty
+list: the exit code is how you tell, and `[]` would read as "nothing to
+do" to a script that forgot to check.
+
+**Ctrl-C stops the browser first.** An interrupt during a `--local` batch
+— during startup or mid-drain — closes the browser and releases the
+profile lock before the process ends, so the next run does not meet a lock
+file belonging to a pid that no longer exists.
 
 ### `--local`: an in-process worker
 

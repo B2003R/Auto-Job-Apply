@@ -235,14 +235,18 @@ def main(
 
     if args.command is None:
         parser.print_usage(file=sys.stderr)
-        out("say what to do: queue, status, pending, run, approve, or reject")
+        _aside(
+            out,
+            args.json,
+            "say what to do: queue, status, pending, run, approve, or reject",
+        )
         return 2
 
     problem = _usage_problem(args)
     if problem is not None:
         # Before either mode is entered, so a mistyped command is answered
         # without a server having to be reachable to say so.
-        out(problem)
+        _aside(out, args.json, problem)
         return 2
 
     if args.local:
@@ -379,10 +383,12 @@ def _local(
     reader: Reader | None,
 ) -> int:
     if args.command != "run":
-        out(
+        _aside(
+            out,
+            args.json,
             f"`{args.command}` needs the control plane: --local starts a worker "
             "for one batch and stops it again, so there is nothing for a "
-            "second command to talk to."
+            "second command to talk to.",
         )
         return 2
     return asyncio.run(_local_run(args, settings, worker_factory, out, reader))
@@ -398,47 +404,60 @@ async def _local_run(
     factory = worker_factory or _default_worker_factory
     worker = factory(settings)
 
-    try:
-        await worker.start()
-    except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
-        # `start()` opens the browser before it can fail, so a start that
-        # raises may already own a Chrome and a profile lock. Stopping
-        # first is what keeps that lock from outliving the process and
-        # refusing every later run, local or served.
-        teardown = await _stop_quietly(worker)
-        out(f"the worker could not be started: {exc}")
-        if teardown is not None:
-            out(f"  cleaning up afterwards also failed: {teardown}")
-        return 1
+    def note(message: str) -> None:
+        """Everything that is not the answer.
+
+        Under `--json` the answer is a document on stdout and this goes to
+        stderr, so a human still reads the narration and a pipe does not
+        have to.
+        """
+        _aside(out, args.json, message)
 
     code = 0
     try:
-        for url in args.urls:
-            queue_id = worker.db.enqueue_job(url, args.board)
-            out(f"queued {url} as run {queue_id}")
-        results = await worker.drain()
-        if args.prompt:
-            results = await _prompt_each(worker, results, args.actor, out, reader)
-        _report_local(out, args.json, results)
-    except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
-        out(f"the local batch could not be completed: {exc}")
-        code = 1
+        try:
+            await worker.start()
+        except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
+            note(f"the worker could not be started: {exc}")
+            return 1
 
-    # Always, and never by raising: a worker left running holds the profile
-    # lock, and a teardown failure the operator is not told about is a lock
-    # they will meet later without knowing why.
-    teardown = await _stop_quietly(worker)
-    if teardown is not None:
-        out(f"the worker could not be shut down cleanly: {teardown}")
-        code = code or 1
+        try:
+            for url in args.urls:
+                queue_id = worker.db.enqueue_job(url, args.board)
+                note(f"queued {url} as run {queue_id}")
+            results = await worker.drain()
+            if args.prompt:
+                results = await _prompt_each(worker, results, args.actor, note, reader)
+            _report_local(out, args.json, results)
+        except Exception as exc:  # noqa: BLE001 - a CLI reports, it does not traceback
+            note(f"the local batch could not be completed: {exc}")
+            code = 1
+    finally:
+        # In a `finally`, so that a `KeyboardInterrupt` or a `CancelledError`
+        # — neither of which is an `Exception`, and the first of which is how
+        # most long batches actually end — cannot leave a browser running and
+        # a profile lock behind for the next run to trip over. It covers the
+        # partial start too: `start()` opens Chrome before it can fail.
+        teardown = await _stop_quietly(worker)
+        if teardown is not None:
+            note(f"the worker could not be shut down cleanly: {teardown}")
+            code = code or 1
     return code
 
 
 async def _stop_quietly(worker: ApplicationWorker) -> BaseException | None:
-    """Stop the worker, handing back whatever went wrong instead of raising."""
+    """Stop the worker, handing back whatever went wrong instead of raising.
+
+    `BaseException` deliberately. This runs while the caller may already be
+    unwinding a `KeyboardInterrupt`, and an exception raised out of here
+    would replace it: the operator would be shown a teardown detail in
+    place of the interrupt they caused, and a second impatient Ctrl-C
+    would become the story instead of the first. What went wrong is
+    returned and reported; what the caller was already doing wins.
+    """
     try:
         await worker.stop()
-    except Exception as exc:  # noqa: BLE001 - reported by the caller
+    except BaseException as exc:  # noqa: BLE001 - reported, never re-raised
         return exc
     return None
 
@@ -597,5 +616,25 @@ def thread_of(queue_id: int) -> str:
     return thread_id_for(queue_id)
 
 
+def run(
+    argv: Sequence[str] | None = None,
+    *,
+    entry: Callable[[Sequence[str] | None], int] | None = None,
+) -> int:
+    """The process boundary: turn an interrupt into an exit code.
+
+    `main` re-raises `KeyboardInterrupt` on purpose, so that anything
+    embedding it — a script, an outer `finally` — can tell an interrupted
+    run from a failed one. A shell cannot: to it, 130 and silence is what
+    an interrupted command looks like, and a traceback is just noise
+    printed after the operator has already decided to stop.
+    """
+    command = entry if entry is not None else main
+    try:
+        return command(argv)
+    except KeyboardInterrupt:
+        return 130
+
+
 if __name__ == "__main__":  # pragma: no cover - process entry point
-    raise SystemExit(main())
+    raise SystemExit(run())

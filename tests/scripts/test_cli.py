@@ -9,6 +9,7 @@ nothing is submitted anywhere.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -16,7 +17,7 @@ import os
 import sqlite3
 from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 import httpx
 import pytest
@@ -47,6 +48,29 @@ SECOND_LISTING = "https://www.linkedin.com/jobs/view/2/"
 def _csv_rows(text: str) -> list[dict[str, str]]:
     """Parse an export as a CSV document, embedded newlines and all."""
     return list(csv.DictReader(io.StringIO(text)))
+
+
+def worker_factory_for(harness: Harness, cls: type[ApplicationWorker]) -> Any:
+    """A local-mode worker factory that builds one particular subclass.
+
+    The subclasses are how a test makes a real worker fail at a chosen
+    moment — during `start()`, during `drain()`, during `stop()` — without
+    a browser being involved in either the failure or the recovery.
+    """
+
+    def factory(settings: Settings) -> ApplicationWorker:
+        worker = cls(
+            settings,
+            db=harness.world.db,
+            session_factory=harness.session_factory,
+            dependencies_factory=lambda _s, _d, _c: harness.world.deps,
+            checkpointer_path=harness.world.checkpoint_path,
+            run_loop=False,
+        )
+        harness.workers.append(worker)
+        return worker
+
+    return factory
 
 
 class Console:
@@ -436,11 +460,146 @@ class TestWatching:
         assert console.json()[0]["state"] == "pending"
 
 
+class TestInterrupting:
+    """Ctrl-C is the commonest way a local run ends, not an exotic one.
+
+    A batch is a browser, a profile lock, and a wait long enough that
+    people interrupt it. `KeyboardInterrupt` and `CancelledError` derive
+    from `BaseException`, not `Exception`, so every `except Exception`
+    around startup and draining let them past without stopping the worker:
+    the lock file stayed behind and the next run — local or served —
+    refused to start, naming a pid that no longer existed.
+    """
+
+    def _run(
+        self,
+        harness: Harness,
+        cls: type[ApplicationWorker],
+        console: Console,
+        *extra: str,
+    ) -> int:
+        return run_batch.main(
+            ["--local", *extra, "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=worker_factory_for(harness, cls),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+    def test_an_interrupt_during_startup_still_closes_the_browser(
+        self, harness: Harness, interrupt: type[BaseException]
+    ) -> None:
+        class Interrupted(ApplicationWorker):
+            async def start(self) -> None:
+                await super().start()
+                raise interrupt()
+
+        with pytest.raises(interrupt):
+            self._run(harness, Interrupted, Console())
+
+        assert harness.sessions[0].closes == 1
+
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, asyncio.CancelledError])
+    def test_an_interrupt_during_the_batch_still_closes_the_browser(
+        self, harness: Harness, interrupt: type[BaseException]
+    ) -> None:
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise interrupt()
+
+        with pytest.raises(interrupt):
+            self._run(harness, Interrupted, Console())
+
+        assert harness.sessions[0].closes == 1
+
+    def test_an_interrupt_is_re_raised_rather_than_becoming_an_exit_code(
+        self, harness: Harness
+    ) -> None:
+        """Ctrl-C is not a failed batch; it is the operator taking over.
+
+        Swallowing it into a return code would leave the caller — a shell
+        script, or a `finally` further up — unable to tell an interrupted
+        run from one that simply failed.
+        """
+
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise KeyboardInterrupt()
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run(harness, Interrupted, Console())
+
+    def test_a_teardown_failure_does_not_replace_the_interrupt(
+        self, harness: Harness
+    ) -> None:
+        """The original exception is the one the operator caused."""
+
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise KeyboardInterrupt()
+
+            async def stop(self) -> None:
+                await super().stop()
+                raise RuntimeError("the profile lock could not be released")
+
+        console = Console()
+
+        with pytest.raises(KeyboardInterrupt):
+            self._run(harness, Interrupted, console)
+
+        assert harness.sessions[0].closes == 1
+        assert "could not be shut down cleanly" in console.text
+
+    def test_a_second_interrupt_during_teardown_does_not_replace_the_first(
+        self, harness: Harness
+    ) -> None:
+        """Ctrl-C twice is what an impatient operator does.
+
+        The second one arriving mid-teardown must not be what propagates:
+        the run is already unwinding, and swapping the exception would lose
+        the reason it started.
+        """
+
+        class Interrupted(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise KeyboardInterrupt("the first one")
+
+            async def stop(self) -> None:
+                await super().stop()
+                raise KeyboardInterrupt("the second one")
+
+        with pytest.raises(KeyboardInterrupt, match="the first one"):
+            self._run(harness, Interrupted, Console())
+
+    def test_the_entry_point_turns_an_interrupt_into_the_usual_exit_code(
+        self,
+    ) -> None:
+        """130 and silence is what a shell expects of an interrupted command.
+
+        Re-raising is right inside `main`, where a caller may want to
+        distinguish it; at the process boundary it would only be a
+        traceback nobody reads.
+        """
+
+        def interrupted(argv: Sequence[str] | None) -> int:
+            raise KeyboardInterrupt()
+
+        assert run_batch.run(entry=interrupted) == 130
+
+    def test_the_entry_point_passes_an_ordinary_exit_code_through(self) -> None:
+        assert run_batch.run(entry=lambda argv: 2) == 2
+
+
 class TestLocalBatch:
     """`--local` runs an in-process worker instead of talking to a server."""
 
     def test_local_json_output_is_machine_readable(self, harness: Harness) -> None:
-        """`--json` was accepted and then ignored, which is the worst of both."""
+        """`--json` was accepted and then ignored, which is the worst of both.
+
+        Parsed as a whole rather than by its last line: a document is only
+        machine-readable if everything on stdout is the document.
+        """
         console = Console()
 
         code = run_batch.main(
@@ -452,7 +611,7 @@ class TestLocalBatch:
         )
 
         assert code == 0
-        payload = json.loads(console.lines[-1])
+        payload = console.json()
         assert payload[0]["queue_id"] == 1
         assert payload[0]["status"] == "awaiting_approval"
         assert payload[0]["awaiting_decision"] is True
@@ -472,9 +631,129 @@ class TestLocalBatch:
             writer=console.write,
         )
 
-        payload = json.loads(console.lines[-1])
+        payload = console.json()
         assert "interrupt" not in payload[0]
         assert "gaps" not in payload[0]
+
+
+class TestLocalJsonStaysMachineReadable:
+    """Under `--json`, stdout is the document and nothing else.
+
+    A local run narrates: what it queued, what failed, what it asked at
+    the gate. Every one of those lines went to stdout alongside the JSON,
+    so `run_batch --local --json ... | jq` failed on the first listing —
+    and the more interesting the run, the more prose there was to break
+    it. Diagnostics belong on stderr, where a human still sees them and a
+    pipe does not.
+    """
+
+    def _run(
+        self,
+        harness: Harness,
+        console: Console,
+        *extra: str,
+        cls: type[ApplicationWorker] | None = None,
+        answers: list[str] | None = None,
+    ) -> int:
+        factory = (
+            worker_factory_for(harness, cls)
+            if cls is not None
+            else (lambda settings: harness.build_worker(run_loop=False))
+        )
+        return run_batch.main(
+            ["--local", "--json", "run", LISTING_URL, "--board", "linkedin", *extra],
+            settings=harness.settings,
+            worker_factory=factory,
+            client_factory=_no_http,
+            writer=console.write,
+            reader=console.read,
+        )
+
+    def test_what_was_queued_is_not_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        console = Console()
+
+        code = self._run(harness, console)
+
+        assert code == 0
+        assert console.json()[0]["queue_id"] == 1
+        assert "queued" not in console.text
+        assert "queued" in capsys.readouterr().err
+
+    def test_a_failed_batch_puts_no_prose_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class Broken(ApplicationWorker):
+            async def drain(self) -> list[Any]:
+                raise RuntimeError("the graph fell over")
+
+        console = Console()
+
+        code = self._run(harness, console, cls=Broken)
+
+        assert code == 1
+        assert console.text == ""
+        assert "the graph fell over" in capsys.readouterr().err
+
+    def test_a_failed_startup_puts_no_prose_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class Locked(ApplicationWorker):
+            async def start(self) -> None:
+                raise ProfileLockedError(
+                    Path("/tmp/profile/.job-apply-lock.json"), None, False
+                )
+
+        console = Console()
+
+        code = self._run(harness, console, cls=Locked)
+
+        assert code == 1
+        assert console.text == ""
+        assert ".job-apply-lock.json" in capsys.readouterr().err
+
+    def test_a_teardown_failure_puts_no_prose_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        class Sticky(ApplicationWorker):
+            async def stop(self) -> None:
+                await super().stop()
+                raise RuntimeError("the profile lock could not be released")
+
+        console = Console()
+
+        code = self._run(harness, console, cls=Sticky)
+
+        assert code == 1
+        console.json()  # still exactly one document: the batch itself ran
+        assert "could not be shut down cleanly" in capsys.readouterr().err
+
+    def test_the_gate_asks_on_stderr_and_answers_on_stdout(
+        self, harness: Harness, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A prompt is for the human; the document is for the pipe."""
+        console = Console(answers=["approve", "looks right"])
+
+        code = self._run(harness, console, "--prompt", "--actor", "ada")
+
+        assert code == 0
+        assert console.json()[0]["decision"] == "approved"
+        assert "approve" in capsys.readouterr().err.lower()
+
+    def test_prose_mode_still_narrates(self, harness: Harness) -> None:
+        """Guard: routing to stderr must not silence the ordinary run."""
+        console = Console()
+
+        run_batch.main(
+            ["--local", "run", LISTING_URL, "--board", "linkedin"],
+            settings=harness.settings,
+            worker_factory=lambda settings: harness.build_worker(run_loop=False),
+            client_factory=_no_http,
+            writer=console.write,
+        )
+
+        assert "queued" in console.text
 
     @pytest.mark.parametrize(
         "argv",
@@ -673,19 +952,7 @@ class TestLocalBatch:
     def _worker_factory(
         self, harness: Harness, cls: type[ApplicationWorker]
     ) -> Any:
-        def factory(settings: Settings) -> ApplicationWorker:
-            worker = cls(
-                settings,
-                db=harness.world.db,
-                session_factory=harness.session_factory,
-                dependencies_factory=lambda _s, _d, _c: harness.world.deps,
-                checkpointer_path=harness.world.checkpoint_path,
-                run_loop=False,
-            )
-            harness.workers.append(worker)
-            return worker
-
-        return factory
+        return worker_factory_for(harness, cls)
 
     def test_a_startup_that_fails_halfway_still_closes_the_browser(
         self, harness: Harness
