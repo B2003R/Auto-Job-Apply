@@ -26,10 +26,6 @@ class QueueState(str, Enum):
 class ApplicationStatus(str, Enum):
     STAGING = "staging"
     AWAITING_APPROVAL = "awaiting_approval"
-    # A decision has been claimed and the submit path is in flight. Held only
-    # between the claim and the terminal write, it is what stops a second
-    # worker acting on the same approval.
-    RESUMING = "resuming"
     SUBMITTED = "submitted"
     REJECTED = "rejected"
     # Distinct from FAILED: the application was abandoned on purpose (an
@@ -103,6 +99,48 @@ class ApplicationField:
     required: bool
     filled: bool
     value: str | None
+
+
+@dataclass(frozen=True)
+class ExecutionLease:
+    """Permission to be the one process running a thread, for a while.
+
+    Deliberately not a status on the application row. "Where is this
+    application in its lifecycle" and "is anybody running it right now" are
+    different questions with different lifetimes, and answering both from
+    one column meant an application abandoned by a killed worker looked as
+    though a human had moved it somewhere.
+
+    Time-limited because the holder may never come back to release it. A
+    lease is only evidence of a live worker for as long as that worker keeps
+    renewing it, which is what lets a successor tell "slow" from "dead"
+    without guessing.
+    """
+
+    thread_id: str
+    owner: str
+    acquired_at: datetime
+    renewed_at: datetime
+    expires_at: datetime
+
+    def active_at(self, moment: datetime) -> bool:
+        return moment < self.expires_at
+
+    def held_by(self, owner: str) -> bool:
+        return self.owner == owner
+
+
+@dataclass(frozen=True)
+class LeaseAttempt:
+    """The result of asking for a lease, and who holds it either way.
+
+    `lease` is populated whether or not the attempt succeeded, so a caller
+    that lost can say who is running the thread and until when instead of
+    reporting a bare refusal.
+    """
+
+    acquired: bool
+    lease: ExecutionLease
 
 
 @dataclass(frozen=True)

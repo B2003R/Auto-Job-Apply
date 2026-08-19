@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterator
 
@@ -19,7 +19,9 @@ from app.storage.models import (
     ApprovalDecision,
     ApprovalRecord,
     Board,
+    ExecutionLease,
     FieldSource,
+    LeaseAttempt,
     QueueItem,
     QueueState,
 )
@@ -89,6 +91,18 @@ _SCHEMA_STATEMENTS = (
         actor TEXT NOT NULL,
         note TEXT,
         timestamp TEXT NOT NULL
+    );
+    """,
+    # One row per thread that some process is currently running. The primary
+    # key is what makes "one owner at a time" a schema fact rather than a
+    # convention two code paths have to agree on.
+    """
+    CREATE TABLE IF NOT EXISTS execution_leases (
+        thread_id TEXT PRIMARY KEY,
+        owner TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        renewed_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
     );
     """,
     """
@@ -183,6 +197,23 @@ def _assert_no_duplicates(conn: sqlite3.Connection) -> None:
         )
 
 
+#: A status this project used, briefly, to mean "a worker is resuming this".
+#: Ownership is an `execution_leases` row now, so an application still
+#: carrying it is put back where it was: awaiting a decision, with no claim
+#: on it. Leaving the value in place would make the row unreadable, since
+#: `ApplicationStatus` no longer has a member for it.
+_RETIRED_RESUMING_STATUS = "resuming"
+
+
+def _retire_resuming_status(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "applications"):
+        return
+    conn.execute(
+        "UPDATE applications SET status = ? WHERE status = ?",
+        (ApplicationStatus.AWAITING_APPROVAL.value, _RETIRED_RESUMING_STATUS),
+    )
+
+
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -229,6 +260,18 @@ def _application(row: sqlite3.Row | None) -> ApplicationRecord | None:
     )
 
 
+def _lease(row: sqlite3.Row | None) -> ExecutionLease | None:
+    if row is None:
+        return None
+    return ExecutionLease(
+        thread_id=row["thread_id"],
+        owner=row["owner"],
+        acquired_at=_parse_ts(row["acquired_at"]),
+        renewed_at=_parse_ts(row["renewed_at"]),
+        expires_at=_parse_ts(row["expires_at"]),
+    )
+
+
 def _approval(row: sqlite3.Row | None) -> ApprovalRecord | None:
     if row is None:
         return None
@@ -258,6 +301,7 @@ class Database:
             _assert_no_duplicates(conn)
             for statement in _SCHEMA_STATEMENTS:
                 conn.execute(statement)
+            _retire_resuming_status(conn)
             conn.commit()
 
     @contextmanager
@@ -505,62 +549,116 @@ class Database:
             )
         return total
 
-    def claim_resume(
-        self, application_id: int
-    ) -> tuple[bool, ApplicationRecord | None]:
-        """Take exclusive ownership of an application's pending decision.
+    def acquire_lease(
+        self,
+        thread_id: str,
+        owner: str,
+        *,
+        ttl: timedelta,
+        now: datetime,
+    ) -> LeaseAttempt:
+        """Become the one process allowed to run this thread, if nobody is.
 
-        Compare-and-set from `awaiting_approval` to `resuming`: exactly one
-        caller can win, whichever process or thread it runs in. Returns
-        `(claimed, record)` where `record` is the application as it stands
-        after the attempt, so a caller that lost can see whether the winner
-        is still in flight or has already finished.
+        Compare-and-set inside an immediate transaction, so exactly one
+        caller wins whichever process or coroutine it runs in. Three ways to
+        succeed: nobody holds the thread, the holder's lease has lapsed, or
+        the holder is you — a worker retrying a thread it failed part-way
+        through must not be locked out by its own abandoned lease.
 
-        In-process locking is not enough here. Two workers on one database
-        each hold their own lock, and a resume that both of them start ends
-        in two submissions of the same form.
+        `now` is a parameter rather than a clock reading because expiry is
+        the whole mechanism, and a mechanism whose behaviour depends on the
+        wall clock is one that can only be tested by waiting.
+
+        In-process locking cannot do this job. Two workers on one database
+        each hold their own lock, and an application both of them start is
+        applied for twice.
         """
+        expires = now + ttl
         with self.immediate_transaction() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE applications SET status = ?, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (
-                    ApplicationStatus.RESUMING.value,
-                    _format_ts(_utc_now()),
-                    application_id,
-                    ApplicationStatus.AWAITING_APPROVAL.value,
-                ),
-            )
-            claimed = cursor.rowcount == 1
             row = conn.execute(
-                "SELECT * FROM applications WHERE id = ?",
-                (application_id,),
+                "SELECT * FROM execution_leases WHERE thread_id = ?",
+                (thread_id,),
             ).fetchone()
-        return claimed, _application(row)
+            held = _lease(row)
+            if held is not None and held.active_at(now) and not held.held_by(owner):
+                return LeaseAttempt(acquired=False, lease=held)
 
-    def release_resume_claim(self, application_id: int) -> bool:
-        """Hand a claimed application back to the gate, if it is still claimed.
+            acquired_at = (
+                held.acquired_at if held is not None and held.held_by(owner) else now
+            )
+            taken = conn.execute(
+                """
+                INSERT INTO execution_leases
+                    (thread_id, owner, acquired_at, renewed_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    owner = excluded.owner,
+                    acquired_at = excluded.acquired_at,
+                    renewed_at = excluded.renewed_at,
+                    expires_at = excluded.expires_at
+                RETURNING *
+                """,
+                (
+                    thread_id,
+                    owner,
+                    _format_ts(acquired_at),
+                    _format_ts(now),
+                    _format_ts(expires),
+                ),
+            ).fetchone()
+        mine = _lease(taken)
+        if mine is None:  # pragma: no cover - the upsert above guarantees a row
+            raise RuntimeError(f"lease for thread {thread_id!r} vanished on acquire")
+        return LeaseAttempt(acquired=True, lease=mine)
 
-        Guarded on `resuming` so a release running after the winner reached
-        a terminal status cannot reopen a submitted application for a second
-        decision.
+    def renew_lease(
+        self,
+        thread_id: str,
+        owner: str,
+        *,
+        ttl: timedelta,
+        now: datetime,
+    ) -> ExecutionLease | None:
+        """Push a held lease's expiry out, proving the holder is still alive.
+
+        Guarded on the owner, not on the expiry: a worker whose lease lapsed
+        while nobody wanted it is still the rightful holder and may carry
+        on, but one whose lease has been *reclaimed* gets `None` and learns
+        that it is no longer in charge.
+        """
+        with self.immediate_transaction() as conn:
+            row = conn.execute(
+                """
+                UPDATE execution_leases SET renewed_at = ?, expires_at = ?
+                WHERE thread_id = ? AND owner = ?
+                RETURNING *
+                """,
+                (_format_ts(now), _format_ts(now + ttl), thread_id, owner),
+            ).fetchone()
+        return _lease(row)
+
+    def release_lease(self, thread_id: str, owner: str) -> bool:
+        """Give the thread back, if it is still yours to give.
+
+        Owner-guarded because the dangerous release is the late one: a
+        worker tidying up after a lease that has already passed to somebody
+        else would leave that somebody holding nothing, and a third worker
+        free to start on the same application.
         """
         with self.immediate_transaction() as conn:
             cursor = conn.execute(
-                """
-                UPDATE applications SET status = ?, updated_at = ?
-                WHERE id = ? AND status = ?
-                """,
-                (
-                    ApplicationStatus.AWAITING_APPROVAL.value,
-                    _format_ts(_utc_now()),
-                    application_id,
-                    ApplicationStatus.RESUMING.value,
-                ),
+                "DELETE FROM execution_leases WHERE thread_id = ? AND owner = ?",
+                (thread_id, owner),
             )
             return bool(cursor.rowcount == 1)
+
+    def get_lease(self, thread_id: str) -> ExecutionLease | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM execution_leases WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return _lease(row)
 
     def record_approval(
         self,

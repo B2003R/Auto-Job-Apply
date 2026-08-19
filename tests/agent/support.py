@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field as dataclass_field
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
@@ -20,6 +21,8 @@ from app.agent.approval import ApprovalService
 from app.agent.form_scanner import FormField, FormSnapshot, SettleResult
 from app.agent.gap_filler import AnswerBook, GapFiller
 from app.agent.graph import (
+    DEFAULT_HEARTBEAT_INTERVAL,
+    DEFAULT_LEASE_TTL,
     ApplicationRunner,
     GraphDependencies,
     SubmitOutcome,
@@ -49,6 +52,19 @@ PLAIN_HTML = "<html><body><form><input name='q'></form></body></html>"
 
 class Crash(BaseException):
     """Stands in for the process dying: never caught by node containment."""
+
+
+class MovableClock:
+    """A clock a test moves by hand, for anything that expires."""
+
+    def __init__(self, start: datetime | None = None) -> None:
+        self.now = start or datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, delta: timedelta) -> None:
+        self.now += delta
 
 
 def make_field(
@@ -289,18 +305,32 @@ class World:
 
     @asynccontextmanager
     async def runner(
-        self, checkpoint_path: Path | None = None
+        self,
+        checkpoint_path: Path | None = None,
+        *,
+        owner: str | None = None,
+        lease_ttl: timedelta | None = None,
+        heartbeat: timedelta | None = None,
     ) -> AsyncIterator[ApplicationRunner]:
         """A runner over this world's database and checkpoint file.
 
         `checkpoint_path` stands in for a second worker that cannot see the
         first one's checkpoints — a lost file, or a process pointed at the
-        wrong directory — while still sharing the queue database.
+        wrong directory — while still sharing the queue database. Two
+        runners always have distinct lease owners, which is what makes a
+        second one behave like a second process rather than a second
+        coroutine.
         """
         async with sqlite_checkpointer(
             checkpoint_path or self.checkpoint_path
         ) as checkpointer:
-            runner = ApplicationRunner(self.deps, checkpointer)
+            runner = ApplicationRunner(
+                self.deps,
+                checkpointer,
+                owner=owner,
+                lease_ttl=lease_ttl or DEFAULT_LEASE_TTL,
+                heartbeat=heartbeat or DEFAULT_HEARTBEAT_INTERVAL,
+            )
             self.built.append(runner)
             yield runner
 
@@ -326,6 +356,7 @@ def build_world(
     write_succeeds: bool = True,
     caps: dict[str, int] | None = None,
     adapter_lookup: Any = None,
+    clock: Any = None,
 ) -> World:
     settings = Settings(
         _env_file=None,
@@ -378,6 +409,7 @@ def build_world(
         submitter=world_submitter,
         guard=world_guard,
         screenshots=world_shots,
+        **({"clock": clock} if clock is not None else {}),
     )
     return World(
         tmp_path=tmp_path,

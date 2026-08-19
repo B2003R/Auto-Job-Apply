@@ -41,9 +41,16 @@ re-executes a node body against a database that already holds the previous
 attempt's writes, so provenance is upserted rather than appended, model spend
 is added rather than assigned and recorded before the fallible part of the
 node, and every terminal write is refused by storage once the record has
-finished. Resumes for a thread are serialised in-process and claimed in the
-database, so one approval means at most one submission even with two workers
-on one queue.
+finished.
+
+**One worker owns a thread at a time.** Staging and resuming ask the same
+question — is another process driving this graph? — so they take the same
+per-thread lease, held in the database and renewed while the work runs, on
+top of an in-process lock. Nothing invokes the graph without it, which is
+what makes one queue item mean one Apply click and one approval mean at most
+one submission across as many workers as you care to start. The lease
+expires, so a worker killed outright releases its thread by the clock rather
+than holding it forever.
 
 **Every dependency is injected.** The browser, the adapter registry, the
 trigger, the gap filler, the field writer, the submitter, the page guard,
@@ -56,9 +63,12 @@ from __future__ import annotations
 
 import asyncio
 import operator
-from contextlib import asynccontextmanager
+import os
+import socket
+import uuid
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field as dataclass_field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from pathlib import Path
@@ -124,6 +134,7 @@ from app.storage.models import (
     ApprovalDecision,
     ApprovalRecord,
     Board,
+    ExecutionLease,
     FieldSource,
     QueueItem,
     QueueState,
@@ -154,6 +165,17 @@ TERMINAL_NODES: tuple[str, ...] = ("submit", "reject", "skip", "fail")
 #: whose recorded state is "still staging".
 CHECKPOINT_DURABILITY = "sync"
 
+#: How long a worker owns a thread before a successor may assume it is dead.
+#: Conservative on purpose: the cost of waiting too long is a delayed
+#: recovery, and the cost of waiting too little is two workers running one
+#: application. A live holder is never at risk of it, because it renews.
+DEFAULT_LEASE_TTL = timedelta(seconds=120)
+
+#: How often the holder renews. Well inside the term, so half a dozen
+#: heartbeats have to be missed — not one slow submit — before a successor
+#: is entitled to take over.
+DEFAULT_HEARTBEAT_INTERVAL = timedelta(seconds=20)
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -177,6 +199,10 @@ class RunStatus(str, Enum):
     REJECTED = "rejected"
     SKIPPED = "skipped"
     FAILED = "failed"
+    #: Not an outcome: another worker owns this thread, and this caller did
+    #: nothing. Reported rather than raised so a queue runner moves to its
+    #: next item instead of having to catch something.
+    IN_PROGRESS = "in_progress"
 
 
 class SkipKind(str, Enum):
@@ -267,25 +293,52 @@ class ThreadNotAwaitingApproval(ApprovalError):
         )
 
 
-class ResumeInProgress(ApprovalError):
-    """Raised when another worker already holds this application's decision.
+class ExecutionInProgress(Exception):
+    """Another worker holds this thread's execution lease.
 
-    Only reachable across processes: within one runner the resumes for a
-    thread are serialised, so the second caller waits and then reads the
-    finished outcome. Two workers on one database cannot wait for each
-    other, so the loser is told to come back rather than being allowed to
-    submit the same form a second time.
+    Only reachable across processes: within one runner every entry point
+    for a thread is serialised, so the second caller waits and then reads
+    whatever the first produced. Two workers on one database cannot wait
+    for each other — a submit takes as long as it takes — so the loser is
+    told to come back rather than being allowed anywhere near the graph.
     """
 
-    def __init__(self, thread_id: str, application_id: int) -> None:
+    def __init__(self, thread_id: str, lease: ExecutionLease | None = None) -> None:
         self.thread_id = thread_id
+        self.lease = lease
+        super().__init__(_in_progress_detail(thread_id, lease))
+
+
+class ResumeInProgress(ExecutionInProgress, ApprovalError):
+    """The same refusal, reached through the approval gate.
+
+    Subclasses `ApprovalError` too, so an API layer that maps every refusal
+    from the gate through one branch keeps working, and a batch runner that
+    only cares about ownership can catch `ExecutionInProgress`.
+    """
+
+    def __init__(
+        self,
+        thread_id: str,
+        application_id: int,
+        lease: ExecutionLease | None = None,
+    ) -> None:
         self.application_id = application_id
-        super().__init__(
-            f"Application {application_id} on thread {thread_id!r} is already "
-            "being resumed by another worker. Its decision is recorded and "
-            "will be acted on there; retry this call afterwards to read the "
-            "outcome."
+        super().__init__(thread_id, lease)
+        self.args = (
+            f"Application {application_id}: "
+            + _in_progress_detail(thread_id, lease),
         )
+
+
+def _in_progress_detail(thread_id: str, lease: ExecutionLease | None) -> str:
+    if lease is None:  # pragma: no cover - the storage layer always returns one
+        return f"thread {thread_id!r} is being run by another worker"
+    return (
+        f"thread {thread_id!r} is being run by {lease.owner!r}, whose lease "
+        f"runs until {lease.expires_at.isoformat()}. The work is happening "
+        "there; retry afterwards to read the outcome."
+    )
 
 
 class ApplicationState(TypedDict, total=False):
@@ -377,6 +430,39 @@ class RunResult:
     @property
     def submitted(self) -> bool:
         return self.status is RunStatus.SUBMITTED
+
+
+@dataclass(frozen=True)
+class ThreadStatus:
+    """What is true of one thread right now, for anything that displays it.
+
+    The interrupt and the lease have to be read together. A checkpoint
+    paused at the gate says a decision is wanted; a live lease says a
+    worker is running the graph and may be about to resolve that pause
+    itself. Reporting the first without the second invites a reviewer into
+    a race they cannot see, and their decision would be refused as
+    in-progress at best.
+    """
+
+    thread_id: str
+    interrupt: dict[str, Any] | None
+    lease: ExecutionLease | None
+    checked_at: datetime
+
+    @property
+    def executing(self) -> bool:
+        """A worker holds this thread and has renewed recently enough."""
+        return self.lease is not None and self.lease.active_at(self.checked_at)
+
+    @property
+    def stale(self) -> bool:
+        """A lease nobody renewed: its holder is presumed gone."""
+        return self.lease is not None and not self.lease.active_at(self.checked_at)
+
+    @property
+    def awaiting_decision(self) -> bool:
+        """A human decision would actually do something, right now."""
+        return self.interrupt is not None and not self.executing
 
 
 class PageBroker(Protocol):
@@ -1094,6 +1180,39 @@ _RECORDED_QUEUE_STATES: Mapping[QueueState, RunStatus] = {
 }
 
 
+def _owner_token() -> str:
+    """A name for this runner that no other runner will pick.
+
+    Host and process make it legible in a lease row someone is trying to
+    understand; the random part keeps two runners inside one process
+    distinct, which is what makes a second runner behave like a second
+    worker rather than accidentally inheriting the first one's lease.
+    """
+    return f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+def _in_progress_result(
+    thread_id: str,
+    queue_id: int,
+    application: ApplicationRecord | None,
+    lease: ExecutionLease,
+) -> RunResult:
+    """The answer to "somebody else is doing this one".
+
+    Not an outcome and not an error: the caller did nothing, and the
+    honest report is who is doing it instead. A queue runner reads this
+    and moves on to its next item.
+    """
+    return RunResult(
+        thread_id=thread_id,
+        queue_id=queue_id,
+        application_id=application.id if application is not None else None,
+        status=RunStatus.IN_PROGRESS,
+        reason="another worker is running this application",
+        detail=_in_progress_detail(thread_id, lease),
+    )
+
+
 def _recorded_result(
     thread_id: str,
     item: QueueItem | None,
@@ -1205,20 +1324,27 @@ class ApplicationRunner:
         self,
         dependencies: GraphDependencies,
         checkpointer: BaseCheckpointSaver[Any],
+        *,
+        owner: str | None = None,
+        lease_ttl: timedelta = DEFAULT_LEASE_TTL,
+        heartbeat: timedelta = DEFAULT_HEARTBEAT_INTERVAL,
     ) -> None:
         self._deps = dependencies
         self._graph = build_graph(dependencies, checkpointer)
         self._service = ApprovalService(dependencies.db, clock=dependencies.clock)
         self._locks: dict[str, asyncio.Lock] = {}
+        self._owner = owner or _owner_token()
+        self._ttl = lease_ttl
+        self._heartbeat = heartbeat
 
     def _lock_for(self, thread_id: str) -> asyncio.Lock:
-        """One lock per thread, so two decisions queue instead of racing.
+        """One lock per thread, so two callers queue instead of racing.
 
-        This is the in-process half of the guarantee. Two coroutines that
-        both read "interrupted, decision matches" and then both resume would
-        submit the same form twice, and no amount of validation before the
-        read prevents it. The database claim in `resume_application` is the
-        other half, for workers that cannot share a lock.
+        The in-process half of the guarantee. Two coroutines that both read
+        "this thread is at the gate" and then both act would submit the same
+        form twice, and no amount of validation before the read prevents it.
+        The database lease is the other half, for workers that cannot share
+        a lock.
         """
         return self._locks.setdefault(thread_id, asyncio.Lock())
 
@@ -1230,19 +1356,29 @@ class ApplicationRunner:
     def approvals(self) -> ApprovalService:
         return self._service
 
+    @property
+    def owner(self) -> str:
+        """This runner's lease identity, unique to it even within a process."""
+        return self._owner
+
     async def run_application(self, queue_id: int) -> RunResult:
         """Stage one queue item, stopping at the approval gate.
 
         Safe to call again for the same queue item: a thread already paused
-        at the gate is reported as-is rather than restaged, and a finished
-        one reports its outcome. Re-staging would mean a second Apply click
-        on the same listing.
+        at the gate is reported as-is rather than restaged, a finished one
+        reports its outcome, and one another worker owns is reported as in
+        progress. Re-staging would mean a second Apply click on the same
+        listing.
         """
         item = self._deps.db.get_queue_item(queue_id)
         if item is None:
             raise UnknownQueueItem(queue_id)
 
         thread_id = thread_id_for(queue_id)
+        async with self._lock_for(thread_id):
+            return await self._run_locked(thread_id, item)
+
+    async def _run_locked(self, thread_id: str, item: QueueItem) -> RunResult:
         application = self._deps.db.get_application_by_thread(thread_id)
         # Storage is consulted before the checkpoint, because it is the
         # record that survives losing the checkpoint file. Without this the
@@ -1253,39 +1389,112 @@ class ApplicationRunner:
         if finished is not None:
             return finished
 
-        config = _config(thread_id)
-        state = await self._graph.aget_state(config)
-        if state.created_at is None and application is not None:
-            stale = self._abandon_stale_approval(thread_id, item, application)
-            if stale is not None:
-                return stale
-        if state.created_at is not None:
-            if state.interrupts or not state.next:
-                return self._from_state(thread_id, queue_id, state)
-            # A checkpoint that is neither finished nor paused belongs to a
-            # run that died mid-flight; continue it rather than restarting.
-            values = await self._graph.ainvoke(
-                None, config, durability=CHECKPOINT_DURABILITY
-            )
-            return self._from_values(thread_id, queue_id, values)
-
-        values = await self._graph.ainvoke(
-            ApplicationState(
-                queue_id=queue_id,
-                thread_id=thread_id,
-                listing_url=item.listing_url,
-                board=item.board.value,
-                visited=[],
-            ),
-            config,
-            durability=CHECKPOINT_DURABILITY,
+        attempt = self._deps.db.acquire_lease(
+            thread_id, self._owner, ttl=self._ttl, now=self._now()
         )
-        return self._from_values(thread_id, queue_id, values)
+        if not attempt.acquired:
+            return _in_progress_result(thread_id, item.id, application, attempt.lease)
+
+        async with self._holding(thread_id):
+            config = _config(thread_id)
+            state = await self._graph.aget_state(config)
+            if state.created_at is None and application is not None:
+                stale = self._abandon_stale_approval(thread_id, item, application)
+                if stale is not None:
+                    return stale
+            if state.created_at is not None:
+                if state.interrupts or not state.next:
+                    return self._from_state(thread_id, item.id, state)
+                # A checkpoint that is neither finished nor paused belongs
+                # to a run that died mid-flight; continue it rather than
+                # restarting. Only ever under the lease: continuing means
+                # running whichever node it stopped at, and for an approved
+                # application that node is `submit`.
+                values = await self._graph.ainvoke(
+                    None, config, durability=CHECKPOINT_DURABILITY
+                )
+                return self._from_values(thread_id, item.id, values)
+
+            values = await self._graph.ainvoke(
+                ApplicationState(
+                    queue_id=item.id,
+                    thread_id=thread_id,
+                    listing_url=item.listing_url,
+                    board=item.board.value,
+                    visited=[],
+                ),
+                config,
+                durability=CHECKPOINT_DURABILITY,
+            )
+            return self._from_values(thread_id, item.id, values)
+
+    async def thread_status(self, thread_id: str) -> ThreadStatus:
+        """What is true of a thread right now, without touching it.
+
+        Lock-free and lease-free: this is the read a status endpoint makes,
+        and it must not queue behind the worker it is reporting on.
+        """
+        state = await self._graph.aget_state(_config(thread_id))
+        return ThreadStatus(
+            thread_id=thread_id,
+            interrupt=_interrupt_payload(state.interrupts),
+            lease=self._deps.db.get_lease(thread_id),
+            checked_at=self._now(),
+        )
 
     async def pending_approval(self, thread_id: str) -> dict[str, Any] | None:
-        """The interrupt payload a thread is paused on, if it is paused."""
-        state = await self._graph.aget_state(_config(thread_id))
-        return _interrupt_payload(state.interrupts)
+        """The decision a thread is actually waiting on a human for.
+
+        `None` while a worker is running the thread, even though the
+        checkpoint may hold an interrupt: that worker may be a moment from
+        resolving it, and a decision offered in the meantime would be
+        refused. Once the lease lapses the interrupt is offered again, which
+        is how a decision survives the death of the worker that asked for
+        it. `thread_status` reports both halves for a caller that needs to
+        tell "being worked on" from "nothing to do".
+        """
+        status = await self.thread_status(thread_id)
+        return status.interrupt if status.awaiting_decision else None
+
+    def _now(self) -> datetime:
+        return self._deps.clock()
+
+    @asynccontextmanager
+    async def _holding(self, thread_id: str) -> AsyncIterator[None]:
+        """Keep a lease alive for the length of one piece of work.
+
+        The heartbeat is what separates "this worker is slow" from "this
+        worker is gone". Without it the lease term would have to exceed the
+        slowest imaginable submit, and a killed worker would own its thread
+        for that long.
+
+        Released on every exit, including a raised exception, because a
+        retry has to be possible at once rather than after an expiry. Only
+        a process that dies outright leaves a lease behind, and that is
+        precisely the case expiry exists for.
+        """
+        beat = asyncio.create_task(self._beat(thread_id))
+        try:
+            yield
+        finally:
+            beat.cancel()
+            with suppress(asyncio.CancelledError):
+                await beat
+            self._deps.db.release_lease(thread_id, self._owner)
+
+    async def _beat(self, thread_id: str) -> None:
+        interval = max(self._heartbeat.total_seconds(), 0.001)
+        while True:
+            await asyncio.sleep(interval)
+            renewed = self._deps.db.renew_lease(
+                thread_id, self._owner, ttl=self._ttl, now=self._now()
+            )
+            if renewed is None:
+                # Somebody reclaimed the thread. Stop renewing so this
+                # worker's stale row cannot come back to life; the terminal
+                # write guards in storage are what keep the outcome honest
+                # from here.
+                return
 
     async def resume_application(
         self, thread_id: str, decision: ApprovalRequest
@@ -1313,7 +1522,7 @@ class ApplicationRunner:
         another application's audit row, let alone releases it. Then storage
         is checked for a finished application, then the checkpoint for a
         pending interrupt, and only then is the decision recorded and the
-        resume claimed.
+        thread leased.
         """
         application = self._service.application_for_thread(thread_id)
         named = self._service.application_for(decision.application_id)
@@ -1333,35 +1542,101 @@ class ApplicationRunner:
 
         state = await self._graph.aget_state(config)
         if not state.interrupts:
-            existing = self._require_matching_approval(thread_id, application, decision)
-            if state.created_at is None:
-                stale = self._abandon_stale_approval(
-                    thread_id,
-                    self._deps.db.get_queue_item(application.queue_id),
-                    application,
-                    approval=existing,
-                )
-                if stale is not None:
-                    return stale
-            return self._from_state(thread_id, application.queue_id, state)
+            return await self._resume_uninterrupted(
+                thread_id, application, decision, state
+            )
 
         outcome = self._service.decide(decision, thread_id=thread_id)
-        claimed, current = self._deps.db.claim_resume(application.id)
-        if not claimed:
-            return self._refuse_or_report(thread_id, application.id, current, decision)
+        attempt = self._deps.db.acquire_lease(
+            thread_id, self._owner, ttl=self._ttl, now=self._now()
+        )
+        if not attempt.acquired:
+            raise ResumeInProgress(thread_id, application.id, attempt.lease)
 
-        try:
+        async with self._holding(thread_id):
+            # Read again now that nobody else can be running the graph. The
+            # snapshot above was taken while another worker may have been
+            # part-way through this very interrupt.
+            fresh = await self._graph.aget_state(config)
+            if not fresh.interrupts:
+                return await self._continue_or_report(
+                    thread_id, application, config, fresh
+                )
             values = await self._graph.ainvoke(
                 Command(resume=outcome.resume_payload()),
                 config,
                 durability=CHECKPOINT_DURABILITY,
             )
-        except BaseException:
-            # Hand the gate back. The claim is only meaningful while someone
-            # is acting on it, and an application stranded in `resuming`
-            # would be invisible to every later attempt to decide it.
-            self._deps.db.release_resume_claim(application.id)
-            raise
+            return self._from_values(thread_id, application.queue_id, values)
+
+    async def _resume_uninterrupted(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        decision: ApprovalRequest,
+        state: Any,
+    ) -> RunResult:
+        """A live application whose checkpoint is not paused at the gate.
+
+        Three different situations wear the same shape here, and the
+        difference matters. No checkpoint at all means the decision can
+        never be applied and the application has to be abandoned. Nodes
+        still to run means a worker died between the decision and the
+        outcome, and the work must be finished rather than reported as
+        done. Nothing left to run means the graph completed and this is a
+        retry reading its result.
+
+        The recorded decision is checked first in every case: a request that
+        does not match what was decided is a conflict whoever owns the
+        thread, and a thread that never reached the gate cannot be approved
+        at all.
+        """
+        existing = self._require_matching_approval(thread_id, application, decision)
+        if state.created_at is None:
+            stale = self._abandon_stale_approval(
+                thread_id,
+                self._deps.db.get_queue_item(application.queue_id),
+                application,
+                approval=existing,
+            )
+            if stale is not None:
+                return stale
+            return self._from_state(thread_id, application.queue_id, state)
+
+        if not state.next:
+            return self._from_state(thread_id, application.queue_id, state)
+
+        attempt = self._deps.db.acquire_lease(
+            thread_id, self._owner, ttl=self._ttl, now=self._now()
+        )
+        if not attempt.acquired:
+            raise ResumeInProgress(thread_id, application.id, attempt.lease)
+        async with self._holding(thread_id):
+            return await self._continue(thread_id, application, _config(thread_id))
+
+    async def _continue_or_report(
+        self,
+        thread_id: str,
+        application: ApplicationRecord,
+        config: dict[str, Any],
+        state: Any,
+    ) -> RunResult:
+        """The interrupt went away between the first read and the lease.
+
+        The worker that resolved it has since let the thread go, so this
+        caller now owns whatever it left behind: either a finished graph to
+        read, or nodes it never got to run.
+        """
+        if not state.next:
+            return self._from_state(thread_id, application.queue_id, state)
+        return await self._continue(thread_id, application, config)
+
+    async def _continue(
+        self, thread_id: str, application: ApplicationRecord, config: dict[str, Any]
+    ) -> RunResult:
+        values = await self._graph.ainvoke(
+            None, config, durability=CHECKPOINT_DURABILITY
+        )
         return self._from_values(thread_id, application.queue_id, values)
 
     def _abandon_stale_approval(
@@ -1424,25 +1699,6 @@ class ApplicationRunner:
             )
         return existing
 
-    def _refuse_or_report(
-        self,
-        thread_id: str,
-        application_id: int,
-        current: ApplicationRecord | None,
-        decision: ApprovalRequest,
-    ) -> RunResult:
-        """What a caller that lost the claim is told.
-
-        If the winner has already finished, the loser reads that outcome:
-        this is the ordinary shape of a retried request, and the honest
-        answer is the submission it caused. If the winner is still in
-        flight, there is no outcome to report yet and waiting is not
-        possible across processes, so the loser is refused rather than
-        allowed anywhere near the submitter.
-        """
-        if current is not None and current.status in TERMINAL_APPLICATION_STATUSES:
-            return self._finished_resume(thread_id, current, decision)
-        raise ResumeInProgress(thread_id, application_id)
 
     def _finished_resume(
         self,
