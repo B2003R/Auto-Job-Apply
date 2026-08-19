@@ -19,6 +19,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,17 +53,42 @@ class BrowserPrerequisites:
         return bool(self.executable)
 
 
+#: Asks Playwright where its Chromium is, and prints only that.
+_CHROMIUM_PATH_PROBE = """
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as playwright:
+    print(playwright.chromium.executable_path)
+"""
+
+
 def _playwright_chromium() -> str:
-    """The Chromium a `playwright install` would have put on this machine."""
+    """The Chromium a `playwright install` would have put on this machine.
+
+    Asked in a subprocess, because asking starts a driver. The sync API's
+    connection is torn down by the interpreter rather than by a running
+    event loop, so it leaves a cancelled task and an unretrieved
+    `TargetClosedError` printed to stderr — which lands in the middle of
+    every browser run, deterministically, and reads exactly like a browser
+    test having crashed. In a child process that noise is the child's, and
+    the child's output is ours to discard.
+    """
     try:
-        from playwright.sync_api import sync_playwright
+        import playwright  # noqa: F401
     except Exception:  # noqa: BLE001 - not installed is one of the answers
         return ""
     try:
-        with sync_playwright() as playwright:
-            path = str(playwright.chromium.executable_path)
-    except Exception:  # noqa: BLE001 - not downloaded is another
+        answered = subprocess.run(
+            [sys.executable, "-c", _CHROMIUM_PATH_PROBE],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception:  # noqa: BLE001 - a driver that will not start is another
         return ""
+    lines = [line.strip() for line in answered.stdout.splitlines() if line.strip()]
+    path = lines[-1] if lines else ""
     return path if path and Path(path).exists() else ""
 
 
