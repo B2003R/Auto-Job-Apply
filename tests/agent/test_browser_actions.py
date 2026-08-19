@@ -18,7 +18,9 @@ JavaScript, so those rules are unit-tested rather than asserted about.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import inspect
 from typing import Any, Iterable, Mapping, Sequence
 
 import pytest
@@ -73,6 +75,13 @@ ANSWER = "Rivera"
 # --------------------------------------------------------------------------
 
 
+async def _resolved(answer: Any) -> Any:
+    """Allow a response to be a coroutine, for the frames that never answer."""
+    if inspect.isawaitable(answer):
+        return await answer
+    return answer
+
+
 class FakeFrame:
     """A frame that answers exactly the scripts it was given, and no others."""
 
@@ -108,10 +117,10 @@ class FakeFrame:
         return handler(argument) if callable(handler) else handler
 
     async def evaluate(self, script: str, argument: Any = None) -> Any:
-        return self._answer(script, argument)
+        return await _resolved(self._answer(script, argument))
 
     async def evaluate_handle(self, script: str, argument: Any = None) -> Any:
-        return self._answer(script, argument)
+        return await _resolved(self._answer(script, argument))
 
     def arguments_for(self, script: str) -> list[Any]:
         return [argument for name, argument in self.calls if name == script]
@@ -726,6 +735,41 @@ class TestTheGuardLetsAnOrdinaryPageThrough:
         await PlaywrightPageGuard().inspect(FakePage(main, [foreign]))
 
         assert foreign.calls == []
+
+    async def test_a_frame_that_never_answers_does_not_stall_the_run(self) -> None:
+        """A frame with no execution context can otherwise wait forever.
+
+        An `about:blank` iframe that is still notionally navigating is the
+        real-world case: the driver waits for a context that never arrives.
+        Left unbounded, the guard would hold a worker's tab, its lease, and
+        the queue behind it, on a page nobody is looking at.
+        """
+        main = guarding_frame()
+        silent = FakeFrame(
+            "https://ats.example.com/pending",
+            {GUARD_SCRIPT: _never_answers},
+            parent=main,
+        )
+
+        await PlaywrightPageGuard(frame_timeout_ms=20).inspect(FakePage(main, [silent]))
+
+    async def test_a_verdict_from_a_frame_that_did_answer_still_counts(self) -> None:
+        """The timeout skips one frame, not the inspection."""
+        main = FakeFrame(MAIN_URL, {GUARD_SCRIPT: _never_answers})
+        answering = guarding_frame(
+            captcha="div.g-recaptcha", url="https://ats.example.com/challenge", parent=main
+        )
+
+        with pytest.raises(CaptchaEncountered):
+            await PlaywrightPageGuard(frame_timeout_ms=20).inspect(
+                FakePage(main, [answering])
+            )
+
+
+async def _never_answers(argument: Any) -> Any:
+    """Stands in for a frame whose execution context never arrives."""
+    await asyncio.sleep(30)
+    raise AssertionError("the guard waited for a frame that was never going to answer")
 
 
 class TestTheGuardScript:

@@ -907,6 +907,13 @@ def _normalized(url: str) -> str:
 # --------------------------------------------------------------------------
 
 
+#: How long one frame is given to answer the guard. A frame that has no
+#: execution context — an `about:blank` iframe still notionally navigating
+#: is the common case — never answers at all, and the driver will wait for
+#: that context far longer than anybody watching a queue would like.
+DEFAULT_GUARD_FRAME_TIMEOUT_MS = 3_000
+
+
 class PlaywrightPageGuard:
     """Refuses to keep working on a challenged or credential-gated page.
 
@@ -915,7 +922,17 @@ class PlaywrightPageGuard:
     the scanner already reports unreadable frames as a coverage gap, which
     is itself a blocking reason at the approval gate. This guard is an extra
     refusal, not the only one.
+
+    That tolerance is bounded in time as well as in kind. A frame that
+    simply never answers is skipped once its own deadline passes, so a page
+    with one stuck frame costs a few seconds rather than holding a tab, a
+    lease, and the whole queue behind it.
     """
+
+    def __init__(
+        self, *, frame_timeout_ms: int = DEFAULT_GUARD_FRAME_TIMEOUT_MS
+    ) -> None:
+        self._frame_timeout_s = max(0.001, frame_timeout_ms / 1000)
 
     async def inspect(self, page: Any) -> None:
         captcha = ""
@@ -923,8 +940,14 @@ class PlaywrightPageGuard:
         frames, _skipped = same_origin_frames(page)
         for frame in frames:
             try:
-                report = _mapping(await _evaluate(frame, GUARD_SCRIPT))
-            except Exception:  # noqa: BLE001 - one unreadable frame is not a verdict
+                report = _mapping(
+                    await asyncio.wait_for(
+                        _evaluate(frame, GUARD_SCRIPT), self._frame_timeout_s
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # One unreadable — or unresponsive, which arrives here as a
+                # timeout — frame is not a verdict.
                 continue
             captcha = captcha or _text(report.get("captcha"))
             login = login or _text(report.get("login"))
