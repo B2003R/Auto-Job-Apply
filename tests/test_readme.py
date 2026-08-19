@@ -15,6 +15,7 @@ code in the same repository.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,92 @@ def _blocks(language: str) -> list[str]:
     return re.findall(
         rf"^```{language}\n(.*?)^```", README.read_text(), re.MULTILINE | re.DOTALL
     )
+
+
+REPO = README.parent
+
+
+def _claimed_gitignored() -> list[str]:
+    """Every path the README says git will not take.
+
+    Read out of the prose rather than listed here, so a new claim is
+    checked by the act of making it.
+    """
+    claims: list[str] = []
+    for line in README.read_text().splitlines():
+        if "gitignored" in line or "is in `.gitignore`" in line:
+            claims.extend(re.findall(r"`([^`]+)`", line))
+    # The file doing the ignoring is named in the same sentence and is not
+    # itself a claim.
+    return [claim for claim in claims if claim != ".gitignore"]
+
+
+def _git_ignores(path: str) -> bool:
+    result = subprocess.run(
+        ["git", "check-ignore", "-q", "--no-index", "--", path],
+        cwd=REPO,
+        capture_output=True,
+    )
+    if result.returncode not in (0, 1):
+        pytest.skip(f"git could not answer: {result.stderr.decode().strip()}")
+    return result.returncode == 0
+
+
+class TestThePrivacyClaims:
+    """The README promises git will not take these. Git is asked, not trusted.
+
+    Every one of them is somebody's real data: the log of jobs they applied
+    to, screenshots of half-filled application forms, the answers file with
+    their address and salary history, and the `.env` holding an API key. A
+    claim like this one is only worth making if a `git add -A` in a hurry
+    cannot quietly break it.
+    """
+
+    def test_the_readme_makes_a_claim_to_check(self) -> None:
+        """Guards the tests below: an empty claim list proves nothing."""
+        assert _claimed_gitignored()
+
+    @pytest.mark.parametrize("claim", _claimed_gitignored())
+    def test_every_claimed_path_is_ignored_by_git(self, claim: str) -> None:
+        # A directory claim is checked through a file inside it: `data/` is
+        # only a real promise if it covers the screenshots underneath.
+        path = claim + "screenshot.png" if claim.endswith("/") else claim
+        assert _git_ignores(path), f"the README says {claim} is gitignored, and it is not"
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "data/jobs.db",
+            "data/artifacts/apply-1.png",
+            "data/artifacts/nested/apply-2.png",
+            "data/checkpoints.sqlite",
+            "answers.yaml",
+            ".env",
+        ],
+    )
+    def test_the_files_a_run_actually_produces_are_ignored(self, path: str) -> None:
+        """The defaults in `.env.example`, spelled out.
+
+        `*.db` covered the database and nothing else: a screenshot of a
+        filled-in application form under `data/artifacts/` was staged by
+        any `git add -A`.
+        """
+        assert _git_ignores(path)
+
+    def test_none_of_it_is_in_the_repository_already(self) -> None:
+        """An ignore rule does nothing for a file that is already tracked."""
+        tracked = subprocess.run(
+            ["git", "ls-files", "--", "data", "answers.yaml", ".env"],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+        )
+        assert tracked.stdout.strip() == ""
+
+    def test_the_example_files_are_still_committable(self) -> None:
+        """Ignoring too much is its own failure: these must be shareable."""
+        assert not _git_ignores("answers.example.yaml")
+        assert not _git_ignores(".env.example")
 
 
 class TestTheAnswersExample:
