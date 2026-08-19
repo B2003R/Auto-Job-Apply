@@ -47,6 +47,13 @@ DEFAULT_POLL_INTERVAL_MS = 100
 #: writing within a few hundred milliseconds; this leaves generous headroom.
 DEFAULT_FIRST_CHANGE_TIMEOUT_MS = 3_000
 
+#: How long one frame is given to answer a scan. A frame that has no
+#: execution context — an `about:blank` iframe still notionally navigating is
+#: the common case — never answers at all, and the driver waits for that
+#: context indefinitely. Bounded here so one such frame costs a coverage gap
+#: rather than a worker, its renewing lease, and the queue behind it.
+DEFAULT_FRAME_TIMEOUT_MS = 3_000
+
 #: Input types that accept free-form prose, i.e. the ones a model or canonical
 #: answer could plausibly be asked to complete. Deliberately excludes
 #: pickers (`date`, `file`, `color`), toggles, hidden controls, and
@@ -877,12 +884,14 @@ class FormScanner:
         clock: Clock = time.monotonic,
         sleep: Sleeper = asyncio.sleep,
         poll_interval_ms: int = DEFAULT_POLL_INTERVAL_MS,
+        frame_timeout_ms: int = DEFAULT_FRAME_TIMEOUT_MS,
         digest_key: bytes | None = None,
     ) -> None:
         self._capture_values = capture_values
         self._clock = clock
         self._sleep = sleep
         self._poll_interval_ms = max(1, poll_interval_ms)
+        self._frame_timeout_s = max(0.001, frame_timeout_ms / 1000)
         # Random per instance: digests are a change-detection device, not a
         # stable identifier, and a fresh key stops values being correlated
         # across runs or recovered by dictionary attack from logs.
@@ -969,7 +978,19 @@ class FormScanner:
         for frame in frames:
             frame_url = _as_text(getattr(frame, "url", ""))
             try:
-                records = await frame.evaluate(FIELD_SCAN_SCRIPT, options)
+                records = await asyncio.wait_for(
+                    frame.evaluate(FIELD_SCAN_SCRIPT, options), self._frame_timeout_s
+                )
+            except asyncio.TimeoutError:
+                skipped.append(
+                    FrameSkip(
+                        frame_url,
+                        "the frame did not answer within "
+                        f"{int(self._frame_timeout_s * 1000)}ms, so it has no "
+                        "execution context to scan",
+                    )
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - one bad frame must not
                 # abort the whole scan; navigation/detachment is routine here.
                 skipped.append(FrameSkip(frame_url, f"evaluation failed: {exc}"))
@@ -1082,13 +1103,19 @@ class FormScanner:
 
         A frame that cannot be probed contributes nothing rather than
         aborting the wait; its field values are still compared each poll.
+        That includes a frame that simply never answers: this runs once per
+        frame on every poll, so an unbounded probe would stop the wait
+        inside an await instead of at the settle deadline meant to end it.
         """
         total = 0
         frames, _ = same_origin_frames(page)
         for frame in frames:
             try:
-                value = await frame.evaluate(MUTATION_PROBE_SCRIPT)
-            except Exception:  # noqa: BLE001 - probing is best effort
+                value = await asyncio.wait_for(
+                    frame.evaluate(MUTATION_PROBE_SCRIPT), self._frame_timeout_s
+                )
+            except Exception:  # noqa: BLE001 - probing is best effort, and an
+                # unresponsive frame arrives here as a timeout
                 continue
             if isinstance(value, (int, float)):
                 total += int(value)

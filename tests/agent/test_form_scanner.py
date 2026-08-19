@@ -10,6 +10,7 @@ fails loudly rather than silently passing.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 from typing import Any, Iterable, Sequence
 
@@ -75,6 +76,7 @@ class FakeFrame:
         name: str = "",
         parent: "FakeFrame | None" = None,
         omit_digest: bool = False,
+        never_answers: bool = False,
     ) -> None:
         self.url = url
         self.name = name
@@ -86,6 +88,7 @@ class FakeFrame:
         self._mutations: list[int] = list(mutations) if mutations is not None else [0]
         self._evaluate_error = evaluate_error
         self._omit_digest = omit_digest
+        self._never_answers = never_answers
         self.scripts: list[str] = []
         self.scan_options: list[Any] = []
         self.scan_calls = 0
@@ -93,6 +96,11 @@ class FakeFrame:
 
     async def evaluate(self, script: str, *args: Any) -> Any:
         self.scripts.append(script)
+        if self._never_answers:
+            # A frame with no execution context: the driver waits for one
+            # that never arrives. Never returns and never raises, so a
+            # scanner with no deadline hangs rather than passing slowly.
+            await asyncio.Event().wait()
         if self._evaluate_error is not None:
             raise self._evaluate_error
         if script == MUTATION_PROBE_SCRIPT:
@@ -720,6 +728,36 @@ class TestFrameTraversal:
         assert len(snapshot.skipped_frames) == 1
         assert "frame was detached" in snapshot.skipped_frames[0].reason
 
+    async def test_a_frame_that_never_answers_is_recorded_and_left_behind(
+        self,
+    ) -> None:
+        """A frame with no execution context must not stall a staging run.
+
+        An `about:blank` iframe still notionally navigating never gains a
+        context, and the driver waits for one indefinitely. Unbounded, one
+        such frame holds the tab, the worker's renewing lease, and every
+        listing queued behind it — and the operator sees a run that is
+        neither finished nor failed.
+
+        The frame is reported as unscanned, which is already a coverage gap
+        and therefore a blocking reason at the approval gate, so nothing is
+        submitted on the strength of a form that was only partly read.
+        """
+        main = FakeFrame(MAIN_URL, batches=[[raw_field()]])
+        pending = FakeFrame(
+            "https://ats.example.com/pending", never_answers=True, parent=main
+        )
+
+        snapshot = await asyncio.wait_for(
+            FormScanner(frame_timeout_ms=20).snapshot(FakePage(main, [pending])),
+            timeout=2,
+        )
+
+        assert [field.name for field in snapshot.fields] == ["first_name"]
+        assert len(snapshot.skipped_frames) == 1
+        assert snapshot.skipped_frames[0].frame_url == "https://ats.example.com/pending"
+        assert "did not answer" in snapshot.skipped_frames[0].reason
+
     async def test_page_without_frames_collection_is_scanned_directly(self) -> None:
         page = FakeFrame(MAIN_URL, batches=[[raw_field()]])
         snapshot = await FormScanner().snapshot(page)
@@ -1148,6 +1186,37 @@ class TestSettleDetection:
         assert result.diff.has_changes is True
         # First change is visible at t=200ms; quiet must then be observed on top.
         assert result.waited_ms >= 200 + 250
+
+    async def test_a_frame_that_never_answers_does_not_hold_the_settle_wait(
+        self,
+    ) -> None:
+        """The mutation probe runs on every poll, once per frame.
+
+        A frame with no execution context never answers it, so an unbounded
+        probe cannot even reach the settle timeout that exists to end this
+        wait — the loop stops inside an await rather than at its deadline.
+        The frame contributes no mutation count, which is what the docstring
+        already promises for a frame that cannot be probed.
+        """
+        clock = FakeClock()
+        scanner = self._scanner(clock, frame_timeout_ms=20)
+        fields = [raw_field(value="Ada")]
+        main = FakeFrame(MAIN_URL, batches=[fields])
+        pending = FakeFrame(
+            "https://ats.example.com/pending", never_answers=True, parent=main
+        )
+        page = FakePage(main, [pending])
+        previous = await self._baseline(scanner, fields, page)
+
+        result = await asyncio.wait_for(
+            scanner.wait_for_settle(
+                page, previous, quiet_ms=200, timeout_ms=30000, first_change_timeout_ms=1000
+            ),
+            timeout=5,
+        )
+
+        assert result.settled is True
+        assert result.mutations == 0
 
     async def test_unchanged_page_settles_only_after_the_first_change_window(self) -> None:
         clock = FakeClock()
