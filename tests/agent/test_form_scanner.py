@@ -19,6 +19,7 @@ from app.agent.errors import FormSettleTimeout, SnapshotScannerMismatch
 from app.agent.form_scanner import (
     DEFAULT_FIRST_CHANGE_TIMEOUT_MS,
     FIELD_IDENTITY_JS,
+    PAGE_TRAVERSAL_JS,
     FIELD_SCAN_SCRIPT,
     MUTATION_PROBE_SCRIPT,
     FieldChange,
@@ -377,6 +378,20 @@ class TestSharedInPageIdentity:
     def test_the_helper_is_not_a_callable_expression_of_its_own(self) -> None:
         """It is spliced into a script body, not evaluated on its own."""
         assert not FIELD_IDENTITY_JS.strip().startswith("(")
+
+    def test_walking_the_page_is_separable_from_reading_a_control(self) -> None:
+        """The page guard needs the walk without the label reader.
+
+        A guard that could read prose would eventually match it, and
+        matching "Sign in" in a header abandons applications that were
+        perfectly fillable. Handing it a helper that cannot read text at all
+        is a stronger guarantee than a review comment asking it not to.
+        """
+        assert PAGE_TRAVERSAL_JS in FIELD_IDENTITY_JS
+        assert "const collectRoots = " in PAGE_TRAVERSAL_JS
+        assert "const isVisible = " in PAGE_TRAVERSAL_JS
+        assert "labelText" not in PAGE_TRAVERSAL_JS
+        assert "textContent" not in PAGE_TRAVERSAL_JS
 
 
 class TestFrameChainIdentity:

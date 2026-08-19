@@ -73,24 +73,20 @@ _VALUE_DIGEST_CHARS = 32
 _MAX_FRAME_CHAIN_DEPTH = 16
 
 
-#: Everything the page has to decide about a control before it has an
-#: identity: which roots exist and what their paths are called, what a
-#: control's type, id, form, and accessible label are, and whether it is
-#: visible or filled.
+#: How every script in this project walks a page: the document plus each
+#: open shadow root, under one naming scheme for the paths, and one answer
+#: to "can a person see this".
 #:
-#: Spliced into `FIELD_SCAN_SCRIPT` and into the field writer's own scripts
-#: (`app.agent.browser_actions`) rather than reimplemented in each, because
-#: these six answers *are* the stable key: a writer that resolved a control
-#: by asking any of them differently would be typing into a control whose
-#: key it cannot reproduce, and "the answer was typed into `key`" would be a
-#: statement about a control nobody checked.
+#: Split out from `FIELD_IDENTITY_JS` because the page guard and the
+#: submitter need to walk the page without being handed the label reader:
+#: a guard that could read prose would eventually match it, and a guard
+#: that matches "Sign in" in a header abandons applications that were
+#: perfectly fillable.
 #:
 #: Not a callable expression: it is a sequence of `const` declarations meant
 #: to be pasted inside a script body.
-FIELD_IDENTITY_JS = """
-  const CONTROL_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
+PAGE_TRAVERSAL_JS = """
   const MAX_ROOT_DEPTH = 8;
-  const PLACEHOLDER_SELECT = /^(please\\s+)?(select|choose|pick)\\b|^-{1,2}$|^n\\/?a$|^none$/i;
 
   const text = (value) => (value == null ? '' : String(value)).trim();
 
@@ -139,6 +135,29 @@ FIELD_IDENTITY_JS = """
     const rect = el.getBoundingClientRect();
     return rect.width > 0 || rect.height > 0;
   };
+
+  const isDisabled = (el) => el.disabled === true
+    || text(el.getAttribute('aria-disabled')).toLowerCase() === 'true';
+"""
+
+
+#: Everything the page has to decide about a control before it has an
+#: identity: what its type, id, form, and accessible label are, and whether
+#: it is filled.
+#:
+#: Spliced into `FIELD_SCAN_SCRIPT` and into the field writer's own scripts
+#: (`app.agent.browser_actions`) rather than reimplemented in each, because
+#: these six answers *are* the stable key: a writer that resolved a control
+#: by asking any of them differently would be typing into a control whose
+#: key it cannot reproduce, and "the answer was typed into `key`" would be a
+#: statement about a control nobody checked.
+#:
+#: Not a callable expression: it is a sequence of `const` declarations meant
+#: to be pasted inside a script body. Includes `PAGE_TRAVERSAL_JS`, so a
+#: script splicing this one must not splice that one as well.
+FIELD_IDENTITY_JS = PAGE_TRAVERSAL_JS + """
+  const CONTROL_SELECTOR = 'input, textarea, select, [contenteditable="true"]';
+  const PLACEHOLDER_SELECT = /^(please\\s+)?(select|choose|pick)\\b|^-{1,2}$|^n\\/?a$|^none$/i;
 
   const controlType = (el) => {
     const tag = el.tagName.toLowerCase();
@@ -270,9 +289,6 @@ FIELD_IDENTITY_JS = """
     }
     return text(el.getAttribute('aria-required')).toLowerCase() === 'true';
   };
-
-  const isDisabled = (el) => el.disabled === true
-    || text(el.getAttribute('aria-disabled')).toLowerCase() === 'true';
 """
 
 
